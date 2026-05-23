@@ -53,6 +53,7 @@ export function AtomReader({ atomId, highlightText, initialEditing }: AtomReader
   const overlayNavigate = useUIStore(s => s.overlayNavigate);
   const overlayDismiss = useUIStore(s => s.overlayDismiss);
   const removeAtomFromTabs = useUIStore(s => s.removeAtomFromTabs);
+  const redirectAtomTabToFinding = useUIStore(s => s.redirectAtomTabToFinding);
 
   const [atom, setAtom] = useState<AtomWithTags | null>(null);
   const [isLoadingAtom, setIsLoadingAtom] = useState(true);
@@ -114,6 +115,20 @@ export function AtomReader({ atomId, highlightText, initialEditing }: AtomReader
       refreshAtom().catch(console.error);
     });
   }, [atomId, refreshAtom]);
+
+  // If the fetched atom turns out to be a report finding (`kind = 'report'`),
+  // redirect to the specialized FindingReader view. The generic atom reader
+  // can't render `[N]` citation popovers, and findings are conceptually
+  // read-only output not the user's own captures. This covers any path that
+  // reached us via `/atoms/:id` for a finding atom — semantic search hits,
+  // stale links from before the reports view existed, etc. The redirect
+  // morphs the active tab in place + URL-replaces, so neither the tab
+  // strip nor the browser back stack accumulates a dead /atoms/:id entry.
+  useEffect(() => {
+    if (atom?.kind === 'report') {
+      redirectAtomTabToFinding(atomId);
+    }
+  }, [atom, atomId, redirectAtomTabToFinding]);
 
   return (
     <div className="h-full bg-[var(--color-bg-main)]">

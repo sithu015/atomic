@@ -199,6 +199,26 @@ pub async fn list_finding_citations(db: Db, path: web::Path<String>) -> HttpResp
     ok_or_error(db.0.list_citations_for_finding(&path.into_inner()).await)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/findings/{atom_id}",
+    responses(
+        (status = 200, description = "Provenance row for a finding atom (parent report, run id, name snapshot, created_at)",
+         body = atomic_core::models::ReportFinding),
+        (status = 404, description = "No finding provenance for this atom id (either the atom isn't a finding, or it doesn't exist)",
+         body = ApiErrorResponse)
+    ),
+    tag = "reports"
+)]
+pub async fn get_finding_provenance(db: Db, path: web::Path<String>) -> HttpResponse {
+    let atom_id = path.into_inner();
+    match db.0.get_finding_provenance(&atom_id).await {
+        Ok(Some(prov)) => HttpResponse::Ok().json(prov),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => error_response(e),
+    }
+}
+
 /// Async manual-run response. Includes the report id and a hint at where
 /// to poll for results; the actual finding atom shows up via the
 /// findings endpoint once the agent loop completes.

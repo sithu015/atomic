@@ -16,6 +16,11 @@ export interface Atom {
   updated_at: string;
   embedding_status: 'pending' | 'processing' | 'complete' | 'failed';
   tagging_status: 'pending' | 'processing' | 'complete' | 'failed' | 'skipped';
+  /// Discriminator added in phase-1 of the reports work. `captured`
+  /// is what users write or import; `report` is agent-written finding
+  /// output. The atom list view filters to `captured` by default, but
+  /// API responses (and the reader) carry the field on every atom.
+  kind: 'captured' | 'report';
 }
 
 export interface Tag {

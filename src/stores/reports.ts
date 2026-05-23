@@ -263,6 +263,21 @@ interface ReportsStore {
   /// in-view-effect so we don't paint the whole list up front.
   fetchCitationCount: (atomId: string) => Promise<void>;
 
+  /// Fetch a single finding by atom id — the atom payload, its
+  /// provenance row (parent report + run + name snapshot), and its
+  /// citation rows in one shot. Used by the FindingReader specialized
+  /// view for cold deep-links (URL `/findings/:atomId` without any
+  /// in-memory cache). Returns `null` if the atom isn't a finding or
+  /// doesn't exist. As a side effect, the result is merged into
+  /// `findingsByReport[report_id]` so the TabStrip's cache-walk for
+  /// the tab label finds it and labels reads "Daily Briefing · 2H AGO"
+  /// instead of falling back to "Finding N".
+  fetchFinding: (atomId: string) => Promise<{
+    atom: ReportFindingWithAtom['atom'];
+    finding: ReportFinding;
+    citations: ReportFindingCitation[];
+  } | null>;
+
   /// Dispatch a manual run. Adds the report to `runningReportIds`,
   /// stamps `runDispatchedAt`, fires `POST /api/reports/:id/run`. The
   /// server responds 202 immediately; we wait for the AtomCreated
@@ -376,6 +391,64 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         }
       });
       set({ hasSubscription: true });
+    },
+
+    fetchFinding: async (atomId: string) => {
+      try {
+        // Parallel fetch — the three calls are independent. If any of
+        // the three errors with 404 we treat the whole thing as
+        // "not a finding" rather than rendering a half-broken view.
+        const transport = getTransport();
+        const [atomRaw, provenanceRaw, citationsRaw] = await Promise.allSettled([
+          transport.invoke<ReportFindingWithAtom['atom']>('get_atom', { id: atomId }),
+          transport.invoke<ReportFinding>('get_finding_provenance', { atom_id: atomId }),
+          transport.invoke<ReportFindingCitation[]>('list_finding_citations', { atom_id: atomId }),
+        ]);
+
+        if (atomRaw.status !== 'fulfilled') return null;
+        if (provenanceRaw.status !== 'fulfilled') return null;
+        if (citationsRaw.status !== 'fulfilled') return null;
+
+        const atom = atomRaw.value;
+        const finding = provenanceRaw.value;
+        const citations = citationsRaw.value;
+
+        // Side-effect: merge into findingsByReport so the TabStrip's
+        // cache-walk (used to label finding tabs) and the
+        // ReportDetailView's findings list both see the row without an
+        // extra fetch. If the report id is null (orphaned finding —
+        // report deleted, FK SET NULL), skip the cache merge; the
+        // FindingReader still renders from the returned payload.
+        if (finding.report_id) {
+          const reportId = finding.report_id;
+          set(state => {
+            const existing = state.findingsByReport[reportId] ?? [];
+            const alreadyPresent = existing.some(f => f.atom.id === atomId);
+            const merged = alreadyPresent
+              ? existing.map(f => (f.atom.id === atomId ? { finding, atom } : f))
+              : [{ finding, atom }, ...existing];
+            return {
+              findingsByReport: { ...state.findingsByReport, [reportId]: merged },
+              citationCountsByAtomId: {
+                ...state.citationCountsByAtomId,
+                [atomId]: citations.length,
+              },
+            };
+          });
+        } else {
+          set(state => ({
+            citationCountsByAtomId: {
+              ...state.citationCountsByAtomId,
+              [atomId]: citations.length,
+            },
+          }));
+        }
+
+        return { atom, finding, citations };
+      } catch (e) {
+        console.error('[reports] fetchFinding failed', atomId, e);
+        return null;
+      }
     },
 
     runNow: async (reportId: string) => {

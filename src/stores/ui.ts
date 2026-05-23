@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { navigateTo } from '../router/navigate-ref';
-import { viewPath, atomReaderPath, wikiReaderPath, atomGraphPath, reportDetailPath } from '../router/routes';
+import { viewPath, atomReaderPath, wikiReaderPath, atomGraphPath, reportDetailPath, findingReaderPath } from '../router/routes';
 
 export type ViewMode = 'dashboard' | 'atoms' | 'canvas' | 'wiki' | 'reports';
 export type AtomsLayout = 'grid' | 'list';
@@ -40,6 +40,12 @@ interface ReportsDetailState {
   reportId: string | null;
 }
 
+interface FindingReaderState {
+  /// The finding atom currently being read in the specialized
+  /// FindingReader view. Projected from the active 'finding' TabEntry.
+  atomId: string | null;
+}
+
 /// A single navigation entry within a tab's stack. Tabs hold the user's
 /// per-context history through atoms, wiki articles, and graphs.
 ///
@@ -52,7 +58,8 @@ export type TabEntry =
   | { type: 'atom'; atomId: string; tagId: string | null; highlightText: string | null; editing: boolean; title?: string }
   | { type: 'wiki'; tagId: string; tagName: string; highlightText: string | null }
   | { type: 'graph'; atomId: string; tagId: string | null; title?: string }
-  | { type: 'report'; reportId: string; title?: string };
+  | { type: 'report'; reportId: string; title?: string }
+  | { type: 'finding'; atomId: string; title?: string };
 
 export interface Tab {
   id: string;
@@ -82,6 +89,7 @@ interface UIStore {
   readerState: ReaderState;
   wikiReaderState: WikiReaderState;
   reportsDetailState: ReportsDetailState;
+  findingReaderState: FindingReaderState;
   // Tabs model — the source of truth for "what's open and where in its
   // stack the user is". `readerState`/`wikiReaderState`/`localGraph` are
   // kept as synced projections of the active tab's current entry so that
@@ -140,6 +148,21 @@ interface UIStore {
   openWikiReader: (tagId: string, tagName: string, highlightText?: string, opts?: { newTab?: boolean }) => void;
   openReportDetail: (reportId: string, opts?: { newTab?: boolean; title?: string }) => void;
   closeReportDetail: () => void;
+  /// Open the specialized read-only view for a finding atom. Findings
+  /// are atoms with `kind = 'report'`; this opener routes them to the
+  /// dedicated `/findings/:atomId` URL + FindingReader component
+  /// instead of the generic AtomReader.
+  openFindingReader: (atomId: string, opts?: { newTab?: boolean; title?: string }) => void;
+  closeFindingReader: () => void;
+
+  /// Redirect from an atom tab to a finding tab without polluting the
+  /// browser back stack. Used by AtomReader when it loads an atom and
+  /// discovers `kind === 'report'` — semantic search and stale
+  /// /atoms/:id URLs can land on a finding, and the user expects to
+  /// end up in the specialized FindingReader rather than the generic
+  /// AtomReader. The active tab is morphed in place (same tab id,
+  /// same ordinal, history.replaceState semantics on the URL).
+  redirectAtomTabToFinding: (atomId: string) => void;
   overlayNavigate: (entry: OverlayNavEntry, opts?: { newTab?: boolean }) => void;
   overlayBack: () => void;
   overlayForward: () => void;
@@ -191,6 +214,7 @@ function entriesEquivalent(a: TabEntry, b: TabEntry): boolean {
   if (a.type === 'wiki' && b.type === 'wiki') return a.tagId === b.tagId;
   if (a.type === 'graph' && b.type === 'graph') return a.atomId === b.atomId;
   if (a.type === 'report' && b.type === 'report') return a.reportId === b.reportId;
+  if (a.type === 'finding' && b.type === 'finding') return a.atomId === b.atomId;
   return false;
 }
 
@@ -198,6 +222,7 @@ function entryUrl(entry: TabEntry): string {
   if (entry.type === 'atom') return atomReaderPath(entry.atomId, entry.tagId);
   if (entry.type === 'wiki') return wikiReaderPath(entry.tagId, entry.tagName);
   if (entry.type === 'report') return reportDetailPath(entry.reportId);
+  if (entry.type === 'finding') return findingReaderPath(entry.atomId);
   return atomGraphPath(entry.atomId, entry.tagId);
 }
 
@@ -207,17 +232,20 @@ function projectActiveEntry(entry: TabEntry | null): {
   readerState: ReaderState;
   wikiReaderState: WikiReaderState;
   reportsDetailState: ReportsDetailState;
+  findingReaderState: FindingReaderState;
   localGraphPatch: Partial<LocalGraphState>;
 } {
   const emptyReader: ReaderState = { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' };
   const emptyWiki: WikiReaderState = { tagId: null, tagName: null, highlightText: null };
   const emptyReport: ReportsDetailState = { reportId: null };
+  const emptyFinding: FindingReaderState = { atomId: null };
 
   if (!entry) {
     return {
       readerState: emptyReader,
       wikiReaderState: emptyWiki,
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false, centerAtomId: null, navigationHistory: [] },
     };
   }
@@ -231,6 +259,7 @@ function projectActiveEntry(entry: TabEntry | null): {
       },
       wikiReaderState: emptyWiki,
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false },
     };
   }
@@ -239,6 +268,7 @@ function projectActiveEntry(entry: TabEntry | null): {
       readerState: emptyReader,
       wikiReaderState: { tagId: entry.tagId, tagName: entry.tagName, highlightText: entry.highlightText },
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false },
     };
   }
@@ -247,6 +277,16 @@ function projectActiveEntry(entry: TabEntry | null): {
       readerState: emptyReader,
       wikiReaderState: emptyWiki,
       reportsDetailState: { reportId: entry.reportId },
+      findingReaderState: emptyFinding,
+      localGraphPatch: { isOpen: false },
+    };
+  }
+  if (entry.type === 'finding') {
+    return {
+      readerState: emptyReader,
+      wikiReaderState: emptyWiki,
+      reportsDetailState: emptyReport,
+      findingReaderState: { atomId: entry.atomId },
       localGraphPatch: { isOpen: false },
     };
   }
@@ -254,6 +294,7 @@ function projectActiveEntry(entry: TabEntry | null): {
     readerState: emptyReader,
     wikiReaderState: emptyWiki,
     reportsDetailState: emptyReport,
+    findingReaderState: emptyFinding,
     localGraphPatch: {
       isOpen: true,
       centerAtomId: entry.atomId,
@@ -280,6 +321,9 @@ export const useUIStore = create<UIStore>()(
       },
       reportsDetailState: {
         reportId: null,
+      },
+      findingReaderState: {
+        atomId: null,
       },
       tabs: [],
       activeTabId: null,
@@ -653,6 +697,65 @@ export const useUIStore = create<UIStore>()(
         const state = get();
         state.deactivateTabs();
         navigateTo(viewPath('reports', state.selectedTagId));
+      },
+
+      openFindingReader: (atomId, opts) => {
+        get().openEntry(
+          {
+            type: 'finding',
+            atomId,
+            title: opts?.title,
+          },
+          { newTab: opts?.newTab },
+        );
+      },
+
+      closeFindingReader: () => {
+        // Same deactivate-without-close semantics as closeReportDetail:
+        // findings are read-only and users frequently return to them,
+        // so destroying the tab on every back-trip is unfriendly.
+        const state = get();
+        state.deactivateTabs();
+        navigateTo(viewPath(state.viewMode, state.selectedTagId));
+      },
+
+      redirectAtomTabToFinding: (atomId) => {
+        const state = get();
+        const activeTab = state.activeTabId
+          ? state.tabs.find((t) => t.id === state.activeTabId) ?? null
+          : null;
+        const currentEntry = activeTab?.stack[activeTab.stackIndex];
+
+        // Only morph in place when the active tab is exactly the atom
+        // tab for this id. Otherwise (no active tab, different tab,
+        // chain stack pointing elsewhere) fall back to a fresh
+        // openEntry — which pushes a new tab + URL, the same behavior
+        // anyone calling openFindingReader directly would see.
+        if (
+          !activeTab ||
+          !currentEntry ||
+          currentEntry.type !== 'atom' ||
+          currentEntry.atomId !== atomId
+        ) {
+          state.openFindingReader(atomId);
+          return;
+        }
+
+        const findingEntry: TabEntry = { type: 'finding', atomId };
+        const newStack = [
+          ...activeTab.stack.slice(0, activeTab.stackIndex),
+          findingEntry,
+          ...activeTab.stack.slice(activeTab.stackIndex + 1),
+        ];
+        const projected = projectActiveEntry(findingEntry);
+        set((s) => ({
+          tabs: s.tabs.map((t) => (t.id === activeTab.id ? { ...t, stack: newStack } : t)),
+          ...projected,
+          localGraph: { ...s.localGraph, ...projected.localGraphPatch },
+        }));
+        // Replace, not push — the /atoms/:id URL was an accidental
+        // detour, not a step in the user's intended navigation.
+        navigateTo(entryUrl(findingEntry), { replace: true });
       },
 
       overlayNavigate: (entry, opts) => {

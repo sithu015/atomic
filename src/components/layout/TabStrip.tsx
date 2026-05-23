@@ -15,11 +15,12 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { motion } from 'motion/react';
-import { ChevronLeft, ChevronRight, X, BookOpen, Network, FileText, Telescope } from 'lucide-react';
+import { ChevronLeft, ChevronRight, X, BookOpen, Network, FileText, Telescope, Quote } from 'lucide-react';
 import { useUIStore, type Tab, type TabEntry } from '../../stores/ui';
 import { useAtomsStore } from '../../stores/atoms';
 import { useReportsStore } from '../../stores/reports';
 import { getTransport } from '../../lib/transport';
+import { formatRelativeDate } from '../../lib/date';
 
 const PILL_WIDTH = 156;
 
@@ -51,7 +52,7 @@ function fetchAtomTitle(atomId: string, onResolved: (title: string) => void): vo
     });
 }
 
-function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; icon: 'atom' | 'wiki' | 'graph' | 'report' } {
+function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; icon: 'atom' | 'wiki' | 'graph' | 'report' | 'finding' } {
   const atomFromStore = useAtomsStore(
     useShallow((s) => {
       if (entry.type === 'atom' || entry.type === 'graph') {
@@ -68,6 +69,28 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
     useShallow((s) => (entry.type === 'report' ? s.byId[entry.reportId]?.name ?? null : null))
   );
 
+  // For finding tabs, walk the findings cache to recover the parent
+  // report's name + creation date so the label reads as a meaningful
+  // breadcrumb ("Daily Briefing · 2H AGO"). Cache hits cover everything
+  // the user opened via the detail view; a cold deep-link without
+  // cache support falls back to entry.title or "Finding".
+  const findingMeta = useReportsStore(
+    useShallow((s) => {
+      if (entry.type !== 'finding') return null;
+      for (const [reportId, findings] of Object.entries(s.findingsByReport)) {
+        for (const f of findings) {
+          if (f.atom.id === entry.atomId) {
+            return {
+              reportName: s.byId[reportId]?.name ?? f.finding.report_name_snapshot ?? null,
+              createdAt: f.atom.created_at,
+            };
+          }
+        }
+      }
+      return null;
+    })
+  );
+
   const [resolved, setResolved] = useState<string | null>(() => {
     if (entry.type === 'atom' || entry.type === 'graph') {
       return titleCache.get(entry.atomId) ?? null;
@@ -76,7 +99,7 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
   });
 
   useEffect(() => {
-    if (entry.type === 'wiki' || entry.type === 'report') return;
+    if (entry.type === 'wiki' || entry.type === 'report' || entry.type === 'finding') return;
     if (atomFromStore && atomFromStore.trim().length > 0) return;
     if (entry.title && entry.title.trim().length > 0) return;
     fetchAtomTitle(entry.atomId, (title) => setResolved(title));
@@ -92,6 +115,19 @@ function useResolvedTitle(entry: TabEntry, ordinal: number): { label: string; ic
       (entry.title && entry.title.trim()) ||
       `Report ${ordinal}`;
     return { label, icon: 'report' };
+  }
+
+  if (entry.type === 'finding') {
+    const name = findingMeta?.reportName?.trim();
+    const date = findingMeta?.createdAt
+      ? formatRelativeDate(findingMeta.createdAt).toUpperCase()
+      : null;
+    const label =
+      (name && date) ? `${name} · ${date}` :
+      (name) ? name :
+      (entry.title && entry.title.trim()) ||
+      `Finding ${ordinal}`;
+    return { label, icon: 'finding' };
   }
 
   const candidate =
@@ -126,6 +162,7 @@ function SortablePill({ tab, isActive, onSwitch, onClose, onBack, onForward, onM
     icon === 'wiki' ? BookOpen :
     icon === 'graph' ? Network :
     icon === 'report' ? Telescope :
+    icon === 'finding' ? Quote :
     FileText;
 
   const style: React.CSSProperties = {

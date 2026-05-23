@@ -299,6 +299,10 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: (a) =>
       `/api/findings/${encodeURIComponent(a.atom_id as string)}/citations`,
   },
+  get_finding_provenance: {
+    method: 'GET',
+    path: (a) => `/api/findings/${encodeURIComponent(a.atom_id as string)}`,
+  },
   run_report_now: {
     method: 'POST',
     path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}/run`,

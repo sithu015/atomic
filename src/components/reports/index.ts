@@ -1,5 +1,6 @@
 export { ReportsFullView } from './ReportsFullView';
 export { ReportDetailView } from './ReportDetailView';
+export { FindingReader } from './FindingReader';
 export { FindingsList } from './FindingsList';
 export { FindingRow } from './FindingRow';
 export { FeaturedStarButton } from './FeaturedStarButton';

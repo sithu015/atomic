@@ -50,7 +50,7 @@ export function ReportDetailView({ reportId }: ReportDetailViewProps) {
   const deleteReport = useReportsStore(s => s.delete);
   const ensureSubscription = useReportsStore(s => s.ensureSubscription);
   const closeReportDetail = useUIStore(s => s.closeReportDetail);
-  const openReader = useUIStore(s => s.openReader);
+  const openFindingReader = useUIStore(s => s.openFindingReader);
 
   const [isInitialFetch, setIsInitialFetch] = useState(!report);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -302,7 +302,7 @@ export function ReportDetailView({ reportId }: ReportDetailViewProps) {
           <FindingsList
             findings={findings}
             isLoading={findings === undefined}
-            onFindingClick={(atomId) => openReader(atomId)}
+            onFindingClick={(atomId) => openFindingReader(atomId)}
           />
         ) : null}
       </div>

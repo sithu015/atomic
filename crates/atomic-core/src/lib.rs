@@ -2006,6 +2006,20 @@ impl AtomicCore {
             .await
     }
 
+    /// Fetch the provenance row (`ReportFinding`) for a finding atom.
+    /// `None` if the atom isn't a finding (no provenance recorded), or
+    /// if the atom doesn't exist. The FindingReader frontend view uses
+    /// this to surface the parent report name + run timestamp on a
+    /// cold deep-link where the row isn't in any in-memory cache.
+    pub async fn get_finding_provenance(
+        &self,
+        finding_atom_id: &str,
+    ) -> Result<Option<models::ReportFinding>, AtomicCoreError> {
+        self.storage
+            .get_finding_provenance_sync(finding_atom_id)
+            .await
+    }
+
     /// Manual "run now" entry point — same machinery as the scheduled
     /// loop, but the run row carries `trigger = 'manual'` for history.
     /// Returns immediately with a `RunOutcome::Skipped` if the report

@@ -160,6 +160,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/findings/{atom_id}/citations",
         web::get().to(reports::list_finding_citations),
     );
+    cfg.route(
+        "/findings/{atom_id}",
+        web::get().to(reports::get_finding_provenance),
+    );
 
     // Settings
     cfg.route("/settings", web::get().to(settings::get_settings));

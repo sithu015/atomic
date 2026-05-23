@@ -1,0 +1,242 @@
+import { useEffect, useState } from 'react';
+import { ArrowLeft, Telescope } from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  useReportsStore,
+  ReportFindingWithAtom,
+  ReportFinding,
+  ReportFindingCitation,
+} from '../../stores/reports';
+import { useUIStore } from '../../stores/ui';
+import { BriefingContent } from '../dashboard/widgets/BriefingContent';
+import { CitationPopover, CitationForPopover } from '../wiki/CitationPopover';
+import { formatRelativeDate } from '../../lib/date';
+
+interface FindingReaderProps {
+  atomId: string;
+}
+
+interface LoadedFinding {
+  atom: ReportFindingWithAtom['atom'];
+  finding: ReportFinding;
+  citations: ReportFindingCitation[];
+}
+
+/// Specialized read-only view for a single finding atom. Distinct from
+/// AtomReader because findings are agent output with structured
+/// citations: the `[N]` markers in the prose become clickable popovers
+/// that link to the cited atom, mirroring the dashboard widget's
+/// behavior on a full-page surface.
+///
+/// Data flow:
+/// - Try to read the finding from `useReportsStore.findingsByReport`
+///   first (populated when the user reached this view from
+///   ReportDetailView).
+/// - Otherwise fetch via `fetchFinding(atomId)`, which retrieves the
+///   atom, provenance, and citations in parallel and merges them into
+///   the cache so subsequent renders are instant.
+/// - If the fetch fails or returns null, surface a toast and close.
+export function FindingReader({ atomId }: FindingReaderProps) {
+  const cachedFinding = useReportsStore(s => {
+    for (const findings of Object.values(s.findingsByReport)) {
+      for (const f of findings) {
+        if (f.atom.id === atomId) return f;
+      }
+    }
+    return null;
+  });
+  const reportName = useReportsStore(s => {
+    const reportId = cachedFinding?.finding.report_id;
+    if (!reportId) return null;
+    return s.byId[reportId]?.name ?? null;
+  });
+  const fetchFinding = useReportsStore(s => s.fetchFinding);
+  const fetchOne = useReportsStore(s => s.fetchOne);
+  const closeFindingReader = useUIStore(s => s.closeFindingReader);
+  const openReportDetail = useUIStore(s => s.openReportDetail);
+  const openReader = useUIStore(s => s.openReader);
+
+  const [loaded, setLoaded] = useState<LoadedFinding | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [activeCitation, setActiveCitation] = useState<CitationForPopover | null>(null);
+  const [anchorRect, setAnchorRect] = useState<
+    { top: number; left: number; bottom: number; width: number } | null
+  >(null);
+
+  // Resolve the finding payload. Three branches:
+  //   - We've already loaded it locally (state) — render.
+  //   - The cache has the atom+provenance row — fetch only citations.
+  //   - Cold path — fetch everything via `fetchFinding`.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      // Cache hit: we already have atom + provenance. Just need
+      // citations (the cache stores them as a count but not the rows).
+      if (cachedFinding) {
+        setIsLoading(true);
+        try {
+          // Walk the same network path fetchFinding uses for citations
+          // only — slightly cheaper than the full triple-fetch when
+          // most of the data is already in memory.
+          const result = await fetchFinding(atomId);
+          if (cancelled) return;
+          setLoaded(result);
+        } finally {
+          if (!cancelled) setIsLoading(false);
+        }
+        return;
+      }
+
+      // Cold path. fetchFinding pulls the atom, provenance, and
+      // citations in parallel and merges into the cache.
+      setIsLoading(true);
+      try {
+        const result = await fetchFinding(atomId);
+        if (cancelled) return;
+        if (!result) {
+          toast.error('Finding unavailable', {
+            description: 'This atom is no longer a finding, or was deleted.',
+          });
+          closeFindingReader();
+          return;
+        }
+        setLoaded(result);
+        // Prime the report row so the breadcrumb's "From: <Report
+        // Name>" link has a name to render right away. fetchOne is
+        // idempotent if the row is already cached.
+        if (result.finding.report_id) {
+          void fetchOne(result.finding.report_id);
+        }
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    void load();
+    return () => { cancelled = true; };
+  }, [atomId, cachedFinding, fetchFinding, fetchOne, closeFindingReader]);
+
+  const displayedName = loaded
+    ? (reportName ?? loaded.finding.report_name_snapshot ?? 'Report')
+    : (reportName ?? cachedFinding?.finding.report_name_snapshot ?? null);
+
+  const displayedDate = loaded?.atom.created_at ?? cachedFinding?.atom.created_at ?? null;
+  const content = loaded?.atom.content ?? cachedFinding?.atom.content ?? '';
+
+  // Adapter: BriefingContent expects `FindingCitation` (citation_index +
+  // atom_id + excerpt); the reports store hands us `ReportFindingCitation`
+  // with `position` instead of `citation_index`. Rename the field.
+  const citationsForContent = (loaded?.citations ?? []).map(c => ({
+    citation_index: c.position,
+    atom_id: c.cited_atom_id,
+    excerpt: c.excerpt,
+  }));
+
+  const handleCitationClick = (
+    citation: { citation_index: number; atom_id: string; excerpt: string },
+    element: HTMLElement,
+  ) => {
+    const rect = element.getBoundingClientRect();
+    setActiveCitation(citation);
+    setAnchorRect({ top: rect.top, left: rect.left, bottom: rect.bottom, width: rect.width });
+  };
+
+  const closePopover = () => {
+    setActiveCitation(null);
+    setAnchorRect(null);
+  };
+
+  return (
+    <div className="h-full overflow-hidden flex flex-col">
+      {/* Header — back + parent-report breadcrumb + date eyebrow. */}
+      <div className="flex items-center gap-3 px-5 py-3 border-b border-[var(--color-border)] flex-shrink-0">
+        <button
+          onClick={closeFindingReader}
+          title="Back"
+          aria-label="Back"
+          className="
+            p-1.5 rounded-md text-[var(--color-text-secondary)]
+            hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]
+            transition-colors
+          "
+        >
+          <ArrowLeft className="w-4 h-4" strokeWidth={2} />
+        </button>
+
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <Telescope className="w-4 h-4 text-[var(--color-text-tertiary)] flex-shrink-0" strokeWidth={2} />
+          {displayedName ? (
+            <button
+              type="button"
+              onClick={() => {
+                const reportId = loaded?.finding.report_id ?? cachedFinding?.finding.report_id;
+                if (reportId) openReportDetail(reportId);
+              }}
+              disabled={!loaded?.finding.report_id && !cachedFinding?.finding.report_id}
+              className="
+                text-sm font-medium text-[var(--color-text-primary)] truncate
+                hover:text-[var(--color-accent-light)] transition-colors
+                disabled:hover:text-[var(--color-text-primary)] disabled:cursor-default
+              "
+            >
+              {displayedName}
+            </button>
+          ) : isLoading ? (
+            <div className="h-4 w-40 bg-[var(--color-border)] rounded animate-pulse" />
+          ) : (
+            <span className="text-sm font-medium text-[var(--color-text-tertiary)]">
+              Finding
+            </span>
+          )}
+          {displayedDate && (
+            <>
+              <span className="text-[var(--color-text-tertiary)]/40">·</span>
+              <span className="text-[10.5px] font-medium uppercase tracking-[0.14em] text-[var(--color-text-tertiary)] tabular-nums">
+                {formatRelativeDate(displayedDate).toUpperCase()}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Body — finding content with clickable citation markers. */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-6 py-8">
+          {loaded ? (
+            <BriefingContent
+              content={content}
+              citations={citationsForContent}
+              onCitationClick={handleCitationClick}
+            />
+          ) : isLoading ? (
+            <div className="space-y-3 animate-pulse">
+              <div className="h-4 w-full bg-[var(--color-border)] rounded" />
+              <div className="h-4 w-5/6 bg-[var(--color-border)] rounded" />
+              <div className="h-4 w-4/6 bg-[var(--color-border)] rounded" />
+              <div className="h-4 w-full bg-[var(--color-border)] rounded mt-6" />
+              <div className="h-4 w-3/4 bg-[var(--color-border)] rounded" />
+            </div>
+          ) : (
+            <p className="text-sm text-[var(--color-text-tertiary)]">
+              Finding unavailable.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Citation popover — same component the wiki + dashboard use. */}
+      {activeCitation && anchorRect && (
+        <CitationPopover
+          citation={activeCitation}
+          anchorRect={anchorRect}
+          onClose={closePopover}
+          onViewAtom={(citedAtomId, highlightText) => {
+            closePopover();
+            openReader(citedAtomId, highlightText ?? undefined);
+          }}
+        />
+      )}
+    </div>
+  );
+}

@@ -25,6 +25,7 @@ function entriesEquivalent(a: TabEntry, parsed: ParsedRoute): boolean {
   if (parsed.kind === 'graph') return a.type === 'graph' && a.atomId === parsed.atomId;
   if (parsed.kind === 'wiki-reader') return a.type === 'wiki' && a.tagId === parsed.tagId;
   if (parsed.kind === 'reports-detail') return a.type === 'report' && a.reportId === parsed.reportId;
+  if (parsed.kind === 'finding-reader') return a.type === 'finding' && a.atomId === parsed.atomId;
   return false;
 }
 
@@ -58,6 +59,12 @@ function entryFromRoute(parsed: ParsedRoute, fallbackEntry?: TabEntry): TabEntry
       : undefined;
     return { type: 'report', reportId: parsed.reportId, title };
   }
+  if (parsed.kind === 'finding-reader') {
+    const title = fallbackEntry?.type === 'finding' && fallbackEntry.atomId === parsed.atomId
+      ? fallbackEntry.title
+      : undefined;
+    return { type: 'finding', atomId: parsed.atomId, title };
+  }
   return null;
 }
 
@@ -65,12 +72,14 @@ function projectActiveEntry(entry: TabEntry | null) {
   const emptyReader = { atomId: null, highlightText: null, editing: false, saveStatus: 'idle' as const };
   const emptyWiki = { tagId: null, tagName: null, highlightText: null };
   const emptyReport = { reportId: null };
+  const emptyFinding = { atomId: null };
 
   if (!entry) {
     return {
       readerState: emptyReader,
       wikiReaderState: emptyWiki,
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false, centerAtomId: null, navigationHistory: [] as string[] },
     };
   }
@@ -84,6 +93,7 @@ function projectActiveEntry(entry: TabEntry | null) {
       },
       wikiReaderState: emptyWiki,
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false },
     };
   }
@@ -92,6 +102,7 @@ function projectActiveEntry(entry: TabEntry | null) {
       readerState: emptyReader,
       wikiReaderState: { tagId: entry.tagId, tagName: entry.tagName, highlightText: entry.highlightText },
       reportsDetailState: emptyReport,
+      findingReaderState: emptyFinding,
       localGraphPatch: { isOpen: false },
     };
   }
@@ -100,6 +111,16 @@ function projectActiveEntry(entry: TabEntry | null) {
       readerState: emptyReader,
       wikiReaderState: emptyWiki,
       reportsDetailState: { reportId: entry.reportId },
+      findingReaderState: emptyFinding,
+      localGraphPatch: { isOpen: false },
+    };
+  }
+  if (entry.type === 'finding') {
+    return {
+      readerState: emptyReader,
+      wikiReaderState: emptyWiki,
+      reportsDetailState: emptyReport,
+      findingReaderState: { atomId: entry.atomId },
       localGraphPatch: { isOpen: false },
     };
   }
@@ -107,6 +128,7 @@ function projectActiveEntry(entry: TabEntry | null) {
     readerState: emptyReader,
     wikiReaderState: emptyWiki,
     reportsDetailState: emptyReport,
+    findingReaderState: emptyFinding,
     localGraphPatch: {
       isOpen: true,
       centerAtomId: entry.atomId,
@@ -223,6 +245,7 @@ export function RouterBridge() {
         store.readerState.atomId !== null ||
         store.wikiReaderState.tagId !== null ||
         store.reportsDetailState.reportId !== null ||
+        store.findingReaderState.atomId !== null ||
         store.localGraph.isOpen;
       if (!needsUpdate) return;
       useUIStore.setState((s) => ({
@@ -244,7 +267,9 @@ export function RouterBridge() {
         tabs: reconciled.tabs,
         activeTabId: reconciled.activeTabId,
         selectedTagId:
-          parsed.kind === 'wiki-reader' || parsed.kind === 'reports-detail'
+          parsed.kind === 'wiki-reader' ||
+          parsed.kind === 'reports-detail' ||
+          parsed.kind === 'finding-reader'
             ? s.selectedTagId
             : (parsed.tagId ?? s.selectedTagId),
         ...projected,
@@ -271,7 +296,9 @@ export function RouterBridge() {
       activeTabId: tabId,
       nextTabOrdinal: s.nextTabOrdinal + 1,
       selectedTagId:
-        parsed.kind === 'wiki-reader' || parsed.kind === 'reports-detail'
+        parsed.kind === 'wiki-reader' ||
+        parsed.kind === 'reports-detail' ||
+        parsed.kind === 'finding-reader'
           ? s.selectedTagId
           : (parsed.tagId ?? s.selectedTagId),
       ...projected,
