@@ -86,21 +86,22 @@ impl RetentionPolicy {
     /// gotcha). No seed rows exist: a fresh DB's empty settings table
     /// yields the defaults, and missing / unparseable / non-positive
     /// values fall back per-knob.
-    pub async fn load(core: &AtomicCore) -> Self {
-        let settings = core
-            .storage()
-            .get_all_settings_sync()
-            .await
-            .unwrap_or_default();
+    ///
+    /// A storage *read error* propagates instead of defaulting: the
+    /// defaults may be tighter than the operator's configured overrides,
+    /// so failing open here would delete more history than asked. The
+    /// caller skips the sweep instead (see [`TaskRunsGcTask::run`]).
+    pub async fn load(core: &AtomicCore) -> Result<Self, AtomicCoreError> {
+        let settings = core.storage().get_all_settings_sync().await?;
         let defaults = Self::default();
-        Self {
+        Ok(Self {
             keep_per_subject: parse_positive(&settings, "keep_per_subject")
                 .and_then(|v| i32::try_from(v).ok())
                 .unwrap_or(defaults.keep_per_subject),
             retain_days: parse_positive(&settings, "retain_days").unwrap_or(defaults.retain_days),
             retain_failed_days: parse_positive(&settings, "retain_failed_days")
                 .unwrap_or(defaults.retain_failed_days),
-        }
+        })
     }
 }
 
@@ -184,7 +185,21 @@ impl ScheduledTask for TaskRunsGcTask {
     // interval elapsed since the last successful sweep.
 
     async fn run(&self, core: &AtomicCore, _ctx: &TaskContext) -> Result<(), TaskError> {
-        let policy = RetentionPolicy::load(core).await;
+        // Fail closed: if the knobs can't be read, skip the sweep entirely
+        // rather than deleting under the (possibly tighter-than-configured)
+        // defaults. Returning the error settles it on the ledger row, so
+        // the skipped sweep is visible in run history and retried with
+        // backoff instead of silently waiting out the next interval.
+        let policy = match RetentionPolicy::load(core).await {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[task_runs_gc] retention settings unreadable; skipping sweep"
+                );
+                return Err(e.into());
+            }
+        };
         let outcome = sweep(core, &policy, DELETE_BATCH_SIZE).await?;
         if outcome.deleted > 0 {
             tracing::info!(

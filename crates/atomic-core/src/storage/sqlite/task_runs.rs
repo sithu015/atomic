@@ -405,6 +405,37 @@ impl SqliteStorage {
         Ok(changed == 1)
     }
 
+    /// Force-settle moot rows for a deleted subject. No lease fence and no
+    /// runnability gate — see `TaskRunStore::settle_task_runs_moot` for why
+    /// both are deliberately skipped. Mirrors `complete_task_run_sync`'s
+    /// column writes (succeeded, lease and error cleared) so settled rows
+    /// read like any other success in history.
+    pub(crate) fn settle_task_runs_moot_sync(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let changed = conn.execute(
+            "UPDATE task_runs
+                SET state       = 'succeeded',
+                    finished_at = ?3,
+                    lease_until = NULL,
+                    last_error  = NULL,
+                    updated_at  = ?3
+              WHERE task_id = ?1
+                AND subject_id = ?2
+                AND state IN ('pending', 'running')",
+            params![task_id, subject_id, finished_at],
+        )?;
+        Ok(changed as u64)
+    }
+
     pub(crate) fn list_recent_task_runs_sync(
         &self,
         task_id: &str,
@@ -677,6 +708,23 @@ impl TaskRunStore for SqliteStorage {
         let finished_at = finished_at.to_string();
         tokio::task::spawn_blocking(move || {
             storage.fail_task_run_abandon_sync(&id, &expected_lease, &last_error, &finished_at)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn settle_task_runs_moot(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64> {
+        let storage = self.clone();
+        let task_id = task_id.to_string();
+        let subject_id = subject_id.to_string();
+        let finished_at = finished_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.settle_task_runs_moot_sync(&task_id, &subject_id, &finished_at)
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?

@@ -3803,8 +3803,34 @@ impl AtomicCore {
     }
 
     /// Delete a feed. Does NOT delete atoms created from this feed.
+    ///
+    /// Also settles any non-terminal `feed_poll` ledger rows for the feed
+    /// as moot successes — the same terminal shape `wiki::runner` gives a
+    /// pending regen whose tag was deleted. Without this, a backed-off
+    /// retry (or a crashed run) for the deleted feed would sit in the
+    /// ledger forever: the poll sweep only visits feeds that still have a
+    /// definition row, and GC never deletes non-terminal rows. Settling
+    /// after the definition delete keeps the window for a racing poll to
+    /// insert a fresh row as small as possible; a poll already in flight
+    /// loses its terminal write on the state predicate and exits quietly.
     pub async fn delete_feed(&self, id: &str) -> Result<(), AtomicCoreError> {
-        self.storage.delete_feed_sync(id).await
+        self.storage.delete_feed_sync(id).await?;
+        let settled = self
+            .storage
+            .settle_task_runs_moot_sync(
+                ingest::poller::FEED_POLL_TASK_ID,
+                id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await?;
+        if settled > 0 {
+            tracing::info!(
+                feed_id = %id,
+                settled,
+                "[feed_poll] feed deleted; settled its non-terminal ledger rows"
+            );
+        }
+        Ok(())
     }
 
     /// Poll a single feed through the `task_runs` ledger: one run per poll
@@ -7267,7 +7293,10 @@ mod tests {
         // invariant — no migration seeds these keys) yields the plan's
         // defaults.
         let (db, _temp) = create_test_db().await;
-        assert_eq!(RetentionPolicy::load(&db).await, RetentionPolicy::default());
+        assert_eq!(
+            RetentionPolicy::load(&db).await.unwrap(),
+            RetentionPolicy::default()
+        );
 
         // Valid overrides are honored. Written via storage directly —
         // the same per-DB path the loader reads.
@@ -7279,7 +7308,7 @@ mod tests {
             db.storage.set_setting_sync(key, value).await.unwrap();
         }
         assert_eq!(
-            RetentionPolicy::load(&db).await,
+            RetentionPolicy::load(&db).await.unwrap(),
             RetentionPolicy {
                 keep_per_subject: 5,
                 retain_days: 7,
@@ -7296,7 +7325,54 @@ mod tests {
         ] {
             db.storage.set_setting_sync(key, value).await.unwrap();
         }
-        assert_eq!(RetentionPolicy::load(&db).await, RetentionPolicy::default());
+        assert_eq!(
+            RetentionPolicy::load(&db).await.unwrap(),
+            RetentionPolicy::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_skips_sweep_when_policy_load_fails() {
+        // Fail closed: a settings read error must skip the sweep — the
+        // defaults may be tighter than the operator's overrides, so falling
+        // back to them could delete history that was configured to be kept.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        // A row the default policy would collect (terminal, past the age cap).
+        seed_terminal_run(
+            &db,
+            "stub_gc_fail_closed",
+            TaskRunState::Succeeded,
+            now - chrono::Duration::days(40),
+        )
+        .await;
+
+        // Break the per-DB settings table to force a real read error on the
+        // exact path RetentionPolicy::load uses.
+        {
+            let sqlite = db.storage.as_sqlite().unwrap();
+            let conn = sqlite.db.conn.lock().unwrap();
+            conn.execute("ALTER TABLE settings RENAME TO settings_broken", [])
+                .unwrap();
+        }
+
+        assert!(
+            RetentionPolicy::load(&db).await.is_err(),
+            "load must surface the read error, not default"
+        );
+        let ctx = noop_ctx();
+        assert!(
+            TaskRunsGcTask.run(&db, &ctx).await.is_err(),
+            "the run fails (skipping the sweep) instead of deleting under defaults"
+        );
+        assert_eq!(
+            db.list_task_runs("stub_gc_fail_closed", None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nothing was deleted while the policy was unreadable"
+        );
     }
 
     #[tokio::test]
@@ -7622,6 +7698,61 @@ mod tests {
         assert_eq!(history.len(), 1, "single run row — no double poll");
         assert_eq!(history[0].state, TaskRunState::Succeeded);
         assert_eq!(history[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_feed_settles_nonterminal_ledger_rows() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 0).await;
+
+        // One failed poll leaves a pending row backed off into the future —
+        // exactly the row no sweep can ever reach once the feed definition
+        // is gone (the sweep only visits feeds that still exist, and GC
+        // never deletes non-terminal rows).
+        poll_sweep(&db).await;
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending);
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "test premise: the row is inside its backoff window"
+        );
+
+        db.delete_feed(&broken.id).await.unwrap();
+
+        assert!(
+            db.storage
+                .find_active_task_run_sync(FEED_POLL_TASK_ID, Some(&broken.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "no non-terminal rows survive feed deletion"
+        );
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "history is preserved, not deleted");
+        assert_eq!(
+            history[0].state,
+            TaskRunState::Succeeded,
+            "settled as moot success — same shape as wiki's deleted-tag path"
+        );
+        assert!(history[0].finished_at.is_some());
+
+        // A later sweep neither errors nor resurrects work for the feed.
+        assert!(poll_sweep(&db).await.is_empty());
+        assert_eq!(
+            db.list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the deleted feed never re-enters the ledger"
+        );
     }
 
     // ==================== Wiki regen via the ledger (phase 4) ====================

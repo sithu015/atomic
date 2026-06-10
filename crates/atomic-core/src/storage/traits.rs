@@ -1184,6 +1184,30 @@ pub trait TaskRunStore: Send + Sync {
         finished_at: &str,
     ) -> StorageResult<bool>;
 
+    /// Force-settle every non-terminal row for `(task_id, subject_id)` as a
+    /// moot success: `state = 'succeeded'` with no `result_id` — the same
+    /// terminal shape `wiki::runner` gives a pending regen whose tag was
+    /// deleted. Called when the subject's *definition* is deleted (e.g. a
+    /// feed), so the work can never run to a meaningful result again.
+    ///
+    /// Unlike the other terminal writers this deliberately skips both the
+    /// lease fence and the runnability gate: a backed-off `pending` row
+    /// (future `next_attempt_at`) or a `running` row with a live lease is
+    /// unclaimable through the normal path, and with the definition gone no
+    /// sweep will ever revisit it — a non-terminal row would sit in the
+    /// ledger forever (GC never deletes live execution state). A worker
+    /// whose in-flight row is settled out from under it loses its own
+    /// terminal write on the `state = 'running'` predicate and exits
+    /// quietly — the same semantics as being reclaimed by a peer.
+    ///
+    /// Returns the number of rows settled.
+    async fn settle_task_runs_moot(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64>;
+
     /// Most-recent-first run history for a task. `subject_id = None` matches
     /// any subject_id (history-by-task); `Some(...)` filters to that subject.
     async fn list_recent_task_runs(

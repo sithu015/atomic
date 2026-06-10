@@ -812,6 +812,89 @@ async fn test_gc_task_runs_batches_are_bounded(storage: &dyn TaskRunStore) {
     assert!(surviving_gc_ids(storage, &task_id).await.is_empty());
 }
 
+/// Force-settling moot rows (subject definition deleted, e.g. a feed):
+/// every non-terminal row for the `(task_id, subject_id)` settles
+/// `succeeded` — backed-off pending and live-lease running alike, since
+/// neither is claimable through the normal path and no sweep will ever
+/// revisit them once the definition is gone. Terminal history and other
+/// subjects are untouched.
+async fn test_settle_task_runs_moot(storage: &dyn TaskRunStore) {
+    let task_id = format!("moot_test::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let future = (now + chrono::Duration::minutes(30)).to_rfc3339();
+    let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
+
+    // subject-a: a backed-off pending row (unclaimable until `future`)
+    // plus terminal history that must survive the settle untouched.
+    let backed_off = task_run_row(&task_id, "subject-a", TaskRunState::Pending, &future, None);
+    let history = task_run_row(&task_id, "subject-a", TaskRunState::Abandoned, &past, None);
+    // subject-b: a running row with a live lease (a poll in flight).
+    let in_flight = task_run_row(
+        &task_id,
+        "subject-b",
+        TaskRunState::Running,
+        &past,
+        Some(&future),
+    );
+    for row in [&backed_off, &history, &in_flight] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    let settled = storage
+        .settle_task_runs_moot(&task_id, "subject-a", &now_str)
+        .await
+        .unwrap();
+    assert_eq!(settled, 1, "only subject-a's non-terminal row settles");
+
+    let row = storage.get_task_run(&backed_off.id).await.unwrap().unwrap();
+    assert_eq!(row.state, TaskRunState::Succeeded);
+    assert!(row.lease_until.is_none());
+    assert!(row.finished_at.is_some());
+    assert!(
+        storage
+            .find_active_task_run(&task_id, Some("subject-a"))
+            .await
+            .unwrap()
+            .is_none(),
+        "no non-terminal rows remain for the settled subject"
+    );
+    let untouched = storage.get_task_run(&history.id).await.unwrap().unwrap();
+    assert_eq!(
+        untouched.state,
+        TaskRunState::Abandoned,
+        "terminal history keeps its state — settle is not a rewrite"
+    );
+
+    // The sibling subject's in-flight row is another definition's business.
+    let sibling = storage.get_task_run(&in_flight.id).await.unwrap().unwrap();
+    assert_eq!(sibling.state, TaskRunState::Running);
+
+    // A live lease is no shield when its own subject is deleted…
+    let settled = storage
+        .settle_task_runs_moot(&task_id, "subject-b", &now_str)
+        .await
+        .unwrap();
+    assert_eq!(settled, 1);
+    let row = storage.get_task_run(&in_flight.id).await.unwrap().unwrap();
+    assert_eq!(row.state, TaskRunState::Succeeded);
+    // …and the displaced worker's terminal write loses cleanly on the
+    // state predicate instead of resurrecting the row.
+    assert!(!storage
+        .fail_task_run_retry(&in_flight.id, &future, "boom", &now_str, &future)
+        .await
+        .unwrap());
+
+    // Idempotent: nothing left to settle.
+    assert_eq!(
+        storage
+            .settle_task_runs_moot(&task_id, "subject-a", &now_str)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 // ==================== ChatStore Tests ====================
 
 async fn test_create_conversation(storage: &dyn ChatStore) {
@@ -1056,6 +1139,12 @@ async fn sqlite_gc_task_runs_batches_are_bounded() {
 }
 
 #[tokio::test]
+async fn sqlite_settle_task_runs_moot() {
+    let (s, _dir) = sqlite_storage().await;
+    test_settle_task_runs_moot(&s).await;
+}
+
+#[tokio::test]
 async fn sqlite_create_conversation() {
     let (s, _dir) = sqlite_storage().await;
     test_create_conversation(&s).await;
@@ -1206,6 +1295,7 @@ mod postgres_tests {
         pg_gc_task_runs_batches_are_bounded,
         test_gc_task_runs_batches_are_bounded
     );
+    pg_test!(pg_settle_task_runs_moot, test_settle_task_runs_moot);
     pg_test!(pg_create_conversation, test_create_conversation);
     pg_test!(pg_save_and_get_messages, test_save_and_get_messages);
     pg_test!(pg_delete_conversation, test_delete_conversation);
@@ -1446,5 +1536,207 @@ mod postgres_tests {
         .execute(s.pool())
         .await;
         assert!(dup.is_err(), "duplicate (db_id, key) must violate the PK");
+    }
+
+    /// Cross-`db_id` fencing for the ledger sweep: runnable rows are scoped
+    /// to the logical database, so one database's sweeper (wiki regen,
+    /// crash recovery) can never see — let alone claim — a sibling's
+    /// backlog on a shared Postgres cluster.
+    #[tokio::test]
+    async fn pg_list_runnable_task_runs_scoped_by_db_id() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let alpha = s.with_db_id("task_runs_fence_alpha");
+        let beta = s.with_db_id("task_runs_fence_beta");
+
+        let task_id = format!("fence_sweep::{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
+
+        // Same (task_id, subject) in both databases — legal, because the
+        // active-row unique index is keyed on db_id too.
+        let alpha_row = task_run_row(&task_id, "subject", TaskRunState::Pending, &past, None);
+        let beta_row = task_run_row(&task_id, "subject", TaskRunState::Pending, &past, None);
+        alpha.insert_task_run(&alpha_row).await.unwrap();
+        beta.insert_task_run(&beta_row).await.unwrap();
+
+        let now_str = now.to_rfc3339();
+        let alpha_runnable = alpha
+            .list_runnable_task_runs(&task_id, &now_str)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = alpha_runnable.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![alpha_row.id.as_str()],
+            "alpha's sweep surfaces only alpha's row"
+        );
+        let beta_runnable = beta
+            .list_runnable_task_runs(&task_id, &now_str)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = beta_runnable.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![beta_row.id.as_str()],
+            "beta's sweep surfaces only beta's row"
+        );
+    }
+
+    /// Cross-`db_id` fencing for retention GC: a sweep in one logical
+    /// database must rank and delete only its own history — the sibling's
+    /// rows are invisible to both the eligibility CTEs and the DELETE.
+    #[tokio::test]
+    async fn pg_gc_task_runs_scoped_by_db_id() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let alpha = s.with_db_id("task_runs_gc_alpha");
+        let beta = s.with_db_id("task_runs_gc_beta");
+
+        let task_id = format!("fence_gc::{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let ancient = (now - chrono::Duration::days(400)).to_rfc3339();
+
+        let alpha_row = gc_run_row(&task_id, Some("subject"), TaskRunState::Succeeded, &ancient);
+        let beta_row = gc_run_row(&task_id, Some("subject"), TaskRunState::Succeeded, &ancient);
+        alpha.insert_task_run(&alpha_row).await.unwrap();
+        beta.insert_task_run(&beta_row).await.unwrap();
+
+        // keep = 0 with both cutoffs at `now`: every terminal row visible
+        // to the sweep is eligible — db_id scoping is the only protection.
+        let now_str = now.to_rfc3339();
+        let deleted = alpha
+            .gc_task_runs(0, &now_str, &now_str, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "alpha collects exactly its own history");
+        assert!(alpha.get_task_run(&alpha_row.id).await.unwrap().is_none());
+        assert!(
+            beta.get_task_run(&beta_row.id).await.unwrap().is_some(),
+            "the sibling database's history must survive alpha's GC"
+        );
+    }
+
+    /// Crash recovery against Postgres through the real claim path: a
+    /// `running` row whose lease expired (the process died mid-run) is
+    /// reclaimed by `ledger::claim_or_create` — same row, no new insert,
+    /// no attempt bump — and settles normally. Mirrors
+    /// `dispatch_reclaims_running_row_with_expired_lease` in lib.rs.
+    #[tokio::test]
+    async fn pg_expired_lease_reclaimed_through_claim_path() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let storage = s.with_db_id("task_runs_reclaim");
+        let core = atomic_core::AtomicCore::from_postgres_storage(storage.clone());
+
+        let task_id = format!("crash::{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let expired_lease = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let mut crashed = task_run_row(
+            &task_id,
+            "subject",
+            TaskRunState::Running,
+            &now.to_rfc3339(),
+            Some(&expired_lease),
+        );
+        crashed.started_at = Some((now - chrono::Duration::minutes(20)).to_rfc3339());
+        storage.insert_task_run(&crashed).await.unwrap();
+
+        let handle = atomic_core::scheduler::ledger::claim_or_create(
+            &core,
+            &task_id,
+            Some("subject"),
+            TaskRunTrigger::Schedule,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("a running row with an expired lease must be reclaimable");
+        assert_eq!(
+            handle.run().id,
+            crashed.id,
+            "reclaimed the crashed row — no new row inserted"
+        );
+        assert_eq!(
+            handle.run().attempts,
+            1,
+            "reclaim must NOT bump attempts — a crash isn't a logic failure"
+        );
+        assert!(
+            handle.run().lease_until.as_deref() > Some(expired_lease.as_str()),
+            "reclaim granted a fresh lease"
+        );
+
+        assert!(
+            handle.complete(None).await.unwrap(),
+            "the reclaimer owns the lease and settles the row"
+        );
+        let row = storage.get_task_run(&crashed.id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskRunState::Succeeded);
+        assert_eq!(row.attempts, 1);
+    }
+
+    /// Deleting a feed settles its stranded ledger rows on Postgres too:
+    /// the core path (`delete_feed` → `settle_task_runs_moot`) runs fenced
+    /// by `db_id`. Companion to `delete_feed_settles_nonterminal_ledger_rows`
+    /// in lib.rs, which drives the same path on SQLite.
+    #[tokio::test]
+    async fn pg_delete_feed_settles_nonterminal_ledger_rows() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let storage = s.with_db_id("feed_delete_settle");
+        let core = atomic_core::AtomicCore::from_postgres_storage(storage.clone());
+
+        let feed = storage
+            .create_feed(
+                "https://example.com/doomed.xml",
+                Some("Doomed"),
+                None,
+                60,
+                &[],
+            )
+            .await
+            .unwrap();
+        // A failed poll's backed-off retry: pending with `next_attempt_at`
+        // in the future — unclaimable, and unreachable by the poll sweep
+        // once the definition row is gone.
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+        let row = task_run_row(
+            atomic_core::ingest::poller::FEED_POLL_TASK_ID,
+            &feed.id,
+            TaskRunState::Pending,
+            &future,
+            None,
+        );
+        storage.insert_task_run(&row).await.unwrap();
+
+        core.delete_feed(&feed.id).await.unwrap();
+
+        assert!(
+            storage
+                .find_active_task_run(
+                    atomic_core::ingest::poller::FEED_POLL_TASK_ID,
+                    Some(&feed.id)
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "no non-terminal rows survive feed deletion"
+        );
+        let settled = storage.get_task_run(&row.id).await.unwrap().unwrap();
+        assert_eq!(
+            settled.state,
+            TaskRunState::Succeeded,
+            "settled as moot success — history preserved, not deleted"
+        );
+        assert!(settled.finished_at.is_some());
     }
 }

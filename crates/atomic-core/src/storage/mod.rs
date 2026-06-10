@@ -686,6 +686,8 @@ dispatch! {
         => sqlite: fail_task_run_retry_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_retry;
     fn fail_task_run_abandon_sync(&self, id: &str, expected_lease: &str, last_error: &str, finished_at: &str) -> Result<bool, AtomicCoreError>
         => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
+    fn settle_task_runs_moot_sync(&self, task_id: &str, subject_id: &str, finished_at: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: settle_task_runs_moot_sync, pg_trait: TaskRunStore, pg_method: settle_task_runs_moot;
     fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: list_recent_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_recent_task_runs;
     fn gc_task_runs_sync(&self, keep_per_subject: i32, age_cutoff: &str, failed_cutoff: &str, batch_size: i32) -> Result<u64, AtomicCoreError>

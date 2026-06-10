@@ -455,6 +455,42 @@ impl TaskRunStore for PostgresStorage {
         Ok(row.is_some())
     }
 
+    /// Force-settle moot rows for a deleted subject. No lease fence and no
+    /// runnability gate — see `TaskRunStore::settle_task_runs_moot` for why
+    /// both are deliberately skipped. Fenced on `db_id` like every other
+    /// writer here, so deleting a feed in one logical database can't settle
+    /// a sibling's runs.
+    async fn settle_task_runs_moot(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64> {
+        let result = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET state       = 'succeeded',
+                        finished_at = $3,
+                        lease_until = NULL,
+                        last_error  = NULL,
+                        updated_at  = $3
+                  WHERE task_id = $1
+                    AND subject_id = $2
+                    AND db_id = $4
+                    AND state IN ('pending', 'running')",
+            )
+            .bind(task_id)
+            .bind(subject_id)
+            .bind(finished_at)
+            .bind(&self.db_id)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn list_recent_task_runs(
         &self,
         task_id: &str,

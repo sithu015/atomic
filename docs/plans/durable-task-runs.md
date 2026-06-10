@@ -253,17 +253,26 @@ just re-armed) was fixed on the spot; these remain:
   its process retries forever. If that bites, add a separate `reclaims`
   counter (additive migration) with a generous ceiling (~20) that settles
   the row abandoned — do not flip the attempts semantics.
-- **Feed deletion strands its non-terminal `feed_poll` row** — settle or
-  delete ledger rows for a feed when the feed is deleted.
+- ~~**Feed deletion strands its non-terminal `feed_poll` row**~~ — **fixed**:
+  `AtomicCore::delete_feed` now settles every non-terminal `feed_poll` row
+  for the feed as a moot *success* via `TaskRunStore::settle_task_runs_moot`
+  (no lease fence, no runnability gate — a backed-off or in-flight row is
+  unclaimable through the normal path and unreachable by any sweep once
+  the definition is gone). Settle-not-delete matches `wiki::runner`'s
+  deleted-tag precedent and preserves history for GC to age out normally.
 - **Settle/cache-write ordering** — a crash between a feed run's ledger
   settle and the `last_polled_at` cache write loses abandonment parking
   (the feed re-polls next sweep). Benign-ish; note for the dispatcher port.
-- **`RetentionPolicy::load` fails open** — a settings read error silently
-  uses defaults, which may be *tighter* than configured (deleting more
-  history than asked). Should skip the sweep instead.
-- **Test gaps**: no cross-`db_id` fencing test for `gc_task_runs` /
-  `list_runnable_task_runs` on Postgres; crash-reclaim never exercised
-  against Postgres.
+  (Same family: a poll racing a concurrent `delete_feed` past its settle
+  can strand a fresh row — equally benign-rare, same dispatcher-port note.)
+- ~~**`RetentionPolicy::load` fails open**~~ — **fixed**: `load` returns
+  `Result` and `TaskRunsGcTask::run` skips the sweep on a read error
+  (warn + ledger-visible failure with backoff) instead of deleting under
+  possibly tighter-than-configured defaults.
+- ~~**Test gaps**~~ — **closed**: `storage_tests::postgres_tests` now pins
+  cross-`db_id` fencing for `gc_task_runs` and `list_runnable_task_runs`,
+  and crash-reclaim (expired lease through the real
+  `ledger::claim_or_create` path) against Postgres.
 - **Nits**: the `failed` state is unreachable in production flows (runs are
   only ever `pending`-with-backoff or `abandoned` in practice, so GC's
   retain-most-recent-failure rule effectively protects `abandoned` rows);
