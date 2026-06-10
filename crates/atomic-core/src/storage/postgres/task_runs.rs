@@ -284,6 +284,7 @@ impl TaskRunStore for PostgresStorage {
                         attempts    = attempts + 1,
                         updated_at  = $2
                   WHERE id = $1 AND state = 'pending' AND db_id = $4
+                    AND next_attempt_at <= $2
                   RETURNING id",
             )
             .bind(id)

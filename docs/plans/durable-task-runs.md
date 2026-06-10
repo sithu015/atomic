@@ -236,6 +236,41 @@ Each phase is independently shippable and testable.
 - **Migration ordering mistake.** The `LATEST_VERSION` bump + un-pinning the V16→V17 pragma to literal `17` must land together, or the schema version logic breaks. Called out explicitly above.
 - **GC write contention on desktop.** Batched deletes + hourly cadence; never a single large `DELETE` under the write lock.
 
+## Review follow-ups (2026-06-10)
+
+From the post-implementation adversarial review. The claim-query backoff
+gate (a sweeper's stale snapshot could claim a row whose backoff a peer had
+just re-armed) was fixed on the spot; these remain:
+
+- **Postgres settings are global across `db_id`s** — the settings table on
+  Postgres has no `db_id` column, so every `task.{id}.*` fast-path key (and
+  the GC knobs) is shared across logical databases on that backend. Worst
+  severity of the batch and load-bearing for cloud (a tenant database hosts
+  multiple KBs). Fix: additive migration adding `db_id` to settings plus
+  scoped queries. Own workstream.
+- **Crash-loop bound.** Reclaim deliberately does *not* consume the retry
+  budget (`ledger_expired_lease_reclaimed_without_bumping_attempts` pins
+  this): desktop restarts mid-task are routine and must not abandon healthy
+  work. The accepted trade-off is that a run that deterministically kills
+  its process retries forever. If that bites, add a separate `reclaims`
+  counter (additive migration) with a generous ceiling (~20) that settles
+  the row abandoned — do not flip the attempts semantics.
+- **Feed deletion strands its non-terminal `feed_poll` row** — settle or
+  delete ledger rows for a feed when the feed is deleted.
+- **Settle/cache-write ordering** — a crash between a feed run's ledger
+  settle and the `last_polled_at` cache write loses abandonment parking
+  (the feed re-polls next sweep). Benign-ish; note for the dispatcher port.
+- **`RetentionPolicy::load` fails open** — a settings read error silently
+  uses defaults, which may be *tighter* than configured (deleting more
+  history than asked). Should skip the sweep instead.
+- **Test gaps**: no cross-`db_id` fencing test for `gc_task_runs` /
+  `list_runnable_task_runs` on Postgres; crash-reclaim never exercised
+  against Postgres.
+- **Nits**: the `failed` state is unreachable in production flows (runs are
+  only ever `pending`-with-backoff or `abandoned` in practice, so GC's
+  retain-most-recent-failure rule effectively protects `abandoned` rows);
+  `list_task_runs` has no REST surface yet (comes with the run-history UI).
+
 ## Resolved decisions
 
 1. **File reclamation deferred.** DELETE doesn't shrink the SQLite file without `VACUUM`/`auto_vacuum`. Accepted: rows are small and the retention caps keep practical growth modest, so this is explicitly out of scope. May revisit as a later refinement (periodic `PRAGMA incremental_vacuum` / WAL checkpoint) if file growth proves to matter in practice.

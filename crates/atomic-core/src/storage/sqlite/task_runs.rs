@@ -267,7 +267,8 @@ impl SqliteStorage {
                     lease_until = ?3,
                     attempts    = attempts + 1,
                     updated_at  = ?2
-              WHERE id = ?1 AND state = 'pending'",
+              WHERE id = ?1 AND state = 'pending'
+                AND next_attempt_at <= ?2",
             params![id, now, lease_until],
         )?;
         Ok(changed == 1)

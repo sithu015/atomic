@@ -6586,6 +6586,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_claim_refuses_pending_row_inside_backoff_window() {
+        // A claim must gate on next_attempt_at: a sweeper working from a
+        // stale runnable snapshot must not steal a row whose backoff was
+        // re-armed (by a peer's failure) after the snapshot was taken.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now + chrono::Duration::seconds(60), 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(
+            !db.storage
+                .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+                .await
+                .unwrap(),
+            "claim inside the backoff window must lose"
+        );
+        let later = (now + chrono::Duration::seconds(120)).to_rfc3339();
+        assert!(
+            db.storage
+                .claim_pending_task_run_sync(&row.id, &later, &lease)
+                .await
+                .unwrap(),
+            "claim after the window opens must win"
+        );
+    }
+
+    #[tokio::test]
     async fn ledger_claim_or_create_inserts_then_claims_when_no_row_exists() {
         // High-level happy path: no existing row → fresh pending inserted,
         // claim wins, RunHandle returned, complete succeeds.
