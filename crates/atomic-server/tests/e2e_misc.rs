@@ -9,7 +9,7 @@
 //!
 //! The Ollama discovery endpoints are not exercised here because they hit a
 //! real Ollama server. Hooking them up would require a separate mock that
-//! speaks Ollama's `/api/tags` shape; defer until we ship Ollama-on-cloud.
+//! speaks Ollama's `/api/tags` shape; defer until something needs it.
 
 mod support;
 

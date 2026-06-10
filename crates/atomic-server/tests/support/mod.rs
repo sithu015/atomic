@@ -190,6 +190,16 @@ impl TestCtx {
         })
     }
 
+    /// Path to this context's data directory — registry + database files on
+    /// SQLite, export scratch space on Postgres. Lets tests open a second
+    /// `DatabaseManager` over the same storage as `state.manager`.
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._temp
+            .as_ref()
+            .map(|d| d.path())
+            .expect("TestCtx always owns a temp dir")
+    }
+
     pub fn auth_header(&self) -> (&'static str, String) {
         ("Authorization", format!("Bearer {}", self.token))
     }
@@ -201,8 +211,9 @@ impl TestCtx {
 
 /// Construct the MCP transport for a test context. Mirrors `main.rs`: built
 /// once per server (outside any worker factory) so all workers share one
-/// session manager.
-fn mcp_transport_for(ctx: &TestCtx) -> AtomicMcpTransport {
+/// session manager. Public so tests that compose their own `App` (e.g. with
+/// extra middleware around `configure_app`) reuse the same wiring.
+pub fn mcp_transport_for(ctx: &TestCtx) -> AtomicMcpTransport {
     AtomicMcpTransport::new(
         Arc::clone(&ctx.state.manager),
         ctx.state.event_tx.clone(),

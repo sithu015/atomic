@@ -5,7 +5,7 @@
 
 pub mod app;
 pub mod auth;
-mod db_extractor;
+pub mod db_extractor;
 pub mod error;
 pub mod event_bridge;
 pub mod export_jobs;
