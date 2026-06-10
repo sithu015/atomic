@@ -13,12 +13,12 @@ through the ledger via `scheduler::runner` (claim-and-record, extracted
 from the 15s tick so tests can drive ticks directly). The in-memory
 registry lock is demoted to a fast-path; `last_run` advances only on
 terminal success; failures back off via `next_attempt_at` — the
-retry-storm bug below is fixed. Known limitation surfaced by the
-multi-DB e2e: the Postgres backend's `settings` table is global across
-logical databases (no `db_id` scoping), so the `task.{id}.*` fast-path
-keys are shared between DBs on Postgres. The ledger itself *is*
-per-database on both backends; scoping PG settings is its own
-follow-up work item.
+retry-storm bug below is fixed. A limitation surfaced by the multi-DB
+e2e — the Postgres backend's `settings` table was global across logical
+databases (no `db_id` scoping), sharing `task.{id}.*` fast-path keys
+between DBs — has since been fixed: Postgres migration 021 scopes
+`settings` by `db_id` with an explicit `'_global'` tier for
+registry-role config.
 
 Phase 3 is **landed**: every feed poll dispatches through the ledger as a
 `task_id = "feed_poll"` run with `subject_id = <feed id>`
@@ -242,12 +242,10 @@ From the post-implementation adversarial review. The claim-query backoff
 gate (a sweeper's stale snapshot could claim a row whose backoff a peer had
 just re-armed) was fixed on the spot; these remain:
 
-- **Postgres settings are global across `db_id`s** — the settings table on
-  Postgres has no `db_id` column, so every `task.{id}.*` fast-path key (and
-  the GC knobs) is shared across logical databases on that backend. Worst
-  severity of the batch and load-bearing for cloud (a tenant database hosts
-  multiple KBs). Fix: additive migration adding `db_id` to settings plus
-  scoped queries. Own workstream.
+- ~~**Postgres settings are global across `db_id`s**~~ — **fixed**
+  (pg-settings-scope branch): migration 021 adds `db_id` to `settings`
+  with PK `(db_id, key)` and an explicit `'_global'` tier for
+  registry-role config; scoped/global accessor split on `SettingsStore`.
 - **Crash-loop bound.** Reclaim deliberately does *not* consume the retry
   budget (`ledger_expired_lease_reclaimed_without_bumping_attempts` pins
   this): desktop restarts mid-task are routine and must not abandon healthy

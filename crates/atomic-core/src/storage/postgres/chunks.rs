@@ -1579,9 +1579,10 @@ impl PostgresStorage {
             tagging_skipped,
             tagging_failed_count,
             tagging_failed,
-            // Postgres backend does not snapshot a per-DB legacy count: the
-            // shared settings table has no per-DB scope. UI gracefully
-            // omits the legacy warning when this is 0.
+            // Postgres backend does not snapshot a per-DB legacy count:
+            // the legacy-tag migration is a SQLite-era concern with no
+            // Postgres deployments behind it. UI gracefully omits the
+            // legacy warning when this is 0.
             legacy_auto_tag_count: 0,
         })
     }

@@ -521,11 +521,13 @@ async fn process_embedding_only_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get settings for embeddings (from registry if provided, otherwise from data db)
+    // Get settings for embeddings (from the caller's resolved map if
+    // provided, otherwise the storage layer's global tier — provider config
+    // is deployment-wide, never per-DB)
     let settings_map = match external_settings {
         Some(ref s) => s.clone(),
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -694,11 +696,12 @@ async fn process_tagging_only_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get settings (from registry if provided, otherwise from data db)
+    // Get settings (from the caller's resolved map if provided, otherwise
+    // the global tier — tagging config is deployment-wide)
     let settings_map = match external_settings {
         Some(ref s) => s.clone(),
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -758,9 +761,10 @@ async fn process_tagging_only_inner(
     // Load model capabilities (uses in-memory + DB cache to avoid redundant fetches)
     let supported_params: Option<Vec<String>> =
         if provider_config.provider_type == ProviderType::OpenRouter {
-            // Try to load capabilities from the settings cache
+            // Try to load capabilities from the settings cache (global
+            // tier — the cache is derived from the global provider config)
             let cached_json = storage
-                .get_setting_sync("model_capabilities_cache")
+                .get_global_setting_sync("model_capabilities_cache")
                 .await
                 .ok()
                 .flatten();
@@ -1172,11 +1176,11 @@ where
         "Starting pipeline for atoms"
     );
 
-    // === Get settings ===
+    // === Get settings (global tier — provider config is deployment-wide) ===
     let provider_config = {
         let settings_map = match external_settings {
             Some(ref s) => s.clone(),
-            None => match storage.get_all_settings_sync().await {
+            None => match storage.get_global_settings_sync().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to get settings");
@@ -1650,7 +1654,7 @@ where
 
     let settings_map = match external_settings.clone() {
         Some(s) => s,
-        None => match storage.get_all_settings_sync().await {
+        None => match storage.get_global_settings_sync().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to get settings for chunk-preserving re-embed");

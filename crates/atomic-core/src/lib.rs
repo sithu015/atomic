@@ -331,13 +331,15 @@ impl AtomicCore {
             tracing::info!("Seeded default category tags in Postgres");
         }
 
-        // Seed default settings if no registry and settings table is empty.
-        // When a registry exists, settings live there (not in the data DB).
+        // Seed default settings if no registry and the global tier is empty.
+        // When a registry exists, settings live there. Without one, the
+        // global tier plays the registry role — deployment-wide config that
+        // every logical database resolves, never per-DB rows.
         if registry.is_none() {
-            let existing = storage.get_all_settings_sync().await?;
+            let existing = storage.get_global_settings_sync().await?;
             if existing.is_empty() {
                 for (key, value) in settings::DEFAULT_SETTINGS {
-                    storage.set_setting_sync(key, value).await?;
+                    storage.set_global_setting_sync(key, value).await?;
                 }
                 tracing::info!("Seeded default settings in Postgres");
             }
@@ -371,7 +373,7 @@ impl AtomicCore {
             .unwrap_or(0);
         let current_dim = pg.get_embedding_dimension().await?;
 
-        let settings = pg.get_all_settings().await?;
+        let settings = pg.get_global_settings().await?;
         let expected_dim = ProviderConfig::from_settings(&settings).embedding_dimension();
 
         match current_dim {
@@ -646,20 +648,26 @@ impl AtomicCore {
             }
         }
 
-        // Layer 3: per-DB. Two cases:
-        //   * Registry attached (the SQLite multi-DB shape): per-DB rows are
-        //     true overrides on top of the registry. Workspace-only rows in
-        //     this layer are legacy data — the registry is the single source
-        //     of truth for those keys, so we ignore them here. The V15
-        //     migration in `db.rs` wipes seeded-default rows so this layer
-        //     only ever contains real overrides.
+        // Layer 3: storage. Two cases:
+        //   * Registry attached (the SQLite multi-DB shape): the scoped
+        //     per-DB rows are true overrides on top of the registry.
+        //     Workspace-only rows in this layer are legacy data — the
+        //     registry is the single source of truth for those keys, so we
+        //     ignore them here. The V15 migration in `db.rs` wipes
+        //     seeded-default rows so this layer only ever contains real
+        //     overrides.
         //   * No registry (Postgres deployments today): the storage layer's
-        //     settings table is the only place anything lives. Treat its
-        //     values like a registry layer would — workspace-only → Workspace,
-        //     overridable → WorkspaceDefault. Without a registry there's no
-        //     "per-DB override" concept to surface.
-        let per_db = self.storage.get_all_settings_sync().await?;
+        //     *global* tier plays the registry role — workspace-only →
+        //     Workspace, overridable → WorkspaceDefault. Reading the global
+        //     tier (rather than the scoped per-DB rows) keeps deployment
+        //     config consistent across logical databases and keeps per-DB
+        //     state (task.{id}.*, seed flags) out of the settings API.
         let has_registry = self.registry.is_some();
+        let per_db = if has_registry {
+            self.storage.get_all_settings_sync().await?
+        } else {
+            self.storage.get_global_settings_sync().await?
+        };
         for (key, value) in per_db {
             let source = if settings::is_workspace_only(&key) {
                 if has_registry {
@@ -684,9 +692,13 @@ impl AtomicCore {
         let registry = match &self.registry {
             Some(r) => r,
             None => {
-                // No registry attached (single-DB embedded use): there's no
-                // workspace layer, so writes always go to the per-DB table.
-                return self.storage.set_setting_sync(key, value).await;
+                // No registry attached (Postgres deployments, single-DB
+                // embedded use): the storage layer's global tier plays the
+                // workspace role, so writes land there. On SQLite the global
+                // accessors resolve to the data DB's only settings table; on
+                // Postgres they hit the '_global' scope shared by every
+                // logical database.
+                return self.storage.set_global_setting_sync(key, value).await;
             }
         };
 
@@ -713,13 +725,24 @@ impl AtomicCore {
                 key
             )));
         }
-        self.storage.delete_setting_sync(key).await
+        if self.registry.is_some() {
+            // Registry attached: the scoped row is the override layer.
+            self.storage.delete_setting_sync(key).await
+        } else {
+            // No registry: there is no override layer — `set_setting` wrote
+            // the global tier, so "clear" deletes from the same tier and the
+            // key falls back to the builtin default.
+            self.storage.delete_global_setting_sync(key).await
+        }
     }
 
     /// Read the per-DB override row for `key`, if any. Skips the registry
     /// fallback — used by the "overrides across all databases" endpoint that
     /// needs just the override layer for one key, not the merged value.
     /// Returns Ok(None) for workspace-only keys (they cannot have overrides).
+    /// Deliberately stays on the *scoped* tier: with no registry attached
+    /// (Postgres) there is no override layer, and the scoped read correctly
+    /// reports "no override" instead of echoing the global value.
     pub async fn get_setting_override(&self, key: &str) -> Result<Option<String>, AtomicCoreError> {
         if settings::is_workspace_only(key) {
             return Ok(None);
@@ -2430,7 +2453,9 @@ impl AtomicCore {
 
         let mut bg_settings = match self.settings_for_background().await {
             Some(settings) => settings,
-            None => self.storage.get_all_settings_sync().await?,
+            // Hard read failure in the resolver — fall back to the raw
+            // global tier (provider/model config), never the per-DB rows.
+            None => self.storage.get_global_settings_sync().await?,
         };
         bg_settings.insert("auto_tagging_enabled".to_string(), "true".to_string());
         let on_event = self.wrap_event_for_cache(on_event);
@@ -3279,13 +3304,15 @@ impl AtomicCore {
         self.storage.get_all_wiki_articles_sync().await
     }
 
-    /// Get cached model capabilities from the settings table.
+    /// Get cached model capabilities from the settings table. The cache is
+    /// derived from the (global) provider config, so it lives in the global
+    /// tier — shared across logical databases on Postgres.
     pub async fn get_cached_capabilities(
         &self,
     ) -> Result<Option<providers::models::ModelCapabilitiesCache>, AtomicCoreError> {
         let json = self
             .storage
-            .get_setting_sync("model_capabilities_cache")
+            .get_global_setting_sync("model_capabilities_cache")
             .await?;
         match json {
             Some(j) => {
@@ -3311,7 +3338,7 @@ impl AtomicCore {
             AtomicCoreError::Configuration(format!("Failed to serialize capabilities cache: {}", e))
         })?;
         self.storage
-            .set_setting_sync("model_capabilities_cache", &json)
+            .set_global_setting_sync("model_capabilities_cache", &json)
             .await
     }
 

@@ -47,12 +47,11 @@ enum StubMode {
 /// assertions need.
 ///
 /// `always_due` bypasses the settings-based gate entirely. The multi-DB
-/// test needs it on Postgres, where the `settings` table is global across
-/// logical databases (no `db_id` scoping — a pre-existing backend gap), so
-/// one database's `last_run` write would race the other database's
-/// `is_due` check within the same tick. With the gate constant, the only
-/// thing throttling re-runs is the ledger itself — which is precisely the
-/// per-DB machinery this suite is pinning down.
+/// test needs it so the succeeding database re-runs on the very next tick
+/// despite a freshly advanced `last_run` (the default interval is 60s).
+/// With the gate constant, the only thing throttling re-runs is the
+/// ledger itself — which is precisely the per-DB machinery this suite is
+/// pinning down.
 struct StubTask {
     id: &'static str,
     mode: StubMode,
@@ -344,7 +343,6 @@ async fn two_databases_progress_independently_postgres() {
 }
 
 async fn run_two_databases_progress_independently(backend: Backend) {
-    let settings_isolated = matches!(backend, Backend::Sqlite);
     let Some(ctx) = TestCtx::new(backend).await else {
         return;
     };
@@ -414,17 +412,14 @@ async fn run_two_databases_progress_independently(backend: Backend) {
         .unwrap()
         .is_some());
 
-    // last_run isolation is a per-DB settings property. SQLite gets it
-    // structurally (one settings table per database file); the Postgres
-    // backend's settings table is currently global across logical
-    // databases, so the assertion only holds on SQLite. The ledger
-    // assertions above are the cross-backend contract.
-    if settings_isolated {
-        assert!(sched_state::get_last_run(&default_core, "e2e_multi_db")
-            .await
-            .unwrap()
-            .is_none());
-    }
+    // last_run isolation is a per-DB settings property on both backends:
+    // SQLite gets it structurally (one settings table per database file),
+    // Postgres via db_id-scoped settings rows. Beta's success must not
+    // leak a last_run into the failing default database.
+    assert!(sched_state::get_last_run(&default_core, "e2e_multi_db")
+        .await
+        .unwrap()
+        .is_none());
 
     // Next tick: default is inside its backoff window (Skipped) while
     // beta — always due, terminal row settled — opens a fresh run. The

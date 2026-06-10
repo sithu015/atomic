@@ -621,6 +621,8 @@ dispatch! {
         => sqlite: get_clusters_sync, pg_trait: ClusterStore, pg_method: get_clusters;
 
     // ---- SettingsStore ----
+    // Scoped (per-DB) tier: task.{id}.* scheduler state, seed flags,
+    // per-DB overrides.
     fn get_all_settings_sync(&self) -> Result<HashMap<String, String>, AtomicCoreError>
         => sqlite: get_all_settings_sync, pg_trait: SettingsStore, pg_method: get_all_settings;
     fn get_setting_sync(&self, key: &str) -> Result<Option<String>, AtomicCoreError>
@@ -629,6 +631,19 @@ dispatch! {
         => sqlite: set_setting_sync, pg_trait: SettingsStore, pg_method: set_setting;
     fn delete_setting_sync(&self, key: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_setting_sync, pg_trait: SettingsStore, pg_method: delete_setting;
+    // Global (registry-role) tier: provider/model config and other
+    // deployment-wide settings. On SQLite a data DB's own table *is* its
+    // only settings table (registry.db handles the global role physically),
+    // so the global accessors map to the same sync helpers; Postgres routes
+    // them to the '_global' sentinel db_id.
+    fn get_global_settings_sync(&self) -> Result<HashMap<String, String>, AtomicCoreError>
+        => sqlite: get_all_settings_sync, pg_trait: SettingsStore, pg_method: get_global_settings;
+    fn get_global_setting_sync(&self, key: &str) -> Result<Option<String>, AtomicCoreError>
+        => sqlite: get_setting_sync, pg_trait: SettingsStore, pg_method: get_global_setting;
+    fn set_global_setting_sync(&self, key: &str, value: &str) -> Result<(), AtomicCoreError>
+        => sqlite: set_setting_sync, pg_trait: SettingsStore, pg_method: set_global_setting;
+    fn delete_global_setting_sync(&self, key: &str) -> Result<(), AtomicCoreError>
+        => sqlite: delete_setting_sync, pg_trait: SettingsStore, pg_method: delete_global_setting;
 
     // ---- TokenStore ----
     fn create_api_token_sync(&self, name: &str) -> Result<(crate::tokens::ApiTokenInfo, String), AtomicCoreError>

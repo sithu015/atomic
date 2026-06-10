@@ -935,6 +935,19 @@ pub trait ClusterStore: Send + Sync {
 // ==================== Settings Storage ====================
 
 /// Storage operations for key-value settings.
+///
+/// Two tiers:
+///
+/// * The **scoped** methods (`get_setting` & co.) address the per-database
+///   settings table — `task.{id}.*` scheduler state, seed flags, per-DB
+///   overrides.
+/// * The **global** methods (`get_global_setting` & co.) address the
+///   registry-role tier — provider/model config and other deployment-wide
+///   settings that SQLite keeps in `registry.db`. On SQLite each data DB is
+///   its own file, so the defaults below (delegate to the scoped methods)
+///   are already correct: physical separation does the scoping. Postgres
+///   has one settings table for all logical databases and overrides the
+///   global methods to target the `'_global'` sentinel `db_id`.
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
     /// Get all settings as a key-value map.
@@ -949,6 +962,28 @@ pub trait SettingsStore: Send + Sync {
     /// Delete a setting row. No-op if the key isn't present. Used to clear a
     /// per-DB override so the resolver falls back to the workspace default.
     async fn delete_setting(&self, key: &str) -> StorageResult<()>;
+
+    /// Get all global-tier (registry-role) settings.
+    async fn get_global_settings(
+        &self,
+    ) -> StorageResult<std::collections::HashMap<String, String>> {
+        self.get_all_settings().await
+    }
+
+    /// Get a single global-tier setting by key.
+    async fn get_global_setting(&self, key: &str) -> StorageResult<Option<String>> {
+        self.get_setting(key).await
+    }
+
+    /// Set a global-tier setting value (upsert).
+    async fn set_global_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+        self.set_setting(key, value).await
+    }
+
+    /// Delete a global-tier setting row. No-op if the key isn't present.
+    async fn delete_global_setting(&self, key: &str) -> StorageResult<()> {
+        self.delete_setting(key).await
+    }
 }
 
 // ==================== Token Storage ====================

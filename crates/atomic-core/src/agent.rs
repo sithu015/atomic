@@ -407,11 +407,12 @@ async fn execute_search_atoms(
             .await;
     }
 
-    // Postgres path: use storage dispatch methods
+    // Postgres path: use storage dispatch methods. Provider config is
+    // deployment-wide, so the fallback reads the global settings tier.
     let settings = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -1307,11 +1308,13 @@ where
 {
     let on_event: ChatEventCallback = Arc::new(on_event);
 
-    // Resolve settings (from registry if provided, otherwise from storage)
+    // Resolve settings (from the caller's resolved map if provided,
+    // otherwise the storage layer's global tier — provider config is
+    // deployment-wide)
     let settings_map = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -1461,11 +1464,13 @@ where
 {
     let on_event: ChatEventCallback = Arc::new(on_event);
 
-    // Resolve settings (from registry if provided, otherwise from storage)
+    // Resolve settings (from the caller's resolved map if provided,
+    // otherwise the storage layer's global tier — provider config is
+    // deployment-wide)
     let settings_map = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };

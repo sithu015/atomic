@@ -114,6 +114,16 @@ impl Default for PgPoolConfig {
     }
 }
 
+/// Sentinel `db_id` for the global settings tier.
+///
+/// Postgres has no `registry.db`, so one settings table serves both roles
+/// SQLite separates physically: registry-role rows (provider/model config,
+/// setup claim) live under this sentinel, per-DB rows (task.{id}.*
+/// scheduler state, seed flags) under their logical database id. Must stay
+/// in sync with the literal in `migrations/021_settings_db_id.sql`.
+#[cfg(feature = "postgres")]
+pub(crate) const GLOBAL_SETTINGS_DB_ID: &str = "_global";
+
 /// Postgres-backed storage implementation using sqlx + pgvector.
 ///
 /// Each instance is scoped to a `db_id` for multi-database isolation.
@@ -235,6 +245,7 @@ impl PostgresStorage {
                 include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
             ),
             (20, include_str!("migrations/020_atom_positions_double.sql")),
+            (21, include_str!("migrations/021_settings_db_id.sql")),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

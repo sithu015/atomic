@@ -1091,6 +1091,50 @@ async fn sqlite_wiki_update_chunks_pending_atom_errors() {
     test_wiki_update_chunks_pending_atom_errors(&s, &s, &s).await;
 }
 
+// ==================== SettingsStore Tests ====================
+
+/// On SQLite the global accessors must resolve to the same physical table
+/// as the scoped ones: each data DB file owns its only settings table, and
+/// the registry plays the global role one layer up (in `AtomicCore`), so
+/// the trait's delegate-to-scoped defaults are exactly right here.
+#[tokio::test]
+async fn sqlite_global_settings_delegate_to_scoped_table() {
+    let (s, _dir) = sqlite_storage().await;
+
+    s.set_global_setting("settings_probe_global", "from-global")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_setting("settings_probe_global").await.unwrap(),
+        Some("from-global".to_string()),
+        "a global write must be visible through the scoped read"
+    );
+
+    s.set_setting("settings_probe_scoped", "from-scoped")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_global_settings()
+            .await
+            .unwrap()
+            .get("settings_probe_scoped")
+            .map(String::as_str),
+        Some("from-scoped"),
+        "a scoped write must be visible through the global read"
+    );
+
+    s.delete_global_setting("settings_probe_global")
+        .await
+        .unwrap();
+    assert!(
+        s.get_setting("settings_probe_global")
+            .await
+            .unwrap()
+            .is_none(),
+        "a global delete must remove the scoped row"
+    );
+}
+
 // ==================== Postgres Test Runners ====================
 
 #[cfg(feature = "postgres")]
@@ -1223,5 +1267,184 @@ mod postgres_tests {
             return;
         };
         test_wiki_update_chunks_pending_atom_errors(s, s, s).await;
+    }
+
+    /// Cross-`db_id` fencing: two storage handles sharing one pool but
+    /// scoped to different logical databases must not see each other's
+    /// settings rows — the exact leak that used to share `task.{id}.*`
+    /// scheduler state between databases on Postgres.
+    #[tokio::test]
+    async fn pg_settings_scoped_by_db_id() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let alpha = s.with_db_id("settings_fence_alpha");
+        let beta = s.with_db_id("settings_fence_beta");
+
+        alpha
+            .set_setting("task.probe.last_run", "alpha-run")
+            .await
+            .unwrap();
+        beta.set_setting("task.probe.last_run", "beta-run")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alpha.get_setting("task.probe.last_run").await.unwrap(),
+            Some("alpha-run".to_string())
+        );
+        assert_eq!(
+            beta.get_setting("task.probe.last_run").await.unwrap(),
+            Some("beta-run".to_string()),
+            "beta must keep its own value — alpha's write must not clobber it"
+        );
+
+        let alpha_all = alpha.get_all_settings().await.unwrap();
+        assert_eq!(
+            alpha_all.get("task.probe.last_run").map(String::as_str),
+            Some("alpha-run")
+        );
+        assert_eq!(alpha_all.len(), 1, "alpha sees only its own row");
+
+        // Deleting in one database must leave the sibling untouched.
+        alpha.delete_setting("task.probe.last_run").await.unwrap();
+        assert!(alpha
+            .get_setting("task.probe.last_run")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            beta.get_setting("task.probe.last_run").await.unwrap(),
+            Some("beta-run".to_string()),
+            "alpha's delete must not bleed into beta"
+        );
+    }
+
+    /// The global tier is its own scope: a global row and a per-DB row
+    /// under the same key name coexist without shadowing each other in
+    /// either direction.
+    #[tokio::test]
+    async fn pg_global_settings_isolated_from_scoped_rows() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        s.set_global_setting("settings_probe", "global-value")
+            .await
+            .unwrap();
+        s.set_setting("settings_probe", "scoped-value")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.get_global_setting("settings_probe").await.unwrap(),
+            Some("global-value".to_string())
+        );
+        assert_eq!(
+            s.get_setting("settings_probe").await.unwrap(),
+            Some("scoped-value".to_string())
+        );
+
+        let global_all = s.get_global_settings().await.unwrap();
+        assert_eq!(
+            global_all.get("settings_probe").map(String::as_str),
+            Some("global-value"),
+            "global map reads the global row, not the scoped one"
+        );
+        let scoped_all = s.get_all_settings().await.unwrap();
+        assert_eq!(
+            scoped_all.get("settings_probe").map(String::as_str),
+            Some("scoped-value"),
+            "scoped map reads the scoped row, not the global one"
+        );
+
+        // Deletes are tier-local too.
+        s.delete_global_setting("settings_probe").await.unwrap();
+        assert!(s
+            .get_global_setting("settings_probe")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            s.get_setting("settings_probe").await.unwrap(),
+            Some("scoped-value".to_string()),
+            "deleting the global row must not touch the scoped row"
+        );
+    }
+
+    /// Migration 021 on a pre-021 shaped table: existing single-tier rows
+    /// must land in the `'_global'` scope and the new composite primary key
+    /// must hold. Rewinds the shared test schema to the old shape (legal
+    /// because the suite runs with `--test-threads=1`), seeds legacy rows,
+    /// and re-runs `initialize()`.
+    #[tokio::test]
+    async fn pg_settings_migration_lands_existing_rows_in_global() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        // Rewind: drop the 021 marker and restore the pre-021 table shape
+        // (key PRIMARY KEY, no db_id). The settings table is already empty
+        // thanks to the truncate in `postgres_storage()`.
+        sqlx::raw_sql(
+            "DELETE FROM schema_version WHERE version >= 21;
+             ALTER TABLE settings DROP CONSTRAINT IF EXISTS settings_pkey;
+             ALTER TABLE settings DROP COLUMN IF EXISTS db_id;
+             ALTER TABLE settings ADD PRIMARY KEY (key);",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        // Pre-021 rows: registry-role config plus a per-DB-role task key
+        // that used to collide across logical databases.
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES
+                 ('provider', 'ollama'),
+                 ('task.draft_pipeline.last_run', '2026-01-01T00:00:00Z')",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        s.initialize().await.unwrap();
+
+        // Every pre-existing row landed in the global tier…
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT db_id, key FROM settings ORDER BY key")
+                .fetch_all(s.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("_global".to_string(), "provider".to_string()),
+                (
+                    "_global".to_string(),
+                    "task.draft_pipeline.last_run".to_string()
+                ),
+            ]
+        );
+
+        // …visible through the global accessors and invisible to scoped
+        // reads (the orphaned task key benignly resets per-DB state).
+        assert_eq!(
+            s.get_global_setting("provider").await.unwrap(),
+            Some("ollama".to_string())
+        );
+        assert!(s.get_setting("provider").await.unwrap().is_none());
+
+        // The new PK is (db_id, key): the same key coexists across scopes…
+        s.set_setting("provider", "scoped-value").await.unwrap();
+        // …but a duplicate (db_id, key) pair violates the constraint.
+        let dup = sqlx::query(
+            "INSERT INTO settings (db_id, key, value) VALUES ('_global', 'provider', 'dup')",
+        )
+        .execute(s.pool())
+        .await;
+        assert!(dup.is_err(), "duplicate (db_id, key) must violate the PK");
     }
 }
