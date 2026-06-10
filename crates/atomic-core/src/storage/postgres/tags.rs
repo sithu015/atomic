@@ -1039,10 +1039,7 @@ impl TagStore for PostgresStorage {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            AtomicCoreError::DatabaseOperation(format!(
-                "Failed to upsert tag '{}': {}",
-                trimmed, e
-            ))
+            AtomicCoreError::DatabaseOperation(format!("Failed to upsert tag '{}': {}", trimmed, e))
         })?;
 
         // We "created" the tag iff the returned created_at matches the

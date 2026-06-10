@@ -892,15 +892,13 @@ async fn run_search_threshold_parity(backend: Backend) {
         .expect("test harness setup");
     let core = &handle.core;
 
-    let physics_a =
-        create_and_await(core, "quantum particles atomic waves momentum spin").await;
+    let physics_a = create_and_await(core, "quantum particles atomic waves momentum spin").await;
     let physics_b = create_and_await(
         core,
         "atomic particles quantum waves spin momentum scattering",
     )
     .await;
-    let _biology =
-        create_and_await(core, "biology cells dna evolution organisms genetics").await;
+    let _biology = create_and_await(core, "biology cells dna evolution organisms genetics").await;
 
     let options = SearchOptions {
         query: "quantum particles atomic waves".to_string(),
@@ -917,7 +915,8 @@ async fn run_search_threshold_parity(backend: Backend) {
         [physics_a.clone(), physics_b.clone()].into_iter().collect();
 
     assert_eq!(
-        returned, expected,
+        returned,
+        expected,
         "threshold=0.5 should admit exactly the two physics atoms on both backends; \
          got scores={:?}",
         results

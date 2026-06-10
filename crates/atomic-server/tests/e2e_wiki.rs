@@ -308,7 +308,11 @@ async fn run_wiki_for_unknown_tag_returns_error(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "GET for unknown tag must return 200 + null");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET for unknown tag must return 200 + null"
+    );
     let body: Value = actix_test::read_body_json(resp).await;
     assert!(
         body.is_null(),
@@ -372,9 +376,16 @@ async fn run_delete_wiki_article(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "deleted-then-GET wiki returns 200 + null");
+    assert_eq!(
+        resp.status(),
+        200,
+        "deleted-then-GET wiki returns 200 + null"
+    );
     let body: Value = actix_test::read_body_json(resp).await;
-    assert!(body.is_null(), "deleted wiki must return null body; got {body}");
+    assert!(
+        body.is_null(),
+        "deleted wiki must return null body; got {body}"
+    );
 }
 
 // ==================== 6. Auth required ====================

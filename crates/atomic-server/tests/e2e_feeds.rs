@@ -16,11 +16,7 @@ use support::{test_app, Backend, MockUrlServer, TestCtx};
 
 // ==================== Helpers ====================
 
-async fn create_feed<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    url: &str,
-) -> Value
+async fn create_feed<S, B>(app: &S, auth: (&'static str, String), url: &str) -> Value
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -44,11 +40,7 @@ where
     actix_test::read_body_json(resp).await
 }
 
-async fn poll_feed<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    id: &str,
-) -> Value
+async fn poll_feed<S, B>(app: &S, auth: (&'static str, String), id: &str) -> Value
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -80,7 +72,9 @@ async fn create_feed_validates_url_sqlite() {
 #[actix_web::test]
 async fn create_feed_validates_url_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("create_feed_validates_url_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "create_feed_validates_url_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_create_feed_validates_url(Backend::Postgres).await;

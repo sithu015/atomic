@@ -76,7 +76,9 @@ async fn claim_succeeds_then_conflicts_sqlite() {
 #[actix_web::test]
 async fn claim_succeeds_then_conflicts_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("claim_succeeds_then_conflicts_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "claim_succeeds_then_conflicts_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_claim_succeeds_then_conflicts(Backend::Postgres).await;
@@ -146,7 +148,9 @@ async fn claim_rate_limited_after_burst_sqlite() {
 #[actix_web::test]
 async fn claim_rate_limited_after_burst_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("claim_rate_limited_after_burst_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "claim_rate_limited_after_burst_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_claim_rate_limited_after_burst(Backend::Postgres).await;

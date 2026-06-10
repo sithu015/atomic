@@ -77,7 +77,10 @@ async fn run_create_tag_round_trip(backend: Backend) {
     let resp = actix_test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
     let tags: Vec<Value> = actix_test::read_body_json(resp).await;
-    assert!(tags.iter().any(|t| t["id"] == id), "created tag must appear in /api/tags");
+    assert!(
+        tags.iter().any(|t| t["id"] == id),
+        "created tag must appear in /api/tags"
+    );
 }
 
 // ==================== T2. Update ====================
@@ -175,7 +178,9 @@ async fn tag_hierarchy_children_query_sqlite() {
 #[actix_web::test]
 async fn tag_hierarchy_children_query_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("tag_hierarchy_children_query_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "tag_hierarchy_children_query_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_tag_hierarchy_children_query(Backend::Postgres).await;
@@ -199,7 +204,12 @@ async fn run_tag_hierarchy_children_query(backend: Backend) {
     assert_eq!(resp.status(), 200);
     let body: Value = actix_test::read_body_json(resp).await;
     let children = body["children"].as_array().expect("children array");
-    assert_eq!(children.len(), 3, "expected 3 children, got {}", children.len());
+    assert_eq!(
+        children.len(),
+        3,
+        "expected 3 children, got {}",
+        children.len()
+    );
 }
 
 // ==================== T5. Autotag-target flag ====================
@@ -212,7 +222,9 @@ async fn autotag_target_flag_persists_sqlite() {
 #[actix_web::test]
 async fn autotag_target_flag_persists_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("autotag_target_flag_persists_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "autotag_target_flag_persists_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_autotag_target_flag_persists(Backend::Postgres).await;
@@ -309,7 +321,9 @@ async fn tag_compaction_merges_pair_sqlite() {
 #[actix_web::test]
 async fn tag_compaction_merges_pair_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("tag_compaction_merges_pair_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "tag_compaction_merges_pair_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_tag_compaction_merges_pair(Backend::Postgres).await;

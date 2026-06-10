@@ -87,8 +87,14 @@ async fn run_oauth_dcr_issues_client_credentials(backend: Backend) {
         .expect("register");
     assert_eq!(resp.status(), 201);
     let body: Value = resp.json().await.expect("parse register");
-    assert!(body["client_id"].as_str().filter(|s| !s.is_empty()).is_some());
-    assert!(body["client_secret"].as_str().filter(|s| !s.is_empty()).is_some());
+    assert!(body["client_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_some());
+    assert!(body["client_secret"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_some());
 
     server.stop().await;
 }

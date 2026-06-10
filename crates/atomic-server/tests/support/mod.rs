@@ -111,9 +111,8 @@ impl TestCtx {
         let (manager, temp) = match backend {
             Backend::Sqlite => {
                 let dir = TempDir::new().expect("create tempdir");
-                let manager = Arc::new(
-                    DatabaseManager::new(dir.path()).expect("open sqlite manager"),
-                );
+                let manager =
+                    Arc::new(DatabaseManager::new(dir.path()).expect("open sqlite manager"));
                 (manager, Some(dir))
             }
             Backend::Postgres => {
@@ -430,8 +429,7 @@ where
             }
             Message::Close(_) => panic!("server closed the ws connection mid-test"),
         };
-        let event: serde_json::Value =
-            serde_json::from_str(&text).expect("ws frame is JSON");
+        let event: serde_json::Value = serde_json::from_str(&text).expect("ws frame is JSON");
         if predicate(&event) {
             return event;
         }

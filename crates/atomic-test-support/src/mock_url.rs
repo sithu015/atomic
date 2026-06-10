@@ -51,7 +51,10 @@ impl MockUrlServer {
             .mount(&server)
             .await;
 
-        for (slug, title) in [("/article-1", "Mock Article One"), ("/article-2", "Mock Article Two")] {
+        for (slug, title) in [
+            ("/article-1", "Mock Article One"),
+            ("/article-2", "Mock Article Two"),
+        ] {
             Mock::given(method("GET"))
                 .and(path(slug))
                 .respond_with(
@@ -65,12 +68,10 @@ impl MockUrlServer {
         // A non-HTML path for the "reject non-HTML" ingest contract test.
         Mock::given(method("GET"))
             .and(path("/plaintext"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(
-                    "just text, nothing structural here".as_bytes().to_vec(),
-                    "text/plain",
-                ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "just text, nothing structural here".as_bytes().to_vec(),
+                "text/plain",
+            ))
             .mount(&server)
             .await;
 

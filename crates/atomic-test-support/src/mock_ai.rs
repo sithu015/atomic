@@ -460,13 +460,11 @@ impl Respond for ChatResponder {
             // `Source [N]: ...` blocks; cite the first one and
             // `extract_citations` resolves the marker against the citables
             // table so the finding atom gets a non-empty citation row.
-            "report_generation_result" => {
-                json!({
-                    "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
-                    "citations_used": [1],
-                })
-                .to_string()
-            }
+            "report_generation_result" => json!({
+                "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
+                "citations_used": [1],
+            })
+            .to_string(),
             // Wiki incremental update: emit a single AppendToSection op
             // pinned to the heading the existing article uses, referencing
             // the first new-source index. Tests assert that the update

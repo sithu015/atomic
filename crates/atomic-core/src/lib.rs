@@ -3422,9 +3422,7 @@ impl AtomicCore {
                 let parent_id: Option<String> = if htag.parent_path.is_empty() {
                     None
                 } else {
-                    folder_tag_ids
-                        .get(htag.parent_path.len() - 1)
-                        .cloned()
+                    folder_tag_ids.get(htag.parent_path.len() - 1).cloned()
                 };
 
                 let cache_key = (htag.name.to_lowercase(), parent_id.clone());
@@ -3453,7 +3451,11 @@ impl AtomicCore {
                 folder_tag_ids.push(tag_id.clone());
                 if let Err(e) = self
                     .storage
-                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .link_tags_to_atom_with_source(
+                        &atom_id,
+                        std::slice::from_ref(&tag_id),
+                        "manual",
+                    )
                     .await
                 {
                     tracing::error!(tag_name = %htag.name, error = %e, "Error linking folder tag to atom");
@@ -3489,7 +3491,11 @@ impl AtomicCore {
 
                 if let Err(e) = self
                     .storage
-                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .link_tags_to_atom_with_source(
+                        &atom_id,
+                        std::slice::from_ref(&tag_id),
+                        "manual",
+                    )
                     .await
                 {
                     tracing::error!(tag_name = %tag_name, error = %e, "Error linking frontmatter tag to atom");
