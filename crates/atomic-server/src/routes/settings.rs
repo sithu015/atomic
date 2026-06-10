@@ -18,6 +18,7 @@
 
 use crate::db_extractor::Db;
 use crate::error::{ok_or_error, ApiErrorResponse};
+use crate::event_channel::EventChannel;
 use crate::state::AppState;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,7 @@ pub struct SetSettingBody {
 
 #[utoipa::path(put, path = "/api/settings/{key}", params(("key" = String, Path, description = "Setting key")), request_body = SetSettingBody, responses((status = 200, description = "Setting updated"), (status = 400, description = "Invalid setting", body = ApiErrorResponse)), tag = "settings")]
 pub async fn set_setting(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
     body: web::Json<SetSettingBody>,
@@ -46,7 +47,7 @@ pub async fn set_setting(
 
     // Handle embedding-space settings via set_setting_with_reembed (avoids deadlock)
     if atomic_core::settings::is_embedding_space_key(&key) {
-        let on_event = crate::event_bridge::embedding_event_callback(state.event_tx.clone());
+        let on_event = crate::event_bridge::embedding_event_callback(events.0.clone());
         // `set_setting_with_reembed` writes through the resolver's routing:
         // workspace-only → registry, overridable + N≤1 → registry, overridable
         // + N>1 → per-DB override for the active database. It then re-embeds
@@ -71,13 +72,13 @@ pub async fn set_setting(
 
 #[utoipa::path(delete, path = "/api/settings/{key}", params(("key" = String, Path, description = "Setting key")), responses((status = 200, description = "Override cleared"), (status = 400, description = "Key is workspace-only", body = ApiErrorResponse)), tag = "settings")]
 pub async fn clear_setting_override(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
 ) -> HttpResponse {
     let key = path.into_inner();
     if atomic_core::settings::is_embedding_space_key(&key) {
-        let on_event = crate::event_bridge::embedding_event_callback(state.event_tx.clone());
+        let on_event = crate::event_bridge::embedding_event_callback(events.0.clone());
         ok_or_error(db.0.clear_override_with_reembed(&key, on_event).await)
     } else {
         ok_or_error(db.0.clear_override(&key).await)

@@ -14,6 +14,7 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::dev::ServiceRequest;
 use actix_web::middleware::{from_fn, Next};
@@ -22,8 +23,15 @@ use actix_web::{App, HttpMessage};
 use atomic_core::DatabaseManager;
 use atomic_server::app::configure_app;
 use atomic_server::db_extractor::RequestDatabaseManager;
+use atomic_server::event_channel::RequestEventChannel;
+use atomic_server::state::ServerEvent;
+use futures_util::SinkExt;
 use serde_json::{json, Value};
-use support::{mcp_transport_for, test_app, Backend, TestCtx};
+use support::{
+    collect_ws_event_until, mcp_transport_for, spawn_live_server_with_event_channel, test_app,
+    Backend, TestCtx,
+};
+use tokio::sync::broadcast;
 
 #[actix_web::test]
 async fn full_composition_sqlite() {
@@ -198,6 +206,223 @@ async fn run_injected_manager_resolution(backend: Backend) {
         ids.contains(&alpha_id) && !ids.contains(&beta_id),
         "X-Atomic-Database must select within the injected manager"
     );
+}
+
+// ==================== Injected event-channel resolution ====================
+
+#[actix_web::test]
+async fn injected_event_channel_sqlite() {
+    run_injected_event_channel(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn injected_event_channel_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!("injected_event_channel_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        return;
+    }
+    run_injected_event_channel(Backend::Postgres).await;
+}
+
+/// `EventChannel` resolution contract for embedders: a layer composing
+/// `configure_app` under its own middleware can install a
+/// [`RequestEventChannel`] per request, and every request-driven event —
+/// both the synchronous `AtomCreated` broadcast and the background pipeline
+/// events spawned by the handler — lands on the injected channel, with
+/// nothing leaking onto `AppState`'s process-wide channel.
+async fn run_injected_event_channel(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+
+    // Subscribe to both channels *before* any request so no event can slip
+    // past (broadcast senders drop events sent while no receiver exists).
+    let (injected_tx, mut injected_rx) = broadcast::channel::<ServerEvent>(64);
+    let mut state_rx = ctx.state.event_tx.subscribe();
+
+    let injected = RequestEventChannel(injected_tx);
+    let app = actix_test::init_service(
+        App::new()
+            .wrap(from_fn(move |req: ServiceRequest, next: Next<_>| {
+                let injected = injected.clone();
+                async move {
+                    req.extensions_mut().insert(injected);
+                    next.call(req).await
+                }
+            }))
+            .configure(configure_app(ctx.state.clone(), mcp_transport_for(&ctx))),
+    )
+    .await;
+
+    let atom_id = post_atom(
+        &app,
+        &ctx,
+        None,
+        "gamma — events must ride the injected channel",
+    )
+    .await;
+
+    // AtomCreated is sent inline by the handler; EmbeddingComplete comes
+    // from the pipeline's background task via the on_event callback. Seeing
+    // both proves the override covers direct sends *and* callbacks.
+    await_broadcast_event(&mut injected_rx, |e| {
+        e["type"] == "AtomCreated" && e["atom"]["id"] == atom_id.as_str()
+    })
+    .await;
+    await_broadcast_event(&mut injected_rx, |e| {
+        e["type"] == "EmbeddingComplete" && e["atom_id"] == atom_id.as_str()
+    })
+    .await;
+
+    assert!(
+        matches!(
+            state_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ),
+        "request-driven events must not reach AppState's channel when one is injected"
+    );
+}
+
+#[actix_web::test]
+async fn event_channel_fallback_sqlite() {
+    run_event_channel_fallback(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn event_channel_fallback_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!("event_channel_fallback_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        return;
+    }
+    run_event_channel_fallback(Backend::Postgres).await;
+}
+
+/// With no middleware installed (the standalone server), the `EventChannel`
+/// extractor falls back to `AppState`'s process-wide channel. The WS suite
+/// relies on this implicitly; assert it once, explicitly, next to the
+/// override test.
+async fn run_event_channel_fallback(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    let mut state_rx = ctx.state.event_tx.subscribe();
+    let atom_id = post_atom(
+        &app,
+        &ctx,
+        None,
+        "delta — events fall back to AppState's channel",
+    )
+    .await;
+
+    await_broadcast_event(&mut state_rx, |e| {
+        e["type"] == "AtomCreated" && e["atom"]["id"] == atom_id.as_str()
+    })
+    .await;
+    await_broadcast_event(&mut state_rx, |e| {
+        e["type"] == "EmbeddingComplete" && e["atom_id"] == atom_id.as_str()
+    })
+    .await;
+}
+
+/// Receive events from `rx` until `predicate` matches one (compared on its
+/// JSON form, the same shape WS clients see), or panic after 15s.
+async fn await_broadcast_event<F>(rx: &mut broadcast::Receiver<ServerEvent>, mut predicate: F)
+where
+    F: FnMut(&Value) -> bool,
+{
+    let deadline = Duration::from_secs(15);
+    let stop_at = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = stop_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("broadcast event predicate did not match within {deadline:?}");
+        }
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("broadcast recv timeout")
+            .expect("broadcast channel closed");
+        let event = serde_json::to_value(&event).expect("serialize ServerEvent");
+        if predicate(&event) {
+            return;
+        }
+    }
+}
+
+#[actix_web::test]
+async fn ws_streams_injected_event_channel_sqlite() {
+    run_ws_streams_injected_event_channel(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn ws_streams_injected_event_channel_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "ws_streams_injected_event_channel_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_ws_streams_injected_event_channel(Backend::Postgres).await;
+}
+
+/// The WebSocket handler honors the injected channel too: a WS client
+/// connected to a composition that installs a [`RequestEventChannel`]
+/// receives the events that request-driven handlers publish there. This is
+/// the consumer half of the contract — without it, an embedder's WS clients
+/// would be subscribed to a channel nobody sends to.
+async fn run_ws_streams_injected_event_channel(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+
+    let (injected_tx, _) = broadcast::channel::<ServerEvent>(64);
+    let mut state_rx = ctx.state.event_tx.subscribe();
+    let server = spawn_live_server_with_event_channel(&ctx, injected_tx).await;
+
+    // Connect the WS first so it's subscribed before the POST fires events.
+    let ws_url = format!(
+        "{}/ws?token={}",
+        server.base_url.replace("http://", "ws://"),
+        ctx.token
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("ws upgrade should succeed");
+
+    // POST over real HTTP. The middleware routes the handler's events into
+    // the injected channel; the WS client must observe them there.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/atoms", server.base_url))
+        .bearer_auth(&ctx.token)
+        .json(&json!({ "content": "epsilon — ws client rides the injected channel" }))
+        .send()
+        .await
+        .expect("POST /api/atoms");
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.expect("parse atom response");
+    let atom_id = body["id"].as_str().expect("atom id").to_string();
+
+    collect_ws_event_until(&mut ws, Duration::from_secs(15), |e| {
+        e["type"] == "EmbeddingComplete" && e["atom_id"] == atom_id.as_str()
+    })
+    .await;
+
+    // The producer side never touched the process-wide channel either.
+    assert!(
+        matches!(
+            state_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ),
+        "request-driven events must not reach AppState's channel when one is injected"
+    );
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+        .await
+        .ok();
+    server.stop().await;
 }
 
 /// POST /api/atoms, optionally into a specific database, returning the id.

@@ -29,10 +29,11 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use atomic_server::app::configure_app;
+use atomic_server::event_channel::RequestEventChannel;
 use atomic_server::export_jobs::ExportJobManager;
 use atomic_server::log_buffer::LogBuffer;
 use atomic_server::mcp::AtomicMcpTransport;
-use atomic_server::state::{AppState, SetupClaimLimiter};
+use atomic_server::state::{AppState, ServerEvent, SetupClaimLimiter};
 
 // Re-export the shared mock + truncate helper so test files can keep using
 // `support::MockAiServer` paths. (EMBED_DIM / EDGE_SIMILARITY_THRESHOLD are
@@ -283,6 +284,52 @@ pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
             state_for_factory.clone(),
             mcp_transport.clone(),
         ))
+    })
+    .workers(1)
+    .listen(listener)
+    .expect("attach listener")
+    .run();
+
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+
+    LiveServer { base_url, handle }
+}
+
+/// Like [`spawn_live_server`], but wraps the composed routes in a middleware
+/// that installs `tx` as each request's
+/// [`RequestEventChannel`] — the live equivalent of an embedder overriding
+/// the event channel per request. Used to prove, over a real socket, that
+/// the WS handler subscribes to the injected channel and that route
+/// handlers publish into it.
+pub async fn spawn_live_server_with_event_channel(
+    ctx: &TestCtx,
+    tx: broadcast::Sender<ServerEvent>,
+) -> LiveServer {
+    use actix_web::dev::ServiceRequest;
+    use actix_web::middleware::{from_fn, Next};
+    use actix_web::{App, HttpMessage, HttpServer};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let base_url = format!("http://{}", addr);
+
+    let mcp_transport = mcp_transport_for(ctx);
+    let state_for_factory = ctx.state.clone();
+    let server = HttpServer::new(move || {
+        let injected = RequestEventChannel(tx.clone());
+        App::new()
+            .wrap(from_fn(move |req: ServiceRequest, next: Next<_>| {
+                let injected = injected.clone();
+                async move {
+                    req.extensions_mut().insert(injected);
+                    next.call(req).await
+                }
+            }))
+            .configure(configure_app(
+                state_for_factory.clone(),
+                mcp_transport.clone(),
+            ))
     })
     .workers(1)
     .listen(listener)

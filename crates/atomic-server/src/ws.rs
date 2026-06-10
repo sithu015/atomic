@@ -1,5 +1,6 @@
 //! WebSocket endpoint for real-time event streaming
 
+use crate::event_channel::EventChannel;
 use crate::state::{AppState, ServerEvent};
 use actix_web::{web, HttpRequest, HttpResponse};
 use tokio::sync::broadcast;
@@ -10,6 +11,7 @@ pub async fn ws_handler(
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
+    events: EventChannel,
     query: web::Query<WsQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Authenticate via query param
@@ -25,8 +27,10 @@ pub async fn ws_handler(
 
     let (response, mut session, _msg_stream) = actix_ws::handle(&req, stream)?;
 
-    // Subscribe to broadcast channel
-    let mut rx = state.event_tx.subscribe();
+    // Subscribe to the request's event channel — AppState's process-wide
+    // channel unless a composing layer injected one, in which case this
+    // client streams the same channel that request-driven events publish to.
+    let mut rx = events.0.subscribe();
 
     // Spawn task to forward broadcast events to this WebSocket client
     actix_web::rt::spawn(async move {

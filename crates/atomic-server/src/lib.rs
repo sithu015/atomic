@@ -8,6 +8,7 @@ pub mod auth;
 pub mod db_extractor;
 pub mod error;
 pub mod event_bridge;
+pub mod event_channel;
 pub mod export_jobs;
 pub mod log_buffer;
 pub mod mcp;
