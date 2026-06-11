@@ -93,6 +93,7 @@ impl PlaneHarness {
         let cache = Arc::new(AccountCache::new(
             control.clone(),
             cluster.clone(),
+            support::test_vault(),
             AccountCacheConfig::default(),
         ));
         let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
@@ -108,6 +109,7 @@ impl PlaneHarness {
             control.clone(),
             cluster.clone(),
             ManagedKeys::Disabled,
+            support::test_vault(),
             Arc::clone(&cache),
         );
         let fallback = FallbackAppState::build().expect("build fallback state");

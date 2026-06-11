@@ -99,6 +99,7 @@ fn echo_service(
     let cache = Arc::new(AccountCache::new(
         control.clone(),
         cluster.clone(),
+        support::test_vault(),
         AccountCacheConfig::default(),
     ));
     web::resource("/echo")

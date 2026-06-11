@@ -440,6 +440,36 @@ pub async fn delete_credentials(
     Ok(deleted)
 }
 
+/// Replace the `model_config` on one `(account, provider, origin)` row,
+/// returning whether the row existed. Model selection lives with the key
+/// (plan: "Storage schema"), but changing it is not a rotation: the key
+/// bytes and the validation state are untouched, so `rotated_at` /
+/// `last_validated_at` keep describing the stored key.
+///
+/// Write-side policy — which keys a user may set, per origin (see
+/// [`crate::curated_models`]) — is the caller's job; this function is the
+/// plain storage primitive.
+pub async fn update_model_config(
+    control: &ControlPlane,
+    account_id: &str,
+    provider: Provider,
+    origin: CredentialOrigin,
+    model_config: &serde_json::Value,
+) -> Result<bool, CloudError> {
+    let result = sqlx::query(
+        "UPDATE provider_credentials SET model_config = $4 \
+         WHERE account_id = $1 AND provider = $2 AND origin = $3",
+    )
+    .bind(account_id)
+    .bind(provider.as_str())
+    .bind(origin.as_str())
+    .bind(model_config)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("updating provider model config"))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Stamp `last_used_at` on a credentials row. Best-effort by design: a row
 /// deleted by a concurrent rotation/delete makes this a no-op, which is
 /// correct — there is nothing left to stamp.

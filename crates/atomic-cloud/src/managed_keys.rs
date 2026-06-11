@@ -78,14 +78,15 @@ impl Default for ManagedKeyConfig {
     }
 }
 
-/// The fleet-wide managed model selection. The embedding model is pinned —
-/// switching it invalidates every stored vector and triggers a full
-/// re-embed billed to the platform — and matches atomic-core's OpenRouter
-/// default so settings-mode and explicit-mode accounts embed identically.
+/// The fleet-wide managed model selection: the pinned embedding model and
+/// the curated list's default LLM (see [`crate::curated_models`] — switching
+/// the embedding model invalidates every stored vector and triggers a full
+/// re-embed billed to the platform, so user writes to a managed row's
+/// `model_config` are curation-checked by the provider routes).
 pub fn default_managed_model_config() -> serde_json::Value {
     serde_json::json!({
-        "embedding_model": "openai/text-embedding-3-small",
-        "llm_model": "openai/gpt-4o-mini",
+        "embedding_model": crate::curated_models::MANAGED_EMBEDDING_MODEL,
+        "llm_model": crate::curated_models::MANAGED_LLM_MODELS[0],
     })
 }
 

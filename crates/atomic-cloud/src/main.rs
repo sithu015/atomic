@@ -469,7 +469,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // The boot contract: serve does not start unless stored
             // provider credentials are decryptable.
             let vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
-            let managed = provisioning.into_managed_keys(vault)?;
+            let managed = provisioning.into_managed_keys(Arc::clone(&vault))?;
 
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
@@ -489,6 +489,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 control,
                 cluster.into_config(),
                 managed,
+                vault,
                 base_domain,
                 bind,
                 port,
@@ -600,6 +601,7 @@ async fn serve(
     control: ControlPlane,
     cluster: ClusterConfig,
     managed: ManagedKeys,
+    vault: Arc<dyn KeyVault>,
     base_domain: String,
     bind: String,
     port: u16,
@@ -615,6 +617,7 @@ async fn serve(
     let cache = Arc::new(AccountCache::new(
         control.clone(),
         cluster.clone(),
+        Arc::clone(&vault),
         cache_config,
     ));
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
@@ -622,6 +625,7 @@ async fn serve(
         control.clone(),
         cluster.clone(),
         managed.clone(),
+        vault,
         Arc::clone(&cache),
     );
 

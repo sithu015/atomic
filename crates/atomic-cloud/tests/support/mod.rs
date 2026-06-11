@@ -416,13 +416,31 @@ impl ProvisioningApi for RecordingProvisioning {
 /// assertions can decrypt rows written through [`managed_keys_with`].
 pub const TEST_MASTER_KEY: [u8; 32] = [7u8; 32];
 
+/// A [`KeyVault`] over [`TEST_MASTER_KEY`], in the `Arc<dyn _>` shape the
+/// compositions take (`AccountCache::new`, `TenantPlane::new`).
+///
+/// [`KeyVault`]: atomic_cloud::KeyVault
+pub fn test_vault() -> Arc<dyn atomic_cloud::KeyVault> {
+    Arc::new(EnvMasterKeyVault::new(TEST_MASTER_KEY))
+}
+
 /// An `Enabled` [`ManagedKeys`] over a recording API, the [`TEST_MASTER_KEY`]
 /// vault, and the default config (50¢ monthly allowance).
 pub fn managed_keys_with(api: Arc<RecordingProvisioning>) -> ManagedKeys {
+    managed_keys_with_config(api, ManagedKeyConfig::default())
+}
+
+/// [`managed_keys_with`] with an explicit [`ManagedKeyConfig`] — e2e suites
+/// use this to seed managed `model_config`s whose base-URL override points
+/// the pipeline at the shared `MockAiServer` (NO REAL PROVIDERS).
+pub fn managed_keys_with_config(
+    api: Arc<RecordingProvisioning>,
+    config: ManagedKeyConfig,
+) -> ManagedKeys {
     ManagedKeys::Enabled {
         api,
-        vault: Arc::new(EnvMasterKeyVault::new(TEST_MASTER_KEY)),
-        config: ManagedKeyConfig::default(),
+        vault: test_vault(),
+        config,
     }
 }
 

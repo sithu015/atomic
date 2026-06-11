@@ -52,7 +52,12 @@ fn cache_with(
     cluster: &ClusterConfig,
     config: AccountCacheConfig,
 ) -> Arc<AccountCache> {
-    Arc::new(AccountCache::new(control.clone(), cluster.clone(), config))
+    Arc::new(AccountCache::new(
+        control.clone(),
+        cluster.clone(),
+        support::test_vault(),
+        config,
+    ))
 }
 
 #[tokio::test]

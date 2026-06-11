@@ -41,17 +41,37 @@
 //! account's build permit and loads; coalesced callers wait on the same
 //! permit and find the finished entry when they acquire it. Failures are
 //! not cached — each waiting caller retries the build itself.
+//!
+//! # Provider config (plan: "Plumbing — control plane → AtomicCore")
+//!
+//! The cache-miss build is where control-plane provider state reaches a
+//! serving tenant: the account's active `provider_credentials` row is
+//! loaded, decrypted through the [`KeyVault`], and turned into an explicit
+//! [`ProviderConfig`] that the tenant manager is opened with — **always**
+//! `Some`, never `None`. `None` would put atomic-core in settings-fallback
+//! mode, letting the tenant database's own settings rows select providers;
+//! the plan forbids that path in cloud. An account with no credentials row
+//! gets a key-less config ([`keyless_provider_config`]) so provider calls
+//! fail with a structured missing-key error rather than falling back.
+//!
+//! Live rotation ([`AccountCache::update_provider_config`]) swaps the config
+//! on a cached entry **in place** — no eviction, so in-flight operations
+//! finish on the config they started with while new operations pick up the
+//! fresh one (plan: "Live rotation", steps 4-5).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atomic_core::{DatabaseManager, PgPoolConfig};
+use atomic_core::{DatabaseManager, PgPoolConfig, ProviderConfig};
 use atomic_server::state::ServerEvent;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+use crate::keyvault::KeyVault;
+use crate::provider_config::{config_for_credentials, keyless_provider_config};
+use crate::provider_credentials::{get_active_credentials, touch_last_used};
 use crate::provision::{is_tenant_db_name, ClusterConfig};
 
 /// Capacity of each per-account event channel. Matches the sizing of
@@ -154,17 +174,27 @@ struct Inner {
 pub struct AccountCache {
     control: ControlPlane,
     cluster: ClusterConfig,
+    /// Decrypts the account's stored provider credentials on the miss path
+    /// (module docs: "Provider config").
+    vault: Arc<dyn KeyVault>,
     config: AccountCacheConfig,
     inner: Mutex<Inner>,
 }
 
 impl AccountCache {
     /// Create an empty cache that resolves tenant databases through
-    /// `control` and connects to them on `cluster`.
-    pub fn new(control: ControlPlane, cluster: ClusterConfig, config: AccountCacheConfig) -> Self {
+    /// `control`, connects to them on `cluster`, and decrypts each account's
+    /// provider credentials through `vault`.
+    pub fn new(
+        control: ControlPlane,
+        cluster: ClusterConfig,
+        vault: Arc<dyn KeyVault>,
+        config: AccountCacheConfig,
+    ) -> Self {
         Self {
             control,
             cluster,
+            vault,
             config,
             inner: Mutex::new(Inner::default()),
         }
@@ -293,8 +323,44 @@ impl AccountCache {
         }
     }
 
-    /// Cache-miss path: control-plane lookup → tenant manager → fresh
-    /// event channel.
+    /// Live provider rotation (plan: "Live rotation", step 4): swap the
+    /// active [`ProviderConfig`] on `account_id`'s cached entry, if one is
+    /// cached. Returns whether an entry was present.
+    ///
+    /// Deliberately **not** an eviction: the manager, its pool, and its
+    /// event channel (with any live WebSocket subscribers) all stay put.
+    /// Every core resolved from the manager shares one config slot, so the
+    /// single call covers all of the account's knowledge bases; operations
+    /// already in flight finish on the config they snapshotted at start. A
+    /// miss needs no action — the next `get_or_load` builds from the
+    /// control-plane state the rotation just wrote.
+    pub async fn update_provider_config(
+        &self,
+        account_id: &str,
+        config: ProviderConfig,
+    ) -> Result<bool, CloudError> {
+        // Clone the manager handle under the lock, swap outside it —
+        // `active_core` does storage resolution that must not stall other
+        // accounts. No `last_touched` refresh: a rotation is control-plane
+        // traffic, not tenant activity.
+        let manager = {
+            let inner = self.inner.lock().await;
+            match inner.entries.get(account_id) {
+                Some(entry) => Arc::clone(&entry.manager),
+                None => return Ok(false),
+            }
+        };
+        let core = manager
+            .active_core()
+            .await
+            .map_err(CloudError::core("resolving core for provider rotation"))?;
+        core.update_provider_config(config);
+        Ok(true)
+    }
+
+    /// Cache-miss path: control-plane lookup → tenant manager (opened with
+    /// the account's explicit provider config; module docs) → fresh event
+    /// channel.
     async fn build_entry(&self, account_id: &str) -> Result<Entry, CloudError> {
         let db_name: Option<String> = sqlx::query_scalar(
             "SELECT db_name FROM account_databases \
@@ -316,6 +382,18 @@ impl AccountCache {
         }
 
         let tenant_url = self.cluster.tenant_db_url(&db_name)?;
+
+        // Resolve the account's provider config from the control plane —
+        // ALWAYS an explicit Some (module docs: the settings-fallback path
+        // is forbidden in cloud). No credentials row → key-less config →
+        // structured missing-key errors downstream.
+        let credentials =
+            get_active_credentials(&self.control, self.vault.as_ref(), account_id).await?;
+        let provider_config = match &credentials {
+            Some(credentials) => config_for_credentials(credentials),
+            None => keyless_provider_config(),
+        };
+
         // Each cached account holds its own pool, so it must be small
         // (config docs); everything the cache config doesn't own still comes
         // from the `ATOMIC_PG_*` environment.
@@ -327,9 +405,31 @@ impl AccountCache {
         // The manager open re-checks migrations and the default-KB seed on
         // every call; for an already-provisioned tenant both are no-op
         // reads. The data-dir argument is unused on the Postgres path.
-        let manager = DatabaseManager::new_postgres_with_pool(".", &tenant_url, pool_config)
+        let manager = DatabaseManager::new_postgres_with_pool_and_provider(
+            ".",
+            &tenant_url,
+            pool_config,
+            Some(provider_config),
+        )
+        .await
+        .map_err(CloudError::core("opening tenant database manager"))?;
+
+        // Stamp the credential's last_used_at: handing the key to a serving
+        // manager is the moment it goes into use (plan: "Audit /
+        // visibility"). Best-effort — a stamp failure must not fail the
+        // tenant load.
+        if let Some(credentials) = &credentials {
+            if let Err(e) = touch_last_used(
+                &self.control,
+                account_id,
+                credentials.provider,
+                credentials.origin,
+            )
             .await
-            .map_err(CloudError::core("opening tenant database manager"))?;
+            {
+                tracing::warn!(account_id, error = %e, "failed to stamp credential last_used_at");
+            }
+        }
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Ok(Entry {

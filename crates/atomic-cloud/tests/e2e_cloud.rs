@@ -21,8 +21,9 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
-    provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, ManagedKeys, NewAccount, TenantPlane,
+    provision_account, set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig,
+    AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin,
+    FallbackAppState, ManagedKeys, NewAccount, NewCredentials, Provider, SecretKey, TenantPlane,
     TokenScope, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
@@ -90,6 +91,7 @@ impl CloudHarness {
         let cache = Arc::new(AccountCache::new(
             control.clone(),
             cluster.clone(),
+            support::test_vault(),
             cache_config,
         ));
         let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
@@ -108,6 +110,7 @@ impl CloudHarness {
             control.clone(),
             cluster.clone(),
             ManagedKeys::Disabled,
+            support::test_vault(),
             Arc::clone(&cache),
         );
         let fallback = FallbackAppState::build().expect("build fallback state");
@@ -147,9 +150,11 @@ impl CloudHarness {
         self.handle.stop(false).await;
     }
 
-    /// Provision an account, seed its provider settings at the mock AI
-    /// server (mirroring atomic-server's `TestCtx`), and issue an
-    /// account-scope token.
+    /// Provision an account, store BYOK provider credentials in the control
+    /// plane pointing at the mock AI server (the cache resolves provider
+    /// config from the control plane only — tenant settings can't select
+    /// providers in cloud), seed the non-provider AI settings in the tenant
+    /// database, and issue an account-scope token.
     async fn provision(&self, subdomain: &str) -> Tenant {
         let account = provision_account(
             &self.control,
@@ -163,6 +168,35 @@ impl CloudHarness {
         .await
         .expect("provision account");
 
+        let vault = support::test_vault();
+        upsert_credentials(
+            &self.control,
+            vault.as_ref(),
+            &account.account_id,
+            NewCredentials {
+                provider: Provider::OpenAiCompat,
+                origin: CredentialOrigin::User,
+                api_key: SecretKey::new("test-key".to_string()),
+                external_key_id: None,
+                model_config: json!({
+                    "embedding_model": "mock-embed",
+                    "llm_model": "mock-llm",
+                    "openai_compat_base_url": self.mock.base_url(),
+                    "embedding_dimension": 1536,
+                }),
+            },
+        )
+        .await
+        .expect("store mock provider credentials");
+        set_active_provider(
+            &self.control,
+            &account.account_id,
+            Some((Provider::OpenAiCompat, CredentialOrigin::User)),
+        )
+        .await
+        .expect("activate mock provider credentials");
+
+        // Non-provider AI settings still live in the tenant database.
         let tenant_url = self
             .cluster
             .tenant_db_url(&account.db_name)
@@ -171,18 +205,9 @@ impl CloudHarness {
             .await
             .expect("open tenant manager");
         let core = manager.active_core().await.expect("active core");
-        let mock_url = self.mock.base_url();
-        for (k, v) in [
-            ("provider", "openai_compat"),
-            ("openai_compat_base_url", mock_url.as_str()),
-            ("openai_compat_api_key", "test-key"),
-            ("openai_compat_embedding_model", "mock-embed"),
-            ("openai_compat_llm_model", "mock-llm"),
-            ("openai_compat_embedding_dimension", "1536"),
-            ("auto_tagging_enabled", "true"),
-        ] {
-            core.set_setting(k, v).await.expect("seed tenant setting");
-        }
+        core.set_setting("auto_tagging_enabled", "true")
+            .await
+            .expect("seed tenant setting");
         core.configure_autotag_targets(&["Topics".to_string()], &[])
             .await
             .expect("configure autotag targets");

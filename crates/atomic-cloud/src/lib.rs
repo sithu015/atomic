@@ -27,11 +27,13 @@ pub mod account_cache;
 pub mod account_plane;
 pub mod auth;
 pub mod control_plane;
+pub mod curated_models;
 pub mod email;
 pub mod error;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod provider_config;
 pub mod provider_credentials;
 pub mod provision;
 pub mod provisioning_api;
@@ -48,6 +50,9 @@ pub use account_plane::{
 };
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use control_plane::ControlPlane;
+pub use curated_models::{
+    validate_managed_model_config, MANAGED_EMBEDDING_MODEL, MANAGED_LLM_MODELS,
+};
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
 pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
@@ -57,10 +62,11 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
+pub use provider_config::{build_provider_config, config_for_credentials, keyless_provider_config};
 pub use provider_credentials::{
     delete_credentials, get_active_credentials, get_credentials, record_validation,
-    set_active_provider, touch_last_used, upsert_credentials, CredentialOrigin, NewCredentials,
-    Provider, ProviderCredentials,
+    set_active_provider, touch_last_used, update_model_config, upsert_credentials,
+    CredentialOrigin, NewCredentials, Provider, ProviderCredentials,
 };
 pub use provision::{
     delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,
