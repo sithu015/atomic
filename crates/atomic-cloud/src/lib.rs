@@ -32,6 +32,7 @@ pub mod error;
 pub mod magic_links;
 pub mod provision;
 pub mod rate_limit;
+pub mod reaper;
 pub mod reserved_subdomains;
 pub mod server;
 pub mod tenant_plane;
@@ -49,9 +50,10 @@ pub use magic_links::{
     consume_magic_link, issue_magic_link, MagicLinkPurpose, MagicLinkRecord, MAGIC_LINK_TTL,
 };
 pub use provision::{
-    delete_account, provision_account, tenant_db_name, ClusterConfig, NewAccount,
-    ProvisionedAccount,
+    delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,
+    NewAccount, ProvisionedAccount,
 };
+pub use reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState};
 pub use tenant_plane::TenantPlane;
 pub use tokens::{

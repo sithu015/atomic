@@ -1,0 +1,735 @@
+//! The failure-recovery reaper (plan: "Failure recovery & the reaper";
+//! "Signup" → safety-net reaper; slice-1 Implementation-log follow-ups).
+//!
+//! One periodic job. Every serve process runs [`run_reaper_pass`] on an
+//! interval (`main.rs` wires the loop with a jittered start; the pass itself
+//! is a plain async function so tests and operators can call it directly).
+//! A pass has four arms, in order:
+//!
+//! 1. **Stuck provisions** — `accounts` rows parked in
+//!    `status = 'provisioning'` longer than
+//!    [`ReaperPolicy::stuck_provision_age`]. A crashed signup leaves exactly
+//!    this behind by design (see `account_plane` "Completion semantics").
+//!    The reaper first attempts a *resume* via [`provision_account`] —
+//!    every provisioning step is idempotent, so a crash at any point re-runs
+//!    to completion. Only when the resume itself fails is the provision
+//!    *rolled back*: accounts row hard-deleted (freeing the subdomain
+//!    immediately), tenant database dropped. There is no `'failed'`
+//!    tombstone — v1 is hard-delete everywhere, and a tombstone row would
+//!    keep holding the UNIQUE subdomain hostage (or force a non-additive
+//!    constraint migration to stop it). The loud `tracing::error!` carrying
+//!    the account's email is the operator's trace. Resume attempts are
+//!    capped per pass ([`ReaperPolicy::max_resumes_per_pass`]) because each
+//!    one can run tenant migrations for seconds; surplus rows are deferred
+//!    to the next pass, and a row that keeps failing never wedges the loop —
+//!    every row's outcome is independent.
+//!
+//! 2. **Orphaned tenant databases** — `acct_*` databases (the exact
+//!    [`is_tenant_db_name`] shape) with **no** `accounts` row and **no**
+//!    `account_databases` row. These are the loudly-logged debris of failed
+//!    23503 cleanup in `provision_account` and of this module's own rollback
+//!    crash window (see below). The accounts-row absence is the safety
+//!    proof: provisioning creates its accounts row *before* `CREATE
+//!    DATABASE` and re-verifies it pre-CREATE, so any in-flight provision's
+//!    database always has its row. Absence is re-checked immediately before
+//!    the drop, under the advisory lock derived from the database name's
+//!    embedded account id ([`tenant_db_account_id`]).
+//!
+//! 3. **Self-reservations** — `subdomains_reserved` rows whose subdomain
+//!    belongs to an *active* account: the residue of a deletion that crashed
+//!    between reserving the subdomain and deleting the accounts row (the
+//!    slice-1 follow-up). Cleared only once the reservation is older than
+//!    [`ReaperPolicy::self_reservation_grace`] — a *fresh* self-reservation
+//!    is a deletion in flight right now, mid-way between its reserve and
+//!    row-delete steps, and clearing it would lose the 90-day park
+//!    (`delete_account` re-ups `created_at` on its upsert precisely so
+//!    retried deletions regain this shield).
+//!
+//! 4. **Hygiene** — purge `magic_links` expired more than
+//!    [`ReaperPolicy::magic_link_retention_after_expiry`] ago (the recently
+//!    expired keep their forensic value a little longer), expired
+//!    `sessions`, and lapsed `subdomains_reserved` rows. All three are
+//!    already inert before purging (every consumer filters on expiry); this
+//!    is table size, not correctness.
+//!
+//! # Concurrency
+//!
+//! Multiple processes run reapers concurrently, against live signups and
+//! deletions (none of which take reaper locks). Three mechanisms make that
+//! safe; each arm documents which it leans on:
+//!
+//! - **Per-account advisory locks.** Row processing in arms 1 and 2 happens
+//!   under `pg_try_advisory_lock` on the control plane, keyed by
+//!   [`reaper_lock_key`] over the account id. Contention means another pass
+//!   owns the row — skip it (recorded in the summary), never wait. The lock
+//!   is session-level on a dedicated connection, so releasing is closing
+//!   the session: even a cancelled future can't strand it. Keying arm 2 on
+//!   the *database name's* account id makes orphan-reclaim and
+//!   stuck-rollback mutually exclusive per account — the rollback's
+//!   row-deleted-but-not-yet-dropped window is invisible to other passes.
+//!
+//! - **Under-lock re-checks.** The work lists are read unlocked, so every
+//!   row is re-verified after its lock is acquired: arm 1 re-reads the
+//!   accounts row (a concurrent pass — or the user's own retried signup —
+//!   may have resumed, rolled back, or activated it), and arm 2 re-proves
+//!   the absence of both control-plane rows.
+//!
+//! - **Existing idempotency guarantees.** The resume *is*
+//!   [`provision_account`]; the rollback's claim is a status-guarded
+//!   `DELETE`; every database drop is `IF EXISTS`. A reaper racing a live
+//!   signup or deletion degrades to one side losing cleanly, never to
+//!   double-processing (the interleavings are walked through on
+//!   [`roll_back_stuck_provision`]).
+//!
+//! Arms 3 and 4 are single atomic SQL statements — concurrent passes
+//! running them twice is harmless (the second deletes nothing), so they
+//! take no locks.
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+use sqlx::{Connection, PgConnection};
+use uuid::Uuid;
+
+use crate::control_plane::ControlPlane;
+use crate::error::CloudError;
+use crate::provision::{
+    is_tenant_db_name, provision_account, tenant_db_account_id, tenant_db_name,
+    terminate_and_drop_database, ClusterConfig, NewAccount,
+};
+
+/// Tunables for a reaper pass. [`Default`] is the production configuration;
+/// tests shrink fields to drive specific arms.
+#[derive(Debug, Clone)]
+pub struct ReaperPolicy {
+    /// How long an account may sit in `status='provisioning'` before it
+    /// counts as stuck (plan: 5 minutes). Anything younger is an in-flight
+    /// signup and is left strictly alone.
+    pub stuck_provision_age: Duration,
+
+    /// Maximum resume attempts (and therefore rollbacks — a rollback only
+    /// follows a failed resume) per pass. Each resume can run tenant
+    /// migrations for seconds; the cap keeps a backlog of stuck rows from
+    /// turning a 60-second job into a minutes-long one. Surplus rows are
+    /// deferred to the next pass, recorded in
+    /// [`ReaperSummary::stuck_deferred`].
+    pub max_resumes_per_pass: usize,
+
+    /// Minimum age of a self-reservation before arm 3 clears it. Younger
+    /// rows are presumed to be a `delete_account` in flight between its
+    /// reserve and row-delete steps.
+    pub self_reservation_grace: Duration,
+
+    /// How long expired magic links are retained before the hygiene arm
+    /// purges them (plan follow-up: "expired > 24h ago"). They are inert
+    /// the moment they expire; the retention only preserves the forensic
+    /// breadcrumbs (`request_ip`, timing) for a debugging window.
+    pub magic_link_retention_after_expiry: Duration,
+}
+
+impl Default for ReaperPolicy {
+    fn default() -> Self {
+        Self {
+            stuck_provision_age: Duration::from_secs(5 * 60),
+            // One pass is at most as provision-heavy as the signup plane.
+            max_resumes_per_pass: crate::account_plane::DEFAULT_MAX_CONCURRENT_PROVISIONS,
+            self_reservation_grace: Duration::from_secs(5 * 60),
+            magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
+/// Everything a pass did (and declined to do), for logging and for tests —
+/// notably, advisory-lock skips are observable here, which is how the
+/// concurrent-pass tests prove rows are never double-processed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReaperSummary {
+    /// Stuck provisions completed by re-running [`provision_account`]
+    /// (account ids; the accounts are now `'active'`).
+    pub stuck_resumed: Vec<String>,
+    /// Stuck provisions whose resume failed and were rolled back (account
+    /// ids; rows hard-deleted, databases dropped, subdomains freed).
+    pub stuck_rolled_back: Vec<String>,
+    /// Stuck provisions skipped because another pass holds their lock.
+    pub stuck_skipped_locked: Vec<String>,
+    /// Stuck provisions past [`ReaperPolicy::max_resumes_per_pass`],
+    /// deferred to the next pass untouched.
+    pub stuck_deferred: Vec<String>,
+    /// Orphaned tenant databases dropped (database names).
+    pub orphan_dbs_dropped: Vec<String>,
+    /// Orphan candidates skipped because another pass holds the lock for
+    /// their embedded account id.
+    pub orphan_dbs_skipped_locked: Vec<String>,
+    /// Reservations cleared because their subdomain belongs to an active
+    /// account (subdomains).
+    pub self_reservations_cleared: Vec<String>,
+    /// Hygiene: long-expired magic links purged.
+    pub expired_magic_links_purged: u64,
+    /// Hygiene: expired sessions purged.
+    pub expired_sessions_purged: u64,
+    /// Hygiene: lapsed subdomain reservations purged.
+    pub expired_reservations_purged: u64,
+    /// Per-row and per-arm failures, with context. A failure never stops
+    /// the pass — the row stays for the next one — but it is recorded here
+    /// (and warned) rather than silently swallowed.
+    pub errors: Vec<String>,
+}
+
+impl ReaperSummary {
+    /// True when the pass found nothing to act on (the steady state) —
+    /// callers log quiet passes at debug instead of info.
+    pub fn is_quiet(&self) -> bool {
+        self.stuck_resumed.is_empty()
+            && self.stuck_rolled_back.is_empty()
+            && self.stuck_skipped_locked.is_empty()
+            && self.stuck_deferred.is_empty()
+            && self.orphan_dbs_dropped.is_empty()
+            && self.orphan_dbs_skipped_locked.is_empty()
+            && self.self_reservations_cleared.is_empty()
+            && self.expired_magic_links_purged == 0
+            && self.expired_sessions_purged == 0
+            && self.expired_reservations_purged == 0
+            && self.errors.is_empty()
+    }
+}
+
+/// Advisory-lock key for an account id (canonical hyphenated-lowercase UUID
+/// string): the first 8 bytes of SHA-256 over a domain-separated input.
+///
+/// Public so tests can hold a contending lock and observe the skip. A hash
+/// collision (with another account or with the control plane's migration
+/// lock) costs a spurious skip retried next pass — never a safety problem,
+/// because the lock only ever *defers* work.
+pub fn reaper_lock_key(account_id: &str) -> i64 {
+    let digest = Sha256::digest(format!("atomic-cloud:reaper:{account_id}").as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
+}
+
+/// Run one reaper pass. Never fails as a whole: per-row and per-arm errors
+/// land in [`ReaperSummary::errors`] (and a `tracing::warn!`), and the
+/// remaining work proceeds — a row that keeps failing must not wedge the
+/// loop, and a broken arm must not starve the others.
+pub async fn run_reaper_pass(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    policy: &ReaperPolicy,
+) -> ReaperSummary {
+    let mut summary = ReaperSummary::default();
+    if let Err(e) = reap_stuck_provisions(control, cluster, policy, &mut summary).await {
+        record_error(&mut summary, "stuck-provision arm", &e);
+    }
+    if let Err(e) = reap_orphaned_tenant_databases(control, cluster, &mut summary).await {
+        record_error(&mut summary, "orphaned-database arm", &e);
+    }
+    if let Err(e) = clear_self_reservations(control, policy, &mut summary).await {
+        record_error(&mut summary, "self-reservation arm", &e);
+    }
+    if let Err(e) = purge_expired_rows(control, policy, &mut summary).await {
+        record_error(&mut summary, "hygiene arm", &e);
+    }
+    summary
+}
+
+fn record_error(summary: &mut ReaperSummary, context: &str, e: &CloudError) {
+    tracing::warn!(error = %e, "reaper: {context} failed");
+    summary.errors.push(format!("{context}: {e}"));
+}
+
+/// `NOW() - age`, saturating: an absurdly large policy duration yields the
+/// minimum timestamp, which matches nothing — the fail-safe direction.
+fn cutoff(age: Duration) -> DateTime<Utc> {
+    let age = chrono::Duration::from_std(age).unwrap_or(chrono::Duration::MAX);
+    Utc::now()
+        .checked_sub_signed(age)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// A held per-account reaper lock: a dedicated control-plane session owning
+/// `pg_try_advisory_lock(reaper_lock_key(account_id))`. Session-level on a
+/// connection detached from the pool, so the lock can never leak back into
+/// the pool on a returned connection; releasing is closing the session,
+/// which Postgres honors even when the future holding this guard is dropped
+/// mid-flight.
+struct AccountLock {
+    conn: PgConnection,
+}
+
+impl AccountLock {
+    /// Try to take the lock; `Ok(None)` means another pass holds it — skip
+    /// the row, never wait.
+    async fn try_acquire(
+        control: &ControlPlane,
+        account_id: &str,
+    ) -> Result<Option<Self>, CloudError> {
+        let mut conn = control
+            .pool()
+            .acquire()
+            .await
+            .map_err(CloudError::db("acquiring reaper lock connection"))?
+            .detach();
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(reaper_lock_key(account_id))
+            .fetch_one(&mut conn)
+            .await
+            .map_err(CloudError::db("taking reaper advisory lock"))?;
+        if acquired {
+            Ok(Some(Self { conn }))
+        } else {
+            let _ = conn.close().await;
+            Ok(None)
+        }
+    }
+
+    /// Release by ending the session — unconditional, no unlock call that
+    /// could itself fail and strand the lock.
+    async fn release(self) {
+        let _ = self.conn.close().await;
+    }
+}
+
+/// What arm 1 decided about one stuck row, post-lock.
+enum StuckOutcome {
+    Resumed,
+    RolledBack,
+    /// The under-lock re-check found the row already handled (activated,
+    /// rolled back, or refreshed) by a concurrent actor — nothing to do.
+    AlreadySettled,
+}
+
+/// Arm 1 — stuck provisions (plan: "accounts WHERE status='provisioning'
+/// AND created_at < now() - interval '5 minutes'").
+async fn reap_stuck_provisions(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    policy: &ReaperPolicy,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let stale_before = cutoff(policy.stuck_provision_age);
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM accounts \
+         WHERE status = 'provisioning' AND created_at < $1 \
+         ORDER BY created_at",
+    )
+    .bind(stale_before)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing stuck provisions"))?;
+
+    let mut resumes_used = 0usize;
+    for account_id in stale {
+        if resumes_used >= policy.max_resumes_per_pass {
+            summary.stuck_deferred.push(account_id);
+            continue;
+        }
+        let lock = match AccountLock::try_acquire(control, &account_id).await {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                summary.stuck_skipped_locked.push(account_id);
+                continue;
+            }
+            Err(e) => {
+                record_error(
+                    summary,
+                    &format!("locking stuck provision {account_id}"),
+                    &e,
+                );
+                continue;
+            }
+        };
+        resumes_used += 1;
+        // Process under the lock, then ALWAYS release — outcomes (including
+        // errors) are values here precisely so no path skips the release.
+        let outcome = process_stuck_provision(control, cluster, &account_id, stale_before).await;
+        lock.release().await;
+        match outcome {
+            Ok(StuckOutcome::Resumed) => summary.stuck_resumed.push(account_id),
+            Ok(StuckOutcome::RolledBack) => summary.stuck_rolled_back.push(account_id),
+            Ok(StuckOutcome::AlreadySettled) => {}
+            Err(e) => record_error(
+                summary,
+                &format!("processing stuck provision {account_id}"),
+                &e,
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// One stuck row, lock held: re-check, resume, and only if the resume fails,
+/// roll back.
+async fn process_stuck_provision(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    account_id: &str,
+    stale_before: DateTime<Utc>,
+) -> Result<StuckOutcome, CloudError> {
+    // Re-read under the lock: between the unlocked listing and lock
+    // acquisition, a concurrent pass (or the user's own retried signup) may
+    // have resumed, rolled back, or activated the account.
+    let row: Option<(String, String, String, DateTime<Utc>)> =
+        sqlx::query_as("SELECT email, subdomain, status, created_at FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(control.pool())
+            .await
+            .map_err(CloudError::db("re-reading stuck provision under lock"))?;
+    let Some((email, subdomain, status, created_at)) = row else {
+        return Ok(StuckOutcome::AlreadySettled);
+    };
+    if status != "provisioning" || created_at >= stale_before {
+        return Ok(StuckOutcome::AlreadySettled);
+    }
+
+    // First choice: resume. provision_account is idempotent end-to-end, so
+    // whatever step the original signup died at, the re-run converges — and
+    // a resume preserves the user's claim where a rollback burns it.
+    let resume_err = match provision_account(
+        control,
+        cluster,
+        NewAccount {
+            email: email.clone(),
+            subdomain: subdomain.clone(),
+        },
+    )
+    .await
+    {
+        Ok(provisioned) => {
+            tracing::info!(
+                account_id,
+                subdomain,
+                db_name = provisioned.db_name,
+                "reaper resumed stuck provision"
+            );
+            return Ok(StuckOutcome::Resumed);
+        }
+        Err(e) => e,
+    };
+
+    if roll_back_stuck_provision(
+        control,
+        cluster,
+        account_id,
+        &email,
+        &subdomain,
+        &resume_err,
+    )
+    .await?
+    {
+        Ok(StuckOutcome::RolledBack)
+    } else {
+        // The status-guarded DELETE matched nothing: a concurrent actor
+        // activated (or removed) the account after our resume attempt
+        // failed. Their outcome stands; ours is a no-op.
+        Ok(StuckOutcome::AlreadySettled)
+    }
+}
+
+/// Roll back a stuck provision whose resume failed: hard-delete the accounts
+/// row, then drop the tenant database(s). Returns `false` when the
+/// status-guarded delete found the row already settled.
+///
+/// # Ordering: row first, database second
+///
+/// The plan sketches drop-then-free; this inverts it, deliberately. The
+/// status-guarded `DELETE ... WHERE status = 'provisioning'` is the atomic
+/// claim on the rollback. Once the row is gone, a concurrently *resumed*
+/// provision (the user retrying signup doesn't take reaper locks) cannot
+/// re-activate the account: its pre-CREATE re-verify fails; a later
+/// `account_databases` INSERT hits the FK (SQLSTATE 23503) and self-cleans
+/// the database it created; its final activation UPDATE matches zero rows.
+/// Dropping the database *first* would open the reverse window — a resume
+/// activating the row just after its data was destroyed, leaving a live
+/// account with no tenant database.
+///
+/// The inverted ordering's own crash window (row deleted, drop never ran)
+/// is precisely the orphan predicate: the next pass's orphan arm reclaims
+/// the database. The same applies when the drop here *fails* — the error is
+/// recorded and the orphan arm finishes the job.
+///
+/// No subdomain reservation is written: a provision that never activated
+/// never served anything, so no external client can be pointing at the
+/// name, and the whole point of freeing is that the user can immediately
+/// retry signup with the same slug. CASCADE FKs sweep any `cloud_tokens`,
+/// `sessions`, and `account_databases` rows with the accounts row.
+async fn roll_back_stuck_provision(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    account_id: &str,
+    email: &str,
+    subdomain: &str,
+    resume_err: &CloudError,
+) -> Result<bool, CloudError> {
+    // Collect database names BEFORE the delete — the CASCADE wipes the
+    // mapping rows with the accounts row. The derived name is unioned in,
+    // mirroring delete_account: a provision that crashed before writing the
+    // mapping row still gets its database cleaned up.
+    let mut db_names: Vec<String> =
+        sqlx::query_scalar("SELECT db_name FROM account_databases WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_all(control.pool())
+            .await
+            .map_err(CloudError::db("listing stuck provision's databases"))?;
+    if let Ok(uuid) = Uuid::parse_str(account_id) {
+        let derived = tenant_db_name(uuid);
+        if !db_names.contains(&derived) {
+            db_names.push(derived);
+        }
+    }
+
+    let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1 AND status = 'provisioning'")
+        .bind(account_id)
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db(
+            "hard-deleting stuck provision's account row",
+        ))?
+        .rows_affected();
+    if deleted == 0 {
+        return Ok(false);
+    }
+
+    // Loud, before the drops: the accounts row is already gone, so this log
+    // line — with the email — is the operator's only trace of who the
+    // failed signup belonged to (no 'failed' tombstone; see module docs).
+    tracing::error!(
+        account_id,
+        email,
+        subdomain,
+        resume_error = %resume_err,
+        "reaper rolled back stuck provision: accounts row hard-deleted, \
+         subdomain freed for immediate reuse; this log line is the \
+         operator's only trace of the failed signup"
+    );
+
+    let mut conn = cluster.connect_maintenance().await?;
+    let mut dropped = Ok(());
+    for db_name in &db_names {
+        dropped = terminate_and_drop_database(&mut conn, db_name).await;
+        if dropped.is_err() {
+            break;
+        }
+    }
+    let _ = conn.close().await;
+    // A failed drop leaves an orphaned database the next pass's orphan arm
+    // reclaims; propagate so the failure is recorded, the row itself is
+    // already (correctly) gone.
+    dropped?;
+    Ok(true)
+}
+
+/// Arm 2 — orphaned tenant databases. See the module docs for the safety
+/// proof; mechanically: list `acct_*`-shaped databases, and for each with
+/// no `accounts` row and no `account_databases` row, re-prove the absence
+/// under the account-keyed advisory lock and drop it.
+async fn reap_orphaned_tenant_databases(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let mut conn = cluster.connect_maintenance().await?;
+    let result = scan_orphans(control, &mut conn, summary).await;
+    let _ = conn.close().await;
+    result
+}
+
+async fn scan_orphans(
+    control: &ControlPlane,
+    conn: &mut PgConnection,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    // `\_` keeps LIKE's underscore literal; is_tenant_db_name below is the
+    // authoritative shape check either way (and the guard every drop
+    // re-asserts before interpolating the name into DDL).
+    let candidates: Vec<String> =
+        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname LIKE 'acct\\_%'")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(CloudError::db("listing tenant-shaped databases"))?;
+
+    for db_name in candidates
+        .into_iter()
+        .filter(|name| is_tenant_db_name(name))
+    {
+        let Some(account_uuid) = tenant_db_account_id(&db_name) else {
+            continue; // unreachable post-filter; belt and braces
+        };
+        let account_id = account_uuid.to_string();
+
+        // Unlocked pre-check keeps the common case (every database owned)
+        // free of lock traffic.
+        match is_referenced(control, &account_id, &db_name).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                record_error(summary, &format!("checking orphan candidate {db_name}"), &e);
+                continue;
+            }
+        }
+
+        let lock = match AccountLock::try_acquire(control, &account_id).await {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                // Another pass owns this account — possibly a rollback in
+                // its row-deleted-but-not-yet-dropped window. Skip; if the
+                // database is still orphaned next pass, it gets reclaimed.
+                summary.orphan_dbs_skipped_locked.push(db_name);
+                continue;
+            }
+            Err(e) => {
+                record_error(summary, &format!("locking orphan candidate {db_name}"), &e);
+                continue;
+            }
+        };
+        let outcome: Result<bool, CloudError> = async {
+            // The double-check the plan demands: immediately before the
+            // drop, under the lock, the rows must STILL be absent — a
+            // provision claiming this exact account id between pre-check
+            // and lock would have inserted its accounts row first.
+            if is_referenced(control, &account_id, &db_name).await? {
+                return Ok(false);
+            }
+            terminate_and_drop_database(&mut *conn, &db_name).await?;
+            Ok(true)
+        }
+        .await;
+        lock.release().await;
+        match outcome {
+            Ok(true) => {
+                tracing::warn!(
+                    db_name,
+                    account_id,
+                    "reaper dropped orphaned tenant database (no accounts or \
+                     account_databases row referenced it)"
+                );
+                summary.orphan_dbs_dropped.push(db_name);
+            }
+            Ok(false) => {}
+            Err(e) => record_error(
+                summary,
+                &format!("reclaiming orphaned database {db_name}"),
+                &e,
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Whether anything in the control plane still claims this database: an
+/// `accounts` row for its embedded id, or any `account_databases` row for
+/// its name. Either one disqualifies the orphan drop.
+async fn is_referenced(
+    control: &ControlPlane,
+    account_id: &str,
+    db_name: &str,
+) -> Result<bool, CloudError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1) \
+             OR EXISTS(SELECT 1 FROM account_databases WHERE db_name = $2)",
+    )
+    .bind(account_id)
+    .bind(db_name)
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db("checking orphan candidate references"))
+}
+
+/// Arm 3 — self-reservations: one atomic DELETE, age-guarded (see module
+/// docs for why the grace shields in-flight deletions).
+async fn clear_self_reservations(
+    control: &ControlPlane,
+    policy: &ReaperPolicy,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let settled_before = cutoff(policy.self_reservation_grace);
+    let cleared: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM subdomains_reserved sr USING accounts a \
+         WHERE a.subdomain = sr.subdomain \
+           AND a.status = 'active' \
+           AND sr.created_at < $1 \
+         RETURNING sr.subdomain",
+    )
+    .bind(settled_before)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("clearing self-reservations"))?;
+    for subdomain in &cleared {
+        tracing::info!(
+            subdomain,
+            "reaper cleared self-reservation (active account's own \
+             subdomain was parked — crashed-deletion residue)"
+        );
+    }
+    summary.self_reservations_cleared.extend(cleared);
+    Ok(())
+}
+
+/// Arm 4 — hygiene purges. Each target is already inert before deletion
+/// (every reader filters on expiry/consumption), so these are independent
+/// single statements with no locking.
+async fn purge_expired_rows(
+    control: &ControlPlane,
+    policy: &ReaperPolicy,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let links_expired_before = cutoff(policy.magic_link_retention_after_expiry);
+    summary.expired_magic_links_purged =
+        sqlx::query("DELETE FROM magic_links WHERE expires_at < $1")
+            .bind(links_expired_before)
+            .execute(control.pool())
+            .await
+            .map_err(CloudError::db("purging expired magic links"))?
+            .rows_affected();
+
+    summary.expired_sessions_purged = sqlx::query("DELETE FROM sessions WHERE expires_at <= NOW()")
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("purging expired sessions"))?
+        .rows_affected();
+
+    summary.expired_reservations_purged =
+        sqlx::query("DELETE FROM subdomains_reserved WHERE expires_at <= NOW()")
+            .execute(control.pool())
+            .await
+            .map_err(CloudError::db("purging lapsed subdomain reservations"))?
+            .rows_affected();
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_key_is_stable_and_account_specific() {
+        let a = "0e1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8";
+        let b = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        assert_eq!(reaper_lock_key(a), reaper_lock_key(a), "deterministic");
+        assert_ne!(reaper_lock_key(a), reaper_lock_key(b));
+    }
+
+    #[test]
+    fn default_policy_matches_plan_numbers() {
+        let policy = ReaperPolicy::default();
+        assert_eq!(policy.stuck_provision_age, Duration::from_secs(300));
+        assert_eq!(
+            policy.magic_link_retention_after_expiry,
+            Duration::from_secs(24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn empty_summary_is_quiet_and_any_action_is_not() {
+        assert!(ReaperSummary::default().is_quiet());
+        let acted = ReaperSummary {
+            expired_sessions_purged: 1,
+            ..ReaperSummary::default()
+        };
+        assert!(!acted.is_quiet());
+        let skipped = ReaperSummary {
+            stuck_skipped_locked: vec!["id".into()],
+            ..ReaperSummary::default()
+        };
+        assert!(!skipped.is_quiet());
+    }
+}

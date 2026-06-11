@@ -75,8 +75,9 @@ impl ClusterConfig {
 
     /// Short-lived connection to the cluster's `postgres` maintenance
     /// database, for `CREATE DATABASE` / `DROP DATABASE` / `pg_database`
-    /// queries that can't run against the database they target.
-    async fn connect_maintenance(&self) -> Result<PgConnection, CloudError> {
+    /// queries that can't run against the database they target. Crate-wide
+    /// because the reaper's orphan scan needs the same connection.
+    pub(crate) async fn connect_maintenance(&self) -> Result<PgConnection, CloudError> {
         let opts = PgConnectOptions::from_str(&self.cluster_url)
             .map_err(|e| CloudError::InvalidUrl(format!("cluster URL: {e}")))?
             .database("postgres");
@@ -128,6 +129,23 @@ pub fn is_tenant_db_name(name: &str) -> bool {
     name.strip_prefix("acct_").is_some_and(|suffix| {
         suffix.len() == 26 && suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
     })
+}
+
+/// Inverse of [`tenant_db_name`]: recover the account UUID a tenant
+/// database name encodes. `None` for anything that isn't exactly the
+/// generated shape (including non-canonical base32 with stray trailing
+/// bits). The reaper uses this to key its per-account advisory lock when
+/// reclaiming an orphaned database — the database name is the only place
+/// the account id survives once the control-plane rows are gone.
+pub fn tenant_db_account_id(name: &str) -> Option<Uuid> {
+    if !is_tenant_db_name(name) {
+        return None;
+    }
+    let suffix = name.strip_prefix("acct_")?;
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(suffix.to_ascii_uppercase().as_bytes())
+        .ok()?;
+    Uuid::from_slice(&bytes).ok()
 }
 
 /// Validate and assert a tenant database name before SQL interpolation.
@@ -417,10 +435,11 @@ pub async fn ensure_claim_not_reserved(
 }
 
 /// Terminate any backends connected to `db_name` and drop it. The shared
-/// drop primitive for [`delete_account`] and the provisioning FK-violation
-/// cleanup: explicit termination keeps the drop from racing a reconnecting
-/// pool, and is harmless when no backends exist.
-async fn terminate_and_drop_database(
+/// drop primitive for [`delete_account`], the provisioning FK-violation
+/// cleanup, and the reaper's rollback/orphan-reclaim arms: explicit
+/// termination keeps the drop from racing a reconnecting pool, and is
+/// harmless when no backends exist.
+pub(crate) async fn terminate_and_drop_database(
     conn: &mut PgConnection,
     db_name: &str,
 ) -> Result<(), CloudError> {
@@ -571,10 +590,15 @@ pub async fn delete_account(
             .await
             .map_err(CloudError::db("reading subdomain for reservation"))?;
     if let Some(subdomain) = subdomain {
+        // Re-upping `created_at` on conflict marks "a deletion is touching
+        // this subdomain right now" — the reaper's self-reservation arm
+        // only clears reservations older than its settle grace, so a
+        // retried deletion is shielded from it again (see crate::reaper).
         sqlx::query(
             "INSERT INTO subdomains_reserved (subdomain, expires_at) \
              VALUES ($1, NOW() + INTERVAL '90 days') \
-             ON CONFLICT (subdomain) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+             ON CONFLICT (subdomain) DO UPDATE \
+             SET expires_at = EXCLUDED.expires_at, created_at = NOW()",
         )
         .bind(&subdomain)
         .execute(control.pool())
@@ -632,6 +656,16 @@ mod tests {
             &format!("acct_{}x", "a".repeat(26)),
         ] {
             assert!(!is_tenant_db_name(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn tenant_db_account_id_inverts_tenant_db_name() {
+        for uuid in [Uuid::nil(), Uuid::new_v4(), Uuid::max()] {
+            assert_eq!(tenant_db_account_id(&tenant_db_name(uuid)), Some(uuid));
+        }
+        for bad in ["", "acct_", "default", &format!("acct_{}", "0".repeat(26))] {
+            assert_eq!(tenant_db_account_id(bad), None, "{bad:?} must not decode");
         }
     }
 

@@ -106,6 +106,15 @@ enum Command {
         #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
         cache_sweep_interval_secs: Option<u64>,
 
+        /// How often the failure-recovery reaper runs, in seconds (plan:
+        /// "Failure recovery & the reaper"). Each pass resumes or rolls
+        /// back stuck provisions, reclaims orphaned tenant databases,
+        /// clears self-reservations, and purges expired links/sessions/
+        /// reservations. Per-account advisory locks make concurrent passes
+        /// across pods safe.
+        #[arg(long, env = "ATOMIC_CLOUD_REAPER_INTERVAL_SECS", default_value_t = 60)]
+        reaper_interval_secs: u64,
+
         #[command(flatten)]
         email: EmailArgs,
 
@@ -323,6 +332,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tenant_pool_max_connections,
             tenant_pool_idle_timeout_secs,
             cache_sweep_interval_secs,
+            reaper_interval_secs,
             email,
             trust_proxy_header,
             app_public_url,
@@ -350,6 +360,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 cache_config,
                 cache_sweep_interval_secs.map(std::time::Duration::from_secs),
+                // tokio::time::interval panics on a zero period; clamp.
+                std::time::Duration::from_secs(reaper_interval_secs.max(1)),
                 email.into_sender()?,
                 plane_config,
             )
@@ -429,7 +441,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// deliberately doesn't until later slices).
 ///
 /// `sweep_interval` controls the periodic account-cache sweep; `None` means
-/// a quarter of the cache's idle TTL.
+/// a quarter of the cache's idle TTL. `reaper_interval` paces the
+/// failure-recovery reaper.
 #[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
 async fn serve(
     control: ControlPlane,
@@ -439,6 +452,7 @@ async fn serve(
     port: u16,
     cache_config: AccountCacheConfig,
     sweep_interval: Option<std::time::Duration>,
+    reaper_interval: std::time::Duration,
     email: Arc<dyn EmailSender>,
     plane_config: AccountPlaneConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -452,6 +466,16 @@ async fn serve(
     ));
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
     let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
+
+    // The reaper loop runs concurrently with the server below via select!,
+    // not tokio::spawn: spawn's Send bound trips rustc's
+    // "implementation is not general enough" higher-ranked lifetime false
+    // positive on provision_account's sqlx futures (the same one
+    // tests/provisioning.rs works around with join!), and select! on the
+    // main task needs no Send while also tying the reaper's lifetime to
+    // serve's.
+    let reaper_loop = run_reaper_loop(control.clone(), cluster.clone(), reaper_interval);
+
     let account_plane = AccountPlane::new(control, cluster, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
@@ -487,7 +511,7 @@ async fn serve(
     tracing::info!(bind, port, "listening on http://{bind}:{port}");
     tracing::info!(bind, port, "health: http://{bind}:{port}/health");
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new().configure(configure_cloud_app(
             state.clone(),
             auth.clone(),
@@ -497,8 +521,43 @@ async fn serve(
     })
     .workers(4)
     .bind((bind.as_str(), port))?
-    .run()
-    .await?;
+    .run();
+
+    tokio::select! {
+        result = server => result?,
+        _ = reaper_loop => unreachable!("the reaper loop never returns"),
+    }
 
     Ok(())
+}
+
+/// Failure-recovery reaper loop (plan: "Failure recovery & the reaper").
+/// The pass semantics — per-account advisory locks, resume-then-rollback,
+/// orphan reclaim, hygiene purges — live in (and are tested through)
+/// [`atomic_cloud::reaper::run_reaper_pass`]; this is interval glue around
+/// it. The jittered start keeps a fleet of pods booted together from
+/// synchronizing their passes (they'd be safe anyway — contended rows skip
+/// via the advisory locks — just wasteful). Never returns; the caller
+/// select!s it against the server so it lives exactly as long as serving.
+async fn run_reaper_loop(
+    control: ControlPlane,
+    cluster: ClusterConfig,
+    reaper_interval: std::time::Duration,
+) {
+    let policy = atomic_cloud::ReaperPolicy::default();
+    let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
+        &mut rand::thread_rng(),
+        0..=reaper_interval.as_millis() as u64,
+    ));
+    tokio::time::sleep(jitter).await;
+    let mut ticker = tokio::time::interval(reaper_interval);
+    loop {
+        ticker.tick().await;
+        let summary = atomic_cloud::run_reaper_pass(&control, &cluster, &policy).await;
+        if summary.is_quiet() {
+            tracing::debug!("reaper pass: nothing to do");
+        } else {
+            tracing::info!(?summary, "reaper pass");
+        }
+    }
 }
