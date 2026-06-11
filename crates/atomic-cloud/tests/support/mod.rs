@@ -23,10 +23,14 @@
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atomic_cloud::provision::is_tenant_db_name;
-use atomic_cloud::{tenant_db_name, CloudError, EmailSender, MagicLinkPurpose};
+use atomic_cloud::{
+    tenant_db_name, CloudError, CreatedRuntimeKey, EmailSender, EnvMasterKeyVault,
+    MagicLinkPurpose, ManagedKeyConfig, ManagedKeys, ProvisioningApi, RuntimeKeyUsage, SecretKey,
+};
 use futures::FutureExt;
 use sqlx::{Connection, PgConnection};
 
@@ -260,6 +264,165 @@ impl EmailSender for DelayedSender {
     ) -> Result<(), CloudError> {
         tokio::time::sleep(self.delay).await;
         self.inner.send_magic_link(to, link, purpose).await
+    }
+}
+
+/// One call recorded by [`RecordingProvisioning`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProvisioningCall {
+    Create {
+        name: String,
+        credit_limit_cents: u32,
+        monthly_reset: bool,
+    },
+    UpdateLimit {
+        external_key_id: String,
+        credit_limit_cents: u32,
+    },
+    Delete {
+        external_key_id: String,
+    },
+    GetUsage {
+        external_key_id: String,
+    },
+}
+
+/// Test-side [`ProvisioningApi`]: records every call for assertion, mints
+/// deterministic fake keys, never talks to a provider. NO REAL PROVIDERS,
+/// EVER. Failures are injectable per method (`fail_create` / `fail_delete`)
+/// so tests can prove the typed-error and best-effort paths.
+#[derive(Default)]
+pub struct RecordingProvisioning {
+    calls: Mutex<Vec<ProvisioningCall>>,
+    counter: AtomicU32,
+    /// When set, `create_key` fails with a typed provisioning error
+    /// (simulating a provider outage / exhausted master balance).
+    pub fail_create: AtomicBool,
+    /// When set, `delete_key` fails (simulating a provider outage during a
+    /// deletion or rollback — the best-effort paths must proceed anyway).
+    pub fail_delete: AtomicBool,
+}
+
+impl RecordingProvisioning {
+    /// Snapshot of every call so far, in order.
+    pub fn calls(&self) -> Vec<ProvisioningCall> {
+        self.calls.lock().expect("provisioning call lock").clone()
+    }
+
+    /// The recorded `Create` calls.
+    pub fn creates(&self) -> Vec<ProvisioningCall> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, ProvisioningCall::Create { .. }))
+            .collect()
+    }
+
+    /// The key ids passed to `delete_key`, in order.
+    pub fn deleted_key_ids(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                ProvisioningCall::Delete { external_key_id } => Some(external_key_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The deterministic plaintext/id pair the `n`th create mints (0-based)
+    /// — lets tests predict key material without threading state.
+    pub fn nth_key(n: u32) -> (String, String) {
+        (
+            format!("sk-or-v1-fake-{n:04}"),
+            format!("orkey-fake-{n:04}"),
+        )
+    }
+
+    fn record(&self, call: ProvisioningCall) {
+        self.calls
+            .lock()
+            .expect("provisioning call lock")
+            .push(call);
+    }
+
+    fn injected_failure(context: &str) -> CloudError {
+        CloudError::ProviderProvisioning {
+            context: context.to_string(),
+            message: "injected test failure".to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProvisioningApi for RecordingProvisioning {
+    async fn create_key(
+        &self,
+        name: &str,
+        credit_limit_cents: u32,
+        monthly_reset: bool,
+    ) -> Result<CreatedRuntimeKey, CloudError> {
+        self.record(ProvisioningCall::Create {
+            name: name.to_string(),
+            credit_limit_cents,
+            monthly_reset,
+        });
+        if self.fail_create.load(Ordering::SeqCst) {
+            return Err(Self::injected_failure("creating runtime key"));
+        }
+        let n = self.counter.fetch_add(1, Ordering::SeqCst);
+        let (plaintext, external_key_id) = Self::nth_key(n);
+        Ok(CreatedRuntimeKey {
+            plaintext_key: SecretKey::new(plaintext),
+            external_key_id,
+        })
+    }
+
+    async fn update_key_limit(
+        &self,
+        external_key_id: &str,
+        credit_limit_cents: u32,
+    ) -> Result<(), CloudError> {
+        self.record(ProvisioningCall::UpdateLimit {
+            external_key_id: external_key_id.to_string(),
+            credit_limit_cents,
+        });
+        Ok(())
+    }
+
+    async fn delete_key(&self, external_key_id: &str) -> Result<(), CloudError> {
+        self.record(ProvisioningCall::Delete {
+            external_key_id: external_key_id.to_string(),
+        });
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(Self::injected_failure("deleting runtime key"));
+        }
+        // Idempotent like the real client: deleting an unknown id succeeds.
+        Ok(())
+    }
+
+    async fn get_key_usage(&self, external_key_id: &str) -> Result<RuntimeKeyUsage, CloudError> {
+        self.record(ProvisioningCall::GetUsage {
+            external_key_id: external_key_id.to_string(),
+        });
+        Ok(RuntimeKeyUsage {
+            usage_usd: 0.0,
+            limit_usd: Some(0.5),
+            limit_remaining_usd: Some(0.5),
+            disabled: false,
+        })
+    }
+}
+
+/// The deterministic test master key shared by managed-key tests, so
+/// assertions can decrypt rows written through [`managed_keys_with`].
+pub const TEST_MASTER_KEY: [u8; 32] = [7u8; 32];
+
+/// An `Enabled` [`ManagedKeys`] over a recording API, the [`TEST_MASTER_KEY`]
+/// vault, and the default config (50¢ monthly allowance).
+pub fn managed_keys_with(api: Arc<RecordingProvisioning>) -> ManagedKeys {
+    ManagedKeys::Enabled {
+        api,
+        vault: Arc::new(EnvMasterKeyVault::new(TEST_MASTER_KEY)),
+        config: ManagedKeyConfig::default(),
     }
 }
 

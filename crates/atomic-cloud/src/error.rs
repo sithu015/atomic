@@ -154,6 +154,22 @@ pub enum CloudError {
         origin: crate::provider_credentials::CredentialOrigin,
     },
 
+    /// The OpenRouter provisioning key is missing or empty. Raised at
+    /// client construction — i.e. at boot — never mid-request. The message
+    /// names the environment variable; it **never** contains key material.
+    #[error("invalid provider-provisioning key: {0}")]
+    InvalidProvisioningKey(String),
+
+    /// A provisioning-API call (create/update/delete/usage of a managed
+    /// runtime key) failed: transport error, non-success status, or an
+    /// unparseable response. `context` says which operation; `message`
+    /// carries the status and a bounded slice of the provider's error body
+    /// — never the provisioning key, and never a runtime-key plaintext
+    /// (success bodies, the only ones that carry keys, are withheld from
+    /// decode errors by construction; see [`crate::provisioning_api`]).
+    #[error("provisioning API: {context}: {message}")]
+    ProviderProvisioning { context: String, message: String },
+
     /// A control-plane invariant the code relies on was violated (e.g. an
     /// `accounts.id` that isn't a UUID). Indicates corruption or a bug, not
     /// a user error.

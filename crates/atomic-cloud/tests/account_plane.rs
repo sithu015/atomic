@@ -24,7 +24,7 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState,
-    MagicLinkPurpose, NewAccount, RateLimits, TenantPlane, TokenScope, SESSION_COOKIE,
+    MagicLinkPurpose, ManagedKeys, NewAccount, RateLimits, TenantPlane, TokenScope, SESSION_COOKIE,
 };
 use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
@@ -96,9 +96,20 @@ impl PlaneHarness {
             AccountCacheConfig::default(),
         ));
         let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
-        let account_plane = AccountPlane::new(control.clone(), cluster.clone(), email, config)
-            .expect("build account plane");
-        let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
+        let account_plane = AccountPlane::new(
+            control.clone(),
+            cluster.clone(),
+            ManagedKeys::Disabled,
+            email,
+            config,
+        )
+        .expect("build account plane");
+        let tenant_plane = TenantPlane::new(
+            control.clone(),
+            cluster.clone(),
+            ManagedKeys::Disabled,
+            Arc::clone(&cache),
+        );
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -311,6 +322,7 @@ async fn app_host_404s_tenant_routes() {
         let account = provision_account(
             &h.control,
             &h.cluster,
+            &ManagedKeys::Disabled,
             NewAccount {
                 email: "alpha@example.com".to_string(),
                 subdomain: "alpha".to_string(),
@@ -385,6 +397,7 @@ async fn tenant_subdomains_404_account_plane_routes() {
             let account = provision_account(
                 &h.control,
                 &h.cluster,
+                &ManagedKeys::Disabled,
                 NewAccount {
                     email: "alpha@example.com".to_string(),
                     subdomain: "alpha".to_string(),
@@ -521,6 +534,7 @@ async fn signup_validation_errors_are_honest_400s() {
             provision_account(
                 &h.control,
                 &h.cluster,
+                &ManagedKeys::Disabled,
                 NewAccount {
                     email: "alpha@example.com".to_string(),
                     subdomain: "alpha".to_string(),
@@ -589,6 +603,7 @@ async fn login_request_link_is_indistinguishable() {
             provision_account(
                 &h.control,
                 &h.cluster,
+                &ManagedKeys::Disabled,
                 NewAccount {
                     email: "alpha@example.com".to_string(),
                     subdomain: "alpha".to_string(),
@@ -679,6 +694,7 @@ async fn login_request_link_returns_before_the_send() {
             provision_account(
                 &h.control,
                 &h.cluster,
+                &ManagedKeys::Disabled,
                 NewAccount {
                     email: "alpha@example.com".to_string(),
                     subdomain: "alpha".to_string(),
@@ -842,6 +858,7 @@ async fn email_rate_limit_enforces_and_resets() {
         provision_account(
             &h.control,
             &h.cluster,
+            &ManagedKeys::Disabled,
             NewAccount {
                 email: "alpha@example.com".to_string(),
                 subdomain: "alpha".to_string(),
@@ -1059,6 +1076,7 @@ async fn completion_purpose_crossover_rejected() {
         provision_account(
             &h.control,
             &h.cluster,
+            &ManagedKeys::Disabled,
             NewAccount {
                 email: "alpha@example.com".to_string(),
                 subdomain: "alpha".to_string(),
@@ -1423,6 +1441,7 @@ async fn login_complete_end_to_end() {
         provision_account(
             &h.control,
             &h.cluster,
+            &ManagedKeys::Disabled,
             NewAccount {
                 email: "alpha@example.com".to_string(),
                 subdomain: "alpha".to_string(),
@@ -1480,6 +1499,7 @@ async fn flow_issued_cookie_rejected_on_other_tenants_subdomain() {
                 provision_account(
                     &h.control,
                     &h.cluster,
+                    &ManagedKeys::Disabled,
                     NewAccount {
                         email: email.to_string(),
                         subdomain: subdomain.to_string(),

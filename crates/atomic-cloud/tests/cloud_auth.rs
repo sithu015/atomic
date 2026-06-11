@@ -15,8 +15,8 @@ use actix_web::http::header;
 use actix_web::{test as actix_test, web, App, HttpMessage, HttpRequest, HttpResponse};
 use atomic_cloud::{
     create_session, issue_token, provision_account, AccountCache, AccountCacheConfig, CloudAuth,
-    ClusterConfig, ControlPlane, NewAccount, ProvisionedAccount, ResolvedTenant, TokenScope,
-    SESSION_COOKIE,
+    ClusterConfig, ControlPlane, ManagedKeys, NewAccount, ProvisionedAccount, ResolvedTenant,
+    TokenScope, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_server::db_extractor::{resolve_core, RequestDatabaseManager};
@@ -49,6 +49,7 @@ async fn provision(
     provision_account(
         control,
         cluster,
+        &ManagedKeys::Disabled,
         NewAccount {
             email: format!("{subdomain}@example.com"),
             subdomain: subdomain.to_string(),

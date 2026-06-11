@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use atomic_cloud::reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 use atomic_cloud::{
-    provision_account, tenant_db_name, ClusterConfig, ControlPlane, NewAccount, ProvisionedAccount,
+    provision_account, tenant_db_name, ClusterConfig, ControlPlane, ManagedKeys, NewAccount,
+    ProvisionedAccount,
 };
 use sqlx::{Connection, PgConnection};
 use support::{create_database, drop_database, with_control_db, with_db_guard};
@@ -118,7 +119,13 @@ async fn stale_half_provision_is_resumed_to_active() {
             create_database(&cluster.cluster_url, &db_name).await;
 
             with_db_guard(&cluster.cluster_url, &db_name, || async {
-                let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+                let summary = run_reaper_pass(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    &ReaperPolicy::default(),
+                )
+                .await;
                 assert_no_errors(&summary);
                 assert_eq!(summary.stuck_resumed, vec![account_id.to_string()]);
                 assert!(summary.stuck_rolled_back.is_empty());
@@ -188,7 +195,13 @@ async fn unresumable_stale_provision_is_rolled_back() {
             .expect("seed mapping row");
 
             with_db_guard(&cluster.cluster_url, &db_name, || async {
-                let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+                let summary = run_reaper_pass(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    &ReaperPolicy::default(),
+                )
+                .await;
                 assert_no_errors(&summary);
                 assert_eq!(summary.stuck_rolled_back, vec![account_id.to_string()]);
                 assert!(summary.stuck_resumed.is_empty());
@@ -218,6 +231,7 @@ async fn unresumable_stale_provision_is_rolled_back() {
                 provision_account(
                     &control,
                     &cluster,
+                    &ManagedKeys::Disabled,
                     new_account("new@example.com", "scorched"),
                 )
                 .await
@@ -242,6 +256,7 @@ async fn orphaned_tenant_database_is_reclaimed_and_owned_one_is_not() {
             let healthy = provision_account(
                 &control,
                 &cluster,
+                &ManagedKeys::Disabled,
                 new_account("healthy@example.com", "healthy"),
             )
             .await
@@ -253,7 +268,13 @@ async fn orphaned_tenant_database_is_reclaimed_and_owned_one_is_not() {
             create_database(&cluster.cluster_url, &orphan_db).await;
 
             with_db_guard(&cluster.cluster_url, &orphan_db, || async {
-                let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+                let summary = run_reaper_pass(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    &ReaperPolicy::default(),
+                )
+                .await;
                 assert_no_errors(&summary);
                 assert_eq!(summary.orphan_dbs_dropped, vec![orphan_db.clone()]);
                 assert!(summary.stuck_rolled_back.is_empty());
@@ -295,7 +316,13 @@ async fn in_flight_healthy_provision_is_left_alone() {
             create_database(&cluster.cluster_url, &db_name).await;
 
             with_db_guard(&cluster.cluster_url, &db_name, || async {
-                let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+                let summary = run_reaper_pass(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    &ReaperPolicy::default(),
+                )
+                .await;
                 assert_no_errors(&summary);
                 assert!(summary.stuck_resumed.is_empty());
                 assert!(summary.stuck_rolled_back.is_empty());
@@ -339,7 +366,7 @@ async fn resume_racing_deletion_is_not_reported_resumed() {
 
             with_db_guard(&cluster.cluster_url, &db_name, || async {
                 let policy = ReaperPolicy::default();
-                let pass = run_reaper_pass(&control, &cluster, &policy);
+                let pass = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy);
                 let saboteur = async {
                     // Wait for the resume's CREATE DATABASE to land
                     // (migrations still have hundreds of milliseconds to
@@ -406,17 +433,23 @@ async fn interrupted_deletion_is_completed_and_healthy_account_untouched() {
             let healthy = provision_account(
                 &control,
                 &cluster,
+                &ManagedKeys::Disabled,
                 new_account("keep@example.com", "keeper"),
             )
             .await
             .expect("provision healthy");
-            let doomed =
-                provision_account(&control, &cluster, new_account("gone@example.com", "goner"))
-                    .await
-                    .expect("provision doomed");
+            let doomed = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("gone@example.com", "goner"),
+            )
+            .await
+            .expect("provision doomed");
             let fresh = provision_account(
                 &control,
                 &cluster,
+                &ManagedKeys::Disabled,
                 new_account("young@example.com", "youngling"),
             )
             .await
@@ -438,7 +471,13 @@ async fn interrupted_deletion_is_completed_and_healthy_account_untouched() {
             run_deletion_steps_through_mapping_removal(&control, &cluster, &doomed).await;
             run_deletion_steps_through_mapping_removal(&control, &cluster, &fresh).await;
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(
                 summary.deletions_completed,
@@ -529,14 +568,22 @@ async fn self_reservation_residue_is_cleared_with_grace() {
         |url| async move {
             let (control, cluster) = setup(&url).await;
 
-            let _alpha =
-                provision_account(&control, &cluster, new_account("a@example.com", "alpha"))
-                    .await
-                    .expect("provision alpha");
-            let _bravo =
-                provision_account(&control, &cluster, new_account("b@example.com", "bravo"))
-                    .await
-                    .expect("provision bravo");
+            let _alpha = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("a@example.com", "alpha"),
+            )
+            .await
+            .expect("provision alpha");
+            let _bravo = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("b@example.com", "bravo"),
+            )
+            .await
+            .expect("provision bravo");
 
             // Residue: alpha's deletion crashed after reserving, 10 minutes ago.
             sqlx::query(
@@ -564,7 +611,13 @@ async fn self_reservation_residue_is_cleared_with_grace() {
             .await
             .expect("seed unrelated reservation");
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.self_reservations_cleared, vec!["alpha".to_string()]);
 
@@ -650,7 +703,13 @@ async fn hygiene_purges_expired_rows_and_keeps_the_rest() {
                 .expect("seed reservation");
             }
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.expired_magic_links_purged, 1);
             assert_eq!(summary.expired_sessions_purged, 1);
@@ -715,7 +774,13 @@ async fn contended_lock_skips_row_and_next_pass_recovers() {
                 .expect("rival takes lock");
             assert!(got, "rival lock must be free initially");
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.stuck_skipped_locked, vec![account_id.to_string()]);
             assert!(summary.stuck_resumed.is_empty());
@@ -731,7 +796,13 @@ async fn contended_lock_skips_row_and_next_pass_recovers() {
             // Closing the rival session releases its lock.
             rival.close().await.expect("close rival session");
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.stuck_resumed, vec![account_id.to_string()]);
             assert_eq!(
@@ -764,7 +835,13 @@ async fn contended_lock_defers_orphan_reclaim() {
                 .expect("rival takes lock");
             assert!(got);
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.orphan_dbs_skipped_locked, vec![orphan_db.clone()]);
             assert!(summary.orphan_dbs_dropped.is_empty());
@@ -775,7 +852,13 @@ async fn contended_lock_defers_orphan_reclaim() {
 
             rival.close().await.expect("close rival session");
 
-            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
             assert_no_errors(&summary);
             assert_eq!(summary.orphan_dbs_dropped, vec![orphan_db.clone()]);
             assert!(!database_exists(&cluster.cluster_url, &orphan_db).await);
@@ -799,8 +882,8 @@ async fn simultaneous_passes_resume_exactly_once() {
 
             let policy = ReaperPolicy::default();
             let (a, b) = tokio::join!(
-                run_reaper_pass(&control, &cluster, &policy),
-                run_reaper_pass(&control, &cluster, &policy),
+                run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy),
+                run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy),
             );
             assert_no_errors(&a);
             assert_no_errors(&b);
@@ -849,7 +932,7 @@ async fn resume_cap_defers_surplus_rows_across_passes() {
                 max_resumes_per_pass: 1,
                 ..ReaperPolicy::default()
             };
-            let first = run_reaper_pass(&control, &cluster, &policy).await;
+            let first = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
             assert_no_errors(&first);
             assert_eq!(first.stuck_rolled_back.len(), 1);
             assert_eq!(
@@ -858,7 +941,7 @@ async fn resume_cap_defers_surplus_rows_across_passes() {
                 "surplus row deferred, not dropped"
             );
 
-            let second = run_reaper_pass(&control, &cluster, &policy).await;
+            let second = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
             assert_no_errors(&second);
             assert_eq!(second.stuck_rolled_back.len(), 1);
             assert!(second.stuck_deferred.is_empty());
@@ -905,7 +988,7 @@ async fn settled_rows_do_not_consume_the_resume_cap() {
                 ..ReaperPolicy::default()
             };
             let oldest_db = tenant_db_name(oldest);
-            let pass = run_reaper_pass(&control, &cluster, &policy);
+            let pass = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy);
             let saboteur = async {
                 // The oldest row's resume signals progress by creating its
                 // tenant database; migrations leave a wide window in which

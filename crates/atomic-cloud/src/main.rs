@@ -21,11 +21,14 @@
 //! serving (managed keys are provisioned at signup; BYOK settings routes
 //! decrypt stored keys), so a missing/malformed key is a deployment error
 //! best surfaced at boot, not on the first signup. The other subcommands
-//! (`migrate`, `account`, `token`) deliberately never load the vault: none
-//! of them read or write `encrypted_key` (managed-key lifecycle calls use
-//! the cleartext `external_key_id`; deletion cascades the rows), so
-//! operator tooling stays runnable from hosts that don't hold the
-//! production master key.
+//! (`migrate`, `account`, `token`) deliberately never load the vault — or
+//! the OpenRouter provisioning key — so operator tooling stays runnable
+//! from hosts that hold neither production secret. The trade-off is that
+//! `account create` provisions keyless accounts and `account delete` cannot
+//! delete a managed runtime key (it logs the residue loudly with the
+//! `external_key_id`; the master OpenRouter account's key listing is the
+//! cleanup path). The HTTP routes, which run inside `serve`, do both
+//! properly — prefer them.
 
 use std::sync::Arc;
 
@@ -34,7 +37,8 @@ use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
     EmailSender, EnvMasterKeyVault, FallbackAppState, KeyVault, LogSender, MailgunSender,
-    NewAccount, RateLimits, TenantPlane, TokenScope,
+    ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, RateLimits, TenantPlane,
+    TokenScope,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -76,6 +80,7 @@ impl ClusterArgs {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // One Command exists per process; Serve is just every serve knob.
 enum Command {
     /// Start the multi-tenant HTTP server.
     Serve {
@@ -167,6 +172,9 @@ enum Command {
             default_value_t = atomic_cloud::DEFAULT_MAX_CONCURRENT_PROVISIONS
         )]
         max_concurrent_provisions: usize,
+
+        #[command(flatten)]
+        provisioning: ProvisioningArgs,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -218,6 +226,97 @@ struct EmailArgs {
     /// mailgun).
     #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_FROM")]
     mailgun_from: Option<String>,
+}
+
+/// How managed provider keys are provisioned at signup (plan: "Provider
+/// management" → "Managed key lifecycle").
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProvisioningMode {
+    /// No managed keys (dev default): signup skips the key step entirely
+    /// and accounts run keyless until a provider is configured. Account
+    /// deletion logs loudly if it encounters managed-key residue it cannot
+    /// delete.
+    Disabled,
+    /// Mint a per-account OpenRouter runtime key at signup, with the
+    /// configured monthly allowance and native monthly reset. Requires the
+    /// provisioning key in the environment.
+    Openrouter,
+}
+
+/// Managed-key provisioning selection for `serve`. The provisioning key is
+/// env-only by convention — it can mint runtime keys against the master
+/// OpenRouter account's balance (crown-jewel custody; see
+/// `atomic_cloud::provisioning_api`), and argv leaks into process listings.
+#[derive(Args)]
+struct ProvisioningArgs {
+    /// Managed provider-key provisioning mode.
+    #[arg(
+        long = "provisioning-mode",
+        env = "ATOMIC_CLOUD_PROVISIONING_MODE",
+        default_value = "disabled"
+    )]
+    provisioning_mode: ProvisioningMode,
+
+    /// Name of the environment variable holding the OpenRouter provisioning
+    /// key (required with --provisioning-mode openrouter). The key VALUE is
+    /// only ever read from the environment.
+    #[arg(long, default_value = atomic_cloud::PROVISIONING_KEY_ENV)]
+    openrouter_provisioning_key_env: String,
+
+    /// Base URL of the OpenRouter provisioning API. Override for proxies or
+    /// test servers speaking the same API.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_OPENROUTER_PROVISIONING_URL",
+        default_value = atomic_cloud::DEFAULT_OPENROUTER_PROVISIONING_URL
+    )]
+    openrouter_provisioning_url: String,
+
+    /// Monthly credit allowance per managed key, in cents, enforced
+    /// provider-side with native monthly reset (the plan's free-tier
+    /// placeholder is 50 = $0.50/mo; the billing slice derives this from
+    /// the account's plan instead).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MANAGED_KEY_ALLOWANCE_CENTS",
+        default_value_t = atomic_cloud::DEFAULT_MONTHLY_ALLOWANCE_CENTS
+    )]
+    managed_key_allowance_cents: u32,
+}
+
+impl ProvisioningArgs {
+    /// Build the managed-key handle, erroring (at boot, never on the first
+    /// signup) when openrouter mode is missing its provisioning key. Takes
+    /// the boot-validated vault; `Disabled` drops it — the boot contract
+    /// ("stored credentials are decryptable") holds either way.
+    fn into_managed_keys(
+        self,
+        vault: Arc<dyn KeyVault>,
+    ) -> Result<ManagedKeys, Box<dyn std::error::Error>> {
+        match self.provisioning_mode {
+            ProvisioningMode::Disabled => {
+                tracing::warn!(
+                    "managed-key provisioning is disabled: new accounts are \
+                     created without AI provider credentials"
+                );
+                Ok(ManagedKeys::Disabled)
+            }
+            ProvisioningMode::Openrouter => {
+                let api = OpenRouterProvisioning::from_env(
+                    &self.openrouter_provisioning_url,
+                    &self.openrouter_provisioning_key_env,
+                )?;
+                Ok(ManagedKeys::Enabled {
+                    api: Arc::new(api),
+                    vault,
+                    config: ManagedKeyConfig {
+                        monthly_allowance_cents: self.managed_key_allowance_cents,
+                        ..ManagedKeyConfig::default()
+                    },
+                })
+            }
+        }
+    }
 }
 
 impl EmailArgs {
@@ -361,15 +460,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             trust_proxy_header,
             app_public_url,
             max_concurrent_provisions,
+            provisioning,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
             // with a missing or malformed master key dies here with a
             // message naming the variable — never on the first signup.
-            // The slice's managed-key and BYOK wiring receives this vault;
-            // the boot contract it pins is: serve does not start unless
-            // stored provider credentials are decryptable.
-            let _vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+            // The boot contract: serve does not start unless stored
+            // provider credentials are decryptable.
+            let vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+            let managed = provisioning.into_managed_keys(vault)?;
 
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
@@ -388,6 +488,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             serve(
                 control,
                 cluster.into_config(),
+                managed,
                 base_domain,
                 bind,
                 port,
@@ -407,9 +508,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 email,
                 subdomain,
             } => {
+                // Operator-side creation never provisions a managed key:
+                // this command runs from hosts that hold neither the
+                // master key nor the provisioning key (see the module
+                // docs), so the account starts keyless — same state as
+                // provisioning-mode 'disabled'.
                 let account = provision_account(
                     &control,
                     &cluster.into_config(),
+                    &ManagedKeys::Disabled,
                     NewAccount { email, subdomain },
                 )
                 .await?;
@@ -434,7 +541,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .account_id_by_subdomain(&subdomain)
                     .await?
                     .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
-                delete_account(&control, &cluster.into_config(), &account_id).await?;
+                // Disabled here too: this host has no provisioning key, so
+                // a managed runtime key (if the account has one) cannot be
+                // deleted from the CLI — delete_account logs the residue
+                // loudly with the external id; clean it up via the master
+                // OpenRouter account's key listing. The HTTP deletion route
+                // (the preferred path) deletes the key properly.
+                delete_account(
+                    &control,
+                    &cluster.into_config(),
+                    &ManagedKeys::Disabled,
+                    &account_id,
+                )
+                .await?;
                 println!("deleted account {account_id} ({subdomain})");
                 Ok(())
             }
@@ -480,6 +599,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn serve(
     control: ControlPlane,
     cluster: ClusterConfig,
+    managed: ManagedKeys,
     base_domain: String,
     bind: String,
     port: u16,
@@ -498,7 +618,12 @@ async fn serve(
         cache_config,
     ));
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
-    let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
+    let tenant_plane = TenantPlane::new(
+        control.clone(),
+        cluster.clone(),
+        managed.clone(),
+        Arc::clone(&cache),
+    );
 
     // The reaper loop runs concurrently with the server below via select!,
     // not tokio::spawn: spawn's Send bound trips rustc's
@@ -507,9 +632,14 @@ async fn serve(
     // tests/provisioning.rs works around with join!), and select! on the
     // main task needs no Send while also tying the reaper's lifetime to
     // serve's.
-    let reaper_loop = run_reaper_loop(control.clone(), cluster.clone(), reaper_interval);
+    let reaper_loop = run_reaper_loop(
+        control.clone(),
+        cluster.clone(),
+        managed.clone(),
+        reaper_interval,
+    );
 
-    let account_plane = AccountPlane::new(control, cluster, email, plane_config)?;
+    let account_plane = AccountPlane::new(control, cluster, managed, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
     // a new entry, but a stable working set produces no inserts — without
@@ -575,6 +705,7 @@ async fn serve(
 async fn run_reaper_loop(
     control: ControlPlane,
     cluster: ClusterConfig,
+    managed: ManagedKeys,
     reaper_interval: std::time::Duration,
 ) {
     let policy = atomic_cloud::ReaperPolicy::default();
@@ -586,7 +717,7 @@ async fn run_reaper_loop(
     let mut ticker = tokio::time::interval(reaper_interval);
     loop {
         ticker.tick().await;
-        let summary = atomic_cloud::run_reaper_pass(&control, &cluster, &policy).await;
+        let summary = atomic_cloud::run_reaper_pass(&control, &cluster, &managed, &policy).await;
         if summary.is_quiet() {
             tracing::debug!("reaper pass: nothing to do");
         } else {

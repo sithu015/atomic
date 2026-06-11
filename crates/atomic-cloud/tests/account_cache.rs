@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use atomic_cloud::{
     provision_account, AccountCache, AccountCacheConfig, CloudError, ClusterConfig, ControlPlane,
-    NewAccount,
+    ManagedKeys, NewAccount,
 };
 use support::with_control_db;
 
@@ -36,6 +36,7 @@ async fn provision(control: &ControlPlane, cluster: &ClusterConfig, subdomain: &
     provision_account(
         control,
         cluster,
+        &ManagedKeys::Disabled,
         NewAccount {
             email: format!("{subdomain}@example.com"),
             subdomain: subdomain.to_string(),

@@ -55,8 +55,9 @@
 //!   itself: one indexed SELECT on both branches, far below network jitter.
 //! - `GET /signup/complete?token=…` — consume the signup link and provision
 //!   the account synchronously (plan: "Signup" steps 3–12, minus the
-//!   deferred 7–9), then establish a session and 302 to the new tenant. See
-//!   "Completion semantics" below.
+//!   deferred 7–8; step 9's managed key runs per the configured
+//!   [`ManagedKeys`] mode), then establish a session and 302 to the new
+//!   tenant. See "Completion semantics" below.
 //! - `GET /login/complete?token=…` — consume the login link, find the
 //!   active account by the link's email, establish a session, 302 to the
 //!   account's subdomain.
@@ -171,6 +172,7 @@ use crate::magic_links::{
     consume_magic_link, issue_magic_link, magic_link_token_shape_ok, peek_magic_link,
     MagicLinkPurpose, MAGIC_LINK_TTL,
 };
+use crate::managed_keys::ManagedKeys;
 use crate::provision::{
     email_format_ok, provision_account, subdomain_format_ok, ClusterConfig, NewAccount,
 };
@@ -267,6 +269,9 @@ struct PlaneState {
     /// The shared tenant cluster, for the synchronous provision in
     /// `/signup/complete`.
     cluster: ClusterConfig,
+    /// Managed provider-key lifecycle for signup step 9 (plan: "Provider
+    /// management"); `Disabled` provisions keyless accounts.
+    managed: ManagedKeys,
     email: Arc<dyn EmailSender>,
     /// Normalized (lowercase, no leading dot, no port) base domain.
     base_domain: String,
@@ -304,6 +309,7 @@ impl AccountPlane {
     pub fn new(
         control: ControlPlane,
         cluster: ClusterConfig,
+        managed: ManagedKeys,
         email: Arc<dyn EmailSender>,
         config: AccountPlaneConfig,
     ) -> Result<Self, CloudError> {
@@ -328,6 +334,7 @@ impl AccountPlane {
             state: web::Data::new(PlaneState {
                 control,
                 cluster,
+                managed,
                 email,
                 base_domain,
                 app_public_url,
@@ -652,9 +659,11 @@ struct CompleteQuery {
 }
 
 /// `GET /signup/complete?token=…` (app host only). Signup steps 3–12 from
-/// the plan, minus the deferred 7–9 (cloud-curated per-DB settings, default
-/// report, managed provider key — later slices). See the module docs
-/// ("Completion semantics") for the refusal ordering this implements.
+/// the plan, minus the deferred 7–8 (cloud-curated per-DB settings, default
+/// report — later slices); step 9 (managed provider key) runs inside
+/// `provision_account` per the configured [`ManagedKeys`] mode. See the
+/// module docs ("Completion semantics") for the refusal ordering this
+/// implements.
 async fn signup_complete(
     state: web::Data<PlaneState>,
     req: HttpRequest,
@@ -718,6 +727,7 @@ async fn signup_complete(
     let provisioned = provision_account(
         &state.control,
         &state.cluster,
+        &state.managed,
         NewAccount {
             email: record.email.clone(),
             subdomain,

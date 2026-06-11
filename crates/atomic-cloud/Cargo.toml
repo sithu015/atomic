@@ -83,3 +83,7 @@ reqwest = { version = "0.12", features = ["json"] }
 # Versions match atomic-server's e2e suite.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# Mock HTTP server pinning OpenRouterProvisioning's request shape (auth
+# header, body fields, response parsing, error mapping) — NO REAL PROVIDERS.
+# Version matches atomic-test-support.
+wiremock = "0.6"

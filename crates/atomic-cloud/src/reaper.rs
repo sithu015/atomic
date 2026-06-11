@@ -14,7 +14,10 @@
 //!    every provisioning step is idempotent, so a crash at any point re-runs
 //!    to completion. Only when the resume itself fails is the provision
 //!    *rolled back*: accounts row hard-deleted (freeing the subdomain
-//!    immediately), tenant database dropped. There is no `'failed'`
+//!    immediately), managed runtime key deleted via the provisioning API
+//!    (best-effort; read before the row delete — the CASCADE sweeps the
+//!    credentials row holding its id), tenant database dropped. There is no
+//!    `'failed'`
 //!    tombstone — v1 is hard-delete everywhere, and a tombstone row would
 //!    keep holding the UNIQUE subdomain hostage (or force a non-additive
 //!    constraint migration to stop it). The loud `tracing::error!` carrying
@@ -120,6 +123,7 @@ use uuid::Uuid;
 
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+use crate::managed_keys::ManagedKeys;
 use crate::provision::{
     is_tenant_db_name, provision_account, tenant_db_account_id, tenant_db_name,
     terminate_and_drop_database, ClusterConfig, NewAccount,
@@ -259,16 +263,19 @@ pub fn reaper_lock_key(account_id: &str) -> i64 {
 pub async fn run_reaper_pass(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     policy: &ReaperPolicy,
 ) -> ReaperSummary {
     let mut summary = ReaperSummary::default();
-    if let Err(e) = reap_stuck_provisions(control, cluster, policy, &mut summary).await {
+    if let Err(e) = reap_stuck_provisions(control, cluster, managed, policy, &mut summary).await {
         record_error(&mut summary, "stuck-provision arm", &e);
     }
     if let Err(e) = reap_orphaned_tenant_databases(control, cluster, &mut summary).await {
         record_error(&mut summary, "orphaned-database arm", &e);
     }
-    if let Err(e) = complete_interrupted_deletions(control, cluster, policy, &mut summary).await {
+    if let Err(e) =
+        complete_interrupted_deletions(control, cluster, managed, policy, &mut summary).await
+    {
         record_error(&mut summary, "interrupted-deletion arm", &e);
     }
     if let Err(e) = clear_self_reservations(control, policy, &mut summary).await {
@@ -351,6 +358,7 @@ enum StuckOutcome {
 async fn reap_stuck_provisions(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     policy: &ReaperPolicy,
     summary: &mut ReaperSummary,
 ) -> Result<(), CloudError> {
@@ -388,7 +396,8 @@ async fn reap_stuck_provisions(
         };
         // Process under the lock, then ALWAYS release — outcomes (including
         // errors) are values here precisely so no path skips the release.
-        let outcome = process_stuck_provision(control, cluster, &account_id, stale_before).await;
+        let outcome =
+            process_stuck_provision(control, cluster, managed, &account_id, stale_before).await;
         lock.release().await;
         // Only attempts that actually did resume work count against the
         // cap. AlreadySettled cost one indexed re-read — charging it would
@@ -417,6 +426,7 @@ async fn reap_stuck_provisions(
 async fn process_stuck_provision(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     account_id: &str,
     stale_before: DateTime<Utc>,
 ) -> Result<StuckOutcome, CloudError> {
@@ -442,6 +452,7 @@ async fn process_stuck_provision(
     let resume_err = match provision_account(
         control,
         cluster,
+        managed,
         NewAccount {
             email: email.clone(),
             subdomain: subdomain.clone(),
@@ -464,6 +475,7 @@ async fn process_stuck_provision(
     if roll_back_stuck_provision(
         control,
         cluster,
+        managed,
         account_id,
         &email,
         &subdomain,
@@ -506,10 +518,14 @@ async fn process_stuck_provision(
 /// never served anything, so no external client can be pointing at the
 /// name, and the whole point of freeing is that the user can immediately
 /// retry signup with the same slug. CASCADE FKs sweep any `cloud_tokens`,
-/// `sessions`, and `account_databases` rows with the accounts row.
+/// `sessions`, `account_databases`, and `provider_credentials` rows with
+/// the accounts row — which is why any managed runtime key is read before,
+/// and deleted after, the row delete (see below).
+#[allow(clippy::too_many_arguments)] // One rollback, fully spelled out.
 async fn roll_back_stuck_provision(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     account_id: &str,
     email: &str,
     subdomain: &str,
@@ -531,6 +547,14 @@ async fn roll_back_stuck_provision(
             db_names.push(derived);
         }
     }
+
+    // Likewise the managed runtime key id(s): the credentials rows go with
+    // the CASCADE, and the database name encodes nothing about them — read
+    // now, delete only once the rollback's claim (the status-guarded DELETE
+    // below) has actually won. A resume racing this read could mint a key
+    // *after* it; that residue is the documented accepted orphan (see
+    // crate::managed_keys), bounded by the per-key credit limit.
+    let managed_key_ids = managed.managed_key_ids(control, account_id).await?;
 
     let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1 AND status = 'provisioning'")
         .bind(account_id)
@@ -556,6 +580,18 @@ async fn roll_back_stuck_provision(
          subdomain freed for immediate reuse; this log line is the \
          operator's only trace of the failed signup"
     );
+
+    // The claim won; the CASCADE has swept the credentials rows, so the
+    // locally held ids are the last reference to the runtime keys. Delete
+    // them BEFORE the database drops below — a drop failure returns early,
+    // and the orphan arm that later reclaims the database knows nothing
+    // about keys. Best-effort: a provider outage must not wedge the
+    // rollback (the row is already correctly gone).
+    for external_key_id in &managed_key_ids {
+        managed
+            .delete_external_key_best_effort(account_id, external_key_id)
+            .await;
+    }
 
     let mut conn = cluster.connect_maintenance().await?;
     let mut dropped = Ok(());
@@ -702,6 +738,7 @@ async fn is_referenced(
 async fn complete_interrupted_deletions(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     policy: &ReaperPolicy,
     summary: &mut ReaperSummary,
 ) -> Result<(), CloudError> {
@@ -756,7 +793,12 @@ async fn complete_interrupted_deletions(
             if !still_interrupted {
                 return Ok(false);
             }
-            crate::provision::delete_account(control, cluster, &account_id).await?;
+            // delete_account's own step 3 deletes any managed runtime key —
+            // the credentials row survives an interrupted deletion (only
+            // the accounts-row CASCADE removes it), so the retry here can
+            // still find the external id even when the original attempt's
+            // key delete failed.
+            crate::provision::delete_account(control, cluster, managed, &account_id).await?;
             Ok(true)
         }
         .await;

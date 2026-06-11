@@ -1,9 +1,10 @@
 //! Account provisioning and deletion (plan: "Provisioning lifecycle").
 //!
-//! These are pure library functions — no HTTP, no email, no provider keys.
-//! The signup HTTP flow and magic links arrive with the signup slice; managed
-//! OpenRouter keys with the provider-management slice (plan: "Provider
-//! management"). Callers compose them under whatever transport they like.
+//! These are pure library functions — no HTTP, no email. The signup HTTP
+//! flow and magic links live in [`crate::account_plane`]; managed provider
+//! keys are threaded in via [`ManagedKeys`] (plan: "Provider management" →
+//! "Managed key lifecycle"). Callers compose them under whatever transport
+//! they like.
 //!
 //! # Idempotency
 //!
@@ -17,6 +18,11 @@
 //! - Tenant migrations and seeding run through `DatabaseManager::new_postgres`
 //!   — atomic-core's own advisory-locked, versioned migration runner and
 //!   default-KB seeding, not a cloud reimplementation.
+//! - Managed-key provisioning (step 9) checks for an existing
+//!   `provider_credentials` row first — key creation itself is not
+//!   idempotent (see [`crate::managed_keys`]); the failure paths delete any
+//!   key created before the failure, using the locally held
+//!   `external_key_id`.
 //! - Control-plane inserts use `ON CONFLICT DO NOTHING`.
 //!
 //! Deletion is likewise idempotent under retry: every step tolerates an
@@ -51,6 +57,7 @@ use uuid::Uuid;
 
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+use crate::managed_keys::ManagedKeys;
 use crate::reserved_subdomains;
 
 /// Where tenant databases live: the shared Postgres cluster.
@@ -185,15 +192,16 @@ pub(crate) fn email_format_ok(email: &str) -> bool {
 
 /// Provision a new account end-to-end: claim the subdomain, create the
 /// tenant database, run tenant migrations, seed the default knowledge base,
-/// record the tenant mapping, and activate the account.
+/// provision the managed provider key, record the tenant mapping, and
+/// activate the account.
 ///
-/// Implements signup steps 1, 3, 4, 5, 6, 10 and 11 from the plan
+/// Implements signup steps 1, 3, 4, 5, 6, 9, 10 and 11 from the plan
 /// ("Provisioning lifecycle" → "Signup"). Steps 2 and 12 (magic link;
 /// session + redirect) live in the HTTP layer ([`crate::account_plane`]);
 /// the rest in later slices: 7 (cloud-curated per-DB settings; atomic-core's
 /// own defaults are seeded here as part of opening the tenant), 8 (default
-/// report — reports slice), 9 (managed OpenRouter key — provider-management
-/// slice).
+/// report — reports slice). Step 9 is skipped entirely when `managed` is
+/// [`ManagedKeys::Disabled`] — the account runs keyless.
 ///
 /// Re-running for an account stuck in `status='provisioning'` (same email,
 /// same subdomain) resumes and completes it without duplicating rows. The
@@ -202,6 +210,7 @@ pub(crate) fn email_format_ok(email: &str) -> bool {
 pub async fn provision_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     new_account: NewAccount,
 ) -> Result<ProvisionedAccount, CloudError> {
     let NewAccount { email, subdomain } = new_account;
@@ -343,6 +352,18 @@ pub async fn provision_account(
         ))?;
     drop(manager);
 
+    // Step 9 — managed provider key (plan: "Provider management" →
+    // "Managed key lifecycle"; skipped entirely in Disabled mode). The
+    // helper is idempotent — an existing credentials row short-circuits, so
+    // a resumed provision never mints a second key — and a failure here
+    // propagates typed: the account stays 'provisioning' and the reaper
+    // retries or rolls it back (no half state). The returned id is held
+    // locally for the lost-race cleanup paths below, where the accounts-row
+    // CASCADE has already swept the credentials row that referenced it.
+    let managed_key_id = managed
+        .ensure_managed_key(control, &account_id.to_string())
+        .await?;
+
     // Step 10 — record the account → tenant-database mapping. ON CONFLICT
     // keeps a resumed provision from duplicating the row.
     let recorded = sqlx::query(
@@ -362,9 +383,18 @@ pub async fn provision_account(
         // DATABASE (or never saw it), so the database we just created would
         // be orphaned forever: no accounts row means nothing can derive its
         // name again. Drop it now (best-effort, logged) before surfacing
-        // the typed error.
+        // the typed error. The same applies to the managed key step 9 just
+        // handled: the CASCADE swept its credentials row, so the locally
+        // held id is the only remaining reference — delete the key too
+        // (best-effort; the winning deletion may have already deleted it
+        // via its own step 3, which the 404-tolerant delete absorbs).
         if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23503")) {
             drop_tenant_database_best_effort(cluster, &db_name).await;
+            if let Some(external_key_id) = &managed_key_id {
+                managed
+                    .delete_external_key_best_effort(&account_id.to_string(), external_key_id)
+                    .await;
+            }
             return Err(CloudError::AccountNoLongerProvisioning(
                 account_id.to_string(),
             ));
@@ -372,8 +402,22 @@ pub async fn provision_account(
         return Err(CloudError::db("recording account database")(e));
     }
 
-    // Step 11 — activate.
-    activate_account(control, account_id).await?;
+    // Step 11 — activate. The zero-row case is the same lost race as the
+    // 23503 above, one step later: the accounts row (and, via CASCADE, the
+    // step-9 credentials row) is gone, so the locally held key id gets the
+    // same best-effort cleanup. The tenant database itself is the winning
+    // deletion's to drop — it read the mapping row this provision just
+    // wrote (or derives the name from the account UUID).
+    if let Err(e) = activate_account(control, account_id).await {
+        if matches!(e, CloudError::AccountNoLongerProvisioning(_)) {
+            if let Some(external_key_id) = &managed_key_id {
+                managed
+                    .delete_external_key_best_effort(&account_id.to_string(), external_key_id)
+                    .await;
+            }
+        }
+        return Err(e);
+    }
 
     tracing::info!(
         account_id = %account_id,
@@ -532,7 +576,6 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
 /// Implements the plan's deletion sequence ("Provisioning lifecycle" →
 /// "Account deletion") minus the steps owned by later slices:
 ///
-/// - Managed-provider-key deletion (step 3) — provider-management slice.
 /// - The final logical dump to `backups/final/` before the drop (step 4) —
 ///   backups slice (plan: "Backups & disaster recovery"); until it lands,
 ///   deletion is genuinely unrecoverable.
@@ -556,10 +599,11 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
 /// invariant for provisioning**: [`ensure_claim_not_reserved`]'s post-claim
 /// re-check is only sufficient because a deletion that frees a subdomain
 /// makes its hold visible before the freed name can be re-claimed. Don't
-/// reorder steps 6a/6b without revisiting that guard.
+/// reorder steps 7a/7b without revisiting that guard.
 pub async fn delete_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
+    managed: &ManagedKeys,
     account_id: &str,
 ) -> Result<(), CloudError> {
     // 1 — revoke all tokens. The accounts-row delete below cascades these
@@ -581,7 +625,18 @@ pub async fn delete_account(
         .await
         .map_err(CloudError::db("deleting account sessions"))?;
 
-    // 3 — find the tenant database(s). `account_databases` is the source of
+    // 3 — delete the managed runtime key(s) via the provisioning API,
+    // strictly BEFORE anything destroys the rows holding `external_key_id`
+    // (the accounts-row CASCADE in step 6 sweeps `provider_credentials`).
+    // Best-effort with loud logging: deletion must not wedge on a provider
+    // outage, and once the rows are gone a failed delete cannot be retried
+    // by the reaper — accepted residue, recovered via the master OpenRouter
+    // account's key listing (see crate::managed_keys).
+    managed
+        .delete_managed_keys_for_account(control, account_id)
+        .await?;
+
+    // 4 — find the tenant database(s). `account_databases` is the source of
     // truth; the name derived from the account UUID is unioned in so a
     // provision that crashed before step 10 (database created, mapping row
     // not yet written) still gets cleaned up.
@@ -598,7 +653,7 @@ pub async fn delete_account(
         }
     }
 
-    // 4 — terminate stragglers and drop. WITH (FORCE) alone would do it,
+    // 5 — terminate stragglers and drop. WITH (FORCE) alone would do it,
     // but explicit termination keeps the drop from racing a reconnecting
     // pool, and is harmless when no backends exist.
     if !db_names.is_empty() {
@@ -609,14 +664,14 @@ pub async fn delete_account(
         let _ = conn.close().await;
     }
 
-    // 5 — remove the mapping rows.
+    // 6 — remove the mapping rows.
     sqlx::query("DELETE FROM account_databases WHERE account_id = $1")
         .bind(account_id)
         .execute(control.pool())
         .await
         .map_err(CloudError::db("deleting account database rows"))?;
 
-    // 6 — reserve the freed subdomain for 90 days (stale RSS readers and
+    // 7 — reserve the freed subdomain for 90 days (stale RSS readers and
     // MCP configs pointing at the old name must not silently reach a
     // stranger), then hard-delete the account row, cascading any remaining
     // token rows away.

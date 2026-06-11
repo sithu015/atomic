@@ -94,6 +94,7 @@ use serde::Deserialize;
 use crate::account_cache::AccountCache;
 use crate::auth::{CloudAuth, ResolvedTenant};
 use crate::control_plane::ControlPlane;
+use crate::managed_keys::ManagedKeys;
 use crate::provision::{delete_account, ClusterConfig};
 use crate::server::cloud_plane_guard;
 use crate::tokens::TokenScope;
@@ -104,6 +105,10 @@ struct PlaneState {
     /// The shared tenant cluster, where `DELETE /api/account` drops the
     /// tenant database.
     cluster: ClusterConfig,
+    /// Managed provider-key lifecycle: deletion step 3 deletes the
+    /// account's managed runtime key via the provisioning API (plan:
+    /// "Account deletion").
+    managed: ManagedKeys,
     /// The serving cache this process resolves tenants through; deletion
     /// must evict from *this* cache or the dropped account's entry (and the
     /// WebSocket channel it owns) would linger until the idle TTL.
@@ -121,11 +126,17 @@ pub struct TenantPlane {
 impl TenantPlane {
     /// Build the plane over the same control plane, cluster, and cache the
     /// rest of the composition serves from.
-    pub fn new(control: ControlPlane, cluster: ClusterConfig, cache: Arc<AccountCache>) -> Self {
+    pub fn new(
+        control: ControlPlane,
+        cluster: ClusterConfig,
+        managed: ManagedKeys,
+        cache: Arc<AccountCache>,
+    ) -> Self {
         Self {
             state: web::Data::new(PlaneState {
                 control,
                 cluster,
+                managed,
                 cache,
             }),
         }
@@ -204,7 +215,13 @@ async fn delete_account_route(
     let task_state = state.clone();
     let account_id = tenant.principal.account_id.clone();
     let outcome = actix_web::rt::spawn(async move {
-        delete_account(&task_state.control, &task_state.cluster, &account_id).await?;
+        delete_account(
+            &task_state.control,
+            &task_state.cluster,
+            &task_state.managed,
+            &account_id,
+        )
+        .await?;
         task_state.cache.evict(&account_id).await;
         Ok::<(), crate::error::CloudError>(())
     })

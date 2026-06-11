@@ -22,8 +22,8 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
     provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, NewAccount, TenantPlane, TokenScope,
-    SESSION_COOKIE,
+    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, ManagedKeys, NewAccount, TenantPlane,
+    TokenScope, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -99,11 +99,17 @@ impl CloudHarness {
         let account_plane = AccountPlane::new(
             control.clone(),
             cluster.clone(),
+            ManagedKeys::Disabled,
             Arc::new(support::CapturingSender::default()),
             AccountPlaneConfig::new(BASE_DOMAIN),
         )
         .expect("build account plane");
-        let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
+        let tenant_plane = TenantPlane::new(
+            control.clone(),
+            cluster.clone(),
+            ManagedKeys::Disabled,
+            Arc::clone(&cache),
+        );
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -148,6 +154,7 @@ impl CloudHarness {
         let account = provision_account(
             &self.control,
             &self.cluster,
+            &ManagedKeys::Disabled,
             NewAccount {
                 email: format!("{subdomain}@example.com"),
                 subdomain: subdomain.to_string(),
@@ -792,9 +799,14 @@ async fn cli_style_deletion_self_heals_without_eviction() {
 
             // Library-level deletion, exactly as the CLI runs it: no cache
             // eviction. Alpha's entry is still cached afterwards.
-            delete_account(&h.control, &h.cluster, &alpha.account_id)
-                .await
-                .expect("delete account");
+            delete_account(
+                &h.control,
+                &h.cluster,
+                &ManagedKeys::Disabled,
+                &alpha.account_id,
+            )
+            .await
+            .expect("delete account");
             assert!(
                 h.cache.contains(&alpha.account_id).await,
                 "the CLI path leaves the serve cache entry in place"

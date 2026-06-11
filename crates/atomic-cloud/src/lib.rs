@@ -31,8 +31,10 @@ pub mod email;
 pub mod error;
 pub mod keyvault;
 pub mod magic_links;
+pub mod managed_keys;
 pub mod provider_credentials;
 pub mod provision;
+pub mod provisioning_api;
 pub mod rate_limit;
 pub mod reaper;
 pub mod reserved_subdomains;
@@ -52,6 +54,9 @@ pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, M
 pub use magic_links::{
     consume_magic_link, issue_magic_link, MagicLinkPurpose, MagicLinkRecord, MAGIC_LINK_TTL,
 };
+pub use managed_keys::{
+    default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
+};
 pub use provider_credentials::{
     delete_credentials, get_active_credentials, get_credentials, record_validation,
     set_active_provider, touch_last_used, upsert_credentials, CredentialOrigin, NewCredentials,
@@ -60,6 +65,10 @@ pub use provider_credentials::{
 pub use provision::{
     delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,
     NewAccount, ProvisionedAccount,
+};
+pub use provisioning_api::{
+    CreatedRuntimeKey, OpenRouterProvisioning, ProvisioningApi, RuntimeKeyUsage,
+    DEFAULT_OPENROUTER_PROVISIONING_URL, PROVISIONING_KEY_ENV,
 };
 pub use reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState};

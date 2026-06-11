@@ -8,7 +8,8 @@ mod support;
 
 use atomic_cloud::provision::is_tenant_db_name;
 use atomic_cloud::{
-    delete_account, provision_account, CloudError, ClusterConfig, ControlPlane, NewAccount,
+    delete_account, provision_account, CloudError, ClusterConfig, ControlPlane, ManagedKeys,
+    NewAccount,
 };
 use atomic_core::DatabaseManager;
 use sqlx::{Connection, PgConnection};
@@ -73,6 +74,7 @@ async fn provision_happy_path() {
         let acct = provision_account(
             &control,
             &cluster,
+            &ManagedKeys::Disabled,
             new_account("kenny@example.com", "kenny"),
         )
         .await
@@ -163,6 +165,7 @@ async fn provision_duplicate_subdomain_is_taken() {
         provision_account(
             &control,
             &cluster,
+            &ManagedKeys::Disabled,
             new_account("first@example.com", "shared"),
         )
         .await
@@ -172,6 +175,7 @@ async fn provision_duplicate_subdomain_is_taken() {
         let err = provision_account(
             &control,
             &cluster,
+            &ManagedKeys::Disabled,
             new_account("second@example.com", "shared"),
         )
         .await
@@ -186,6 +190,7 @@ async fn provision_duplicate_subdomain_is_taken() {
         let err = provision_account(
             &control,
             &cluster,
+            &ManagedKeys::Disabled,
             new_account("first@example.com", "shared"),
         )
         .await
@@ -214,9 +219,14 @@ async fn provision_rejects_reserved_and_invalid_subdomains() {
             let (control, cluster) = setup(&url).await;
 
             // Static blocklist.
-            let err = provision_account(&control, &cluster, new_account("k@example.com", "admin"))
-                .await
-                .expect_err("blocklisted subdomain must fail");
+            let err = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("k@example.com", "admin"),
+            )
+            .await
+            .expect_err("blocklisted subdomain must fail");
             assert!(matches!(err, CloudError::SubdomainReserved(ref s) if s == "admin"));
 
             // Active hold in subdomains_reserved (post-deletion park).
@@ -227,9 +237,14 @@ async fn provision_rejects_reserved_and_invalid_subdomains() {
             .execute(control.pool())
             .await
             .expect("insert active reservation");
-            let err = provision_account(&control, &cluster, new_account("k@example.com", "parked"))
-                .await
-                .expect_err("actively reserved subdomain must fail");
+            let err = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("k@example.com", "parked"),
+            )
+            .await
+            .expect_err("actively reserved subdomain must fail");
             assert!(matches!(err, CloudError::SubdomainReserved(ref s) if s == "parked"));
 
             // An expired hold no longer blocks — the 90-day park lapses.
@@ -240,15 +255,25 @@ async fn provision_rejects_reserved_and_invalid_subdomains() {
             .execute(control.pool())
             .await
             .expect("insert expired reservation");
-            provision_account(&control, &cluster, new_account("k@example.com", "lapsed"))
-                .await
-                .expect("expired reservation must not block");
+            provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("k@example.com", "lapsed"),
+            )
+            .await
+            .expect("expired reservation must not block");
 
             // Slug-rule violations never reach the database.
             for bad in ["ab", "Has-Upper", "under_score"] {
-                let err = provision_account(&control, &cluster, new_account("k@example.com", bad))
-                    .await
-                    .expect_err("invalid subdomain must fail");
+                let err = provision_account(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    new_account("k@example.com", bad),
+                )
+                .await
+                .expect_err("invalid subdomain must fail");
                 assert!(
                     matches!(err, CloudError::InvalidSubdomain(_)),
                     "expected InvalidSubdomain for {bad:?}, got {err:?}"
@@ -256,10 +281,14 @@ async fn provision_rejects_reserved_and_invalid_subdomains() {
             }
 
             // Email shape check.
-            let err =
-                provision_account(&control, &cluster, new_account("not-an-email", "fine-name"))
-                    .await
-                    .expect_err("invalid email must fail");
+            let err = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("not-an-email", "fine-name"),
+            )
+            .await
+            .expect_err("invalid email must fail");
             assert!(matches!(err, CloudError::InvalidEmail(_)));
 
             assert_eq!(
@@ -283,7 +312,7 @@ async fn provision_resumes_after_crash() {
         let (control, cluster) = setup(&url).await;
         let signup = new_account("kenny@example.com", "resumable");
 
-        let first = provision_account(&control, &cluster, signup.clone())
+        let first = provision_account(&control, &cluster, &ManagedKeys::Disabled, signup.clone())
             .await
             .expect("initial provision");
 
@@ -296,7 +325,7 @@ async fn provision_resumes_after_crash() {
             .await
             .expect("flip status back to provisioning");
 
-        let second = provision_account(&control, &cluster, signup)
+        let second = provision_account(&control, &cluster, &ManagedKeys::Disabled, signup)
             .await
             .expect("re-run completes the stuck provision");
 
@@ -461,6 +490,7 @@ async fn racing_deletion_does_not_orphan_tenant_database() {
                 let provision = provision_account(
                     &control,
                     &cluster,
+                    &ManagedKeys::Disabled,
                     new_account("r@example.com", "race-victim"),
                 );
                 let saboteur = async {
@@ -579,6 +609,7 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
             let acct = provision_account(
                 &control,
                 &cluster,
+                &ManagedKeys::Disabled,
                 new_account("doomed@example.com", "doomed"),
             )
             .await
@@ -604,7 +635,7 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
             .await
             .expect("create session");
 
-            delete_account(&control, &cluster, &acct.account_id)
+            delete_account(&control, &cluster, &ManagedKeys::Disabled, &acct.account_id)
                 .await
                 .expect("delete succeeds");
 
@@ -646,19 +677,28 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
             assert!(still_held, "subdomain must be reserved for 90 days");
 
             // And a fresh signup for it is rejected while parked.
-            let err =
-                provision_account(&control, &cluster, new_account("new@example.com", "doomed"))
-                    .await
-                    .expect_err("parked subdomain must reject signups");
+            let err = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                new_account("new@example.com", "doomed"),
+            )
+            .await
+            .expect_err("parked subdomain must reject signups");
             assert!(matches!(err, CloudError::SubdomainReserved(_)));
 
             // Re-delete is a no-op, as is deleting an unknown account.
-            delete_account(&control, &cluster, &acct.account_id)
+            delete_account(&control, &cluster, &ManagedKeys::Disabled, &acct.account_id)
                 .await
                 .expect("re-delete is a no-op");
-            delete_account(&control, &cluster, &uuid::Uuid::new_v4().to_string())
-                .await
-                .expect("deleting an unknown account is a no-op");
+            delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("deleting an unknown account is a no-op");
         },
     )
     .await;
