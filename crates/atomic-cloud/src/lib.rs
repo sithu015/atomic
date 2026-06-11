@@ -37,7 +37,9 @@ pub mod server;
 pub mod tokens;
 
 pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
-pub use account_plane::{AccountPlane, AccountPlaneConfig, RateLimits};
+pub use account_plane::{
+    AccountPlane, AccountPlaneConfig, RateLimits, DEFAULT_MAX_CONCURRENT_PROVISIONS, SESSION_TTL,
+};
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use control_plane::ControlPlane;
 pub use email::{EmailSender, LogSender, MailgunSender};

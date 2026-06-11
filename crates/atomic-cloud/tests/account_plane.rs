@@ -1,12 +1,16 @@
 //! End-to-end tests for the app-host account plane: the host-based plane
 //! split (both fail-closed directions), signup/login request-link behavior,
-//! login indistinguishability, and the anti-abuse rate limits.
+//! login indistinguishability, the anti-abuse rate limits, and the
+//! completion flows (consume → provision → session cookie → redirect).
 //!
 //! Each test spawns the real composition — `configure_cloud_app` on an
 //! ephemeral port, exactly as `atomic-cloud serve` wires it — with a
 //! capturing email sender (NO REAL EMAIL, EVER) and drives it with explicit
 //! `Host` headers: `cloudtest.local` / `app.cloudtest.local` for the
-//! account plane, `<subdomain>.cloudtest.local` for tenants.
+//! account plane, `<subdomain>.cloudtest.local` for tenants. The harness
+//! client never follows redirects: completion responses are asserted on the
+//! raw 302 + `Set-Cookie` header strings (a cookie jar would silently drop
+//! the `Secure` cookie over plain-HTTP loopback).
 //!
 //! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
 //! conventions and the run command.
@@ -20,9 +24,9 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState,
-    MagicLinkPurpose, NewAccount, RateLimits, TokenScope,
+    MagicLinkPurpose, NewAccount, RateLimits, TokenScope, SESSION_COOKIE,
 };
-use reqwest::header::{HOST, RETRY_AFTER};
+use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,12 +40,23 @@ fn sha256_hex(plaintext: &str) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(plaintext.as_bytes()))
 }
 
+/// Plane config for tests: production defaults under [`BASE_DOMAIN`] with
+/// the given rate limits.
+fn plane_config(rate_limits: RateLimits) -> AccountPlaneConfig {
+    AccountPlaneConfig {
+        rate_limits,
+        ..AccountPlaneConfig::new(BASE_DOMAIN)
+    }
+}
+
 /// The composed cloud server on an ephemeral port, with the account plane
 /// backed by a capturing sender.
 struct PlaneHarness {
     control: ControlPlane,
     cluster: ClusterConfig,
     sender: CapturingSender,
+    /// The live plane, kept so tests can reach the provision semaphore.
+    plane: AccountPlane,
     client: reqwest::Client,
     base_url: String,
     handle: actix_web::dev::ServerHandle,
@@ -51,7 +66,7 @@ struct PlaneHarness {
 }
 
 impl PlaneHarness {
-    async fn spawn(control_url: &str, rate_limits: RateLimits) -> Self {
+    async fn spawn(control_url: &str, config: AccountPlaneConfig) -> Self {
         let control = ControlPlane::connect(control_url)
             .await
             .expect("connect control plane");
@@ -70,17 +85,17 @@ impl PlaneHarness {
         let sender = CapturingSender::default();
         let account_plane = AccountPlane::new(
             control.clone(),
+            cluster.clone(),
             Arc::new(sender.clone()),
-            AccountPlaneConfig {
-                rate_limits,
-                ..AccountPlaneConfig::new(BASE_DOMAIN)
-            },
-        );
+            config,
+        )
+        .expect("build account plane");
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
+        let plane = account_plane.clone();
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -99,7 +114,14 @@ impl PlaneHarness {
             control,
             cluster,
             sender,
-            client: reqwest::Client::new(),
+            plane,
+            // Never follow redirects: completion 302s point at
+            // `<slug>.cloudtest.local`, which doesn't resolve — and the
+            // assertions are on the raw headers anyway.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build http client"),
             base_url: format!("http://127.0.0.1:{port}"),
             handle,
             _fallback: fallback,
@@ -142,11 +164,116 @@ impl PlaneHarness {
         .await
         .expect("send login request-link")
     }
+
+    /// GET a completion route on the app host. `kind` is `signup` or
+    /// `login`; the client never follows the resulting redirect.
+    async fn complete(&self, kind: &str, token: &str) -> reqwest::Response {
+        self.on_host(
+            Method::GET,
+            &format!("app.{BASE_DOMAIN}"),
+            &format!("/{kind}/complete?token={token}"),
+        )
+        .send()
+        .await
+        .expect("send complete")
+    }
+
+    /// Request a signup link and return the captured token (the most
+    /// recently "sent" email's).
+    async fn signup_token(&self, email: &str, subdomain: &str) -> String {
+        let resp = self
+            .request_signup_link(&format!("app.{BASE_DOMAIN}"), email, subdomain)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "request signup link");
+        let sent = self.sender.sent();
+        let last = sent.last().expect("a signup email was captured");
+        assert_eq!(last.to, email);
+        token_from_link(&last.link).to_string()
+    }
+
+    /// Request a login link and return the captured token.
+    async fn login_token(&self, email: &str) -> String {
+        let resp = self.request_login_link(email).await;
+        assert_eq!(resp.status(), StatusCode::OK, "request login link");
+        let sent = self.sender.sent();
+        let last = sent.last().expect("a login email was captured");
+        assert_eq!(last.to, email);
+        assert_eq!(last.purpose, MagicLinkPurpose::Login);
+        token_from_link(&last.link).to_string()
+    }
+
+    /// Whether the magic-link row for `token` has been consumed.
+    async fn link_consumed(&self, token: &str) -> bool {
+        let consumed: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT consumed_at FROM magic_links WHERE token_hash = $1")
+                .bind(sha256_hex(token))
+                .fetch_one(self.control.pool())
+                .await
+                .expect("magic link row exists");
+        consumed.is_some()
+    }
+
+    /// `accounts` rows for an email, any status.
+    async fn account_count(&self, email: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE email = $1")
+            .bind(email)
+            .fetch_one(self.control.pool())
+            .await
+            .expect("count accounts")
+    }
 }
 
 /// Pull the `token=` value out of a captured link.
 fn token_from_link(link: &str) -> &str {
     link.split("token=").nth(1).expect("link carries a token")
+}
+
+/// The `Set-Cookie` header of a completion response, as the raw string —
+/// assertions run on the string because a cookie jar would drop the
+/// `Secure` cookie over plain HTTP.
+fn set_cookie_header(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(SET_COOKIE)
+        .expect("response carries Set-Cookie")
+        .to_str()
+        .expect("Set-Cookie is ascii")
+        .to_string()
+}
+
+/// The session secret inside a `Set-Cookie` string.
+fn cookie_session_value(set_cookie: &str) -> &str {
+    set_cookie
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
+        .expect("cookie is the session cookie")
+        .split(';')
+        .next()
+        .expect("cookie has a value")
+}
+
+/// Assert the full attribute set from the plan ("Web sessions") on a raw
+/// `Set-Cookie` string. The cookie crate serializes the domain without the
+/// leading dot (RFC 6265 ignores it), so both spellings are accepted.
+fn assert_session_cookie_attributes(set_cookie: &str) {
+    assert!(
+        set_cookie.starts_with(&format!("{SESSION_COOKIE}=ats_")),
+        "cookie must carry an ats_ session secret: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains(&format!("Domain={BASE_DOMAIN}"))
+            || set_cookie.contains(&format!("Domain=.{BASE_DOMAIN}")),
+        "cookie must be scoped to the base domain: {set_cookie}"
+    );
+    for attribute in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/"] {
+        assert!(
+            set_cookie.contains(attribute),
+            "cookie must carry {attribute}: {set_cookie}"
+        );
+    }
+    // Max-Age matches the default session TTL (30 days).
+    assert!(
+        set_cookie.contains("Max-Age=2592000"),
+        "cookie Max-Age must match the session TTL: {set_cookie}"
+    );
 }
 
 // ==================== Plane split ====================
@@ -157,7 +284,7 @@ fn token_from_link(link: &str) -> &str {
 #[actix_web::test]
 async fn app_host_404s_tenant_routes() {
     with_control_db("app_host_404s_tenant_routes", |url| async move {
-        let h = PlaneHarness::spawn(&url, RateLimits::default()).await;
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
         let account = provision_account(
             &h.control,
             &h.cluster,
@@ -231,7 +358,7 @@ async fn tenant_subdomains_404_account_plane_routes() {
     with_control_db(
         "tenant_subdomains_404_account_plane_routes",
         |url| async move {
-            let h = PlaneHarness::spawn(&url, RateLimits::default()).await;
+            let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
             let account = provision_account(
                 &h.control,
                 &h.cluster,
@@ -299,7 +426,7 @@ async fn tenant_subdomains_404_account_plane_routes() {
 #[actix_web::test]
 async fn signup_request_link_end_to_end() {
     with_control_db("signup_request_link_end_to_end", |url| async move {
-        let h = PlaneHarness::spawn(&url, RateLimits::default()).await;
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
 
         let resp = h
             .request_signup_link(&format!("app.{BASE_DOMAIN}"), "kenny@example.com", "kenny")
@@ -360,11 +487,11 @@ async fn signup_validation_errors_are_honest_400s() {
             // only — the limiter has its own tests.
             let h = PlaneHarness::spawn(
                 &url,
-                RateLimits {
+                plane_config(RateLimits {
                     signup_links_per_ip: 100,
                     links_per_email: 100,
                     ..RateLimits::default()
-                },
+                }),
             )
             .await;
             // An existing account and an active reservation to collide with.
@@ -435,7 +562,7 @@ async fn login_request_link_is_indistinguishable() {
     with_control_db(
         "login_request_link_is_indistinguishable",
         |url| async move {
-            let h = PlaneHarness::spawn(&url, RateLimits::default()).await;
+            let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
             provision_account(
                 &h.control,
                 &h.cluster,
@@ -509,12 +636,12 @@ async fn signup_ip_rate_limit_enforces_and_resets() {
             let window = Duration::from_millis(1500);
             let h = PlaneHarness::spawn(
                 &url,
-                RateLimits {
+                plane_config(RateLimits {
                     signup_links_per_ip: 3,
                     signup_ip_window: window,
                     // Distinct emails below keep the email limit out of play.
                     ..RateLimits::default()
-                },
+                }),
             )
             .await;
             let app_host = format!("app.{BASE_DOMAIN}");
@@ -576,11 +703,11 @@ async fn email_rate_limit_enforces_and_resets() {
         let window = Duration::from_millis(1500);
         let h = PlaneHarness::spawn(
             &url,
-            RateLimits {
+            plane_config(RateLimits {
                 links_per_email: 2,
                 email_window: window,
                 ..RateLimits::default()
-            },
+            }),
         )
         .await;
         provision_account(
@@ -620,5 +747,450 @@ async fn email_rate_limit_enforces_and_resets() {
 
         h.stop().await;
     })
+    .await;
+}
+
+// ==================== Signup completion ====================
+
+/// The full signup happy path over real HTTP: request a link, pull it from
+/// the capturing sender, GET the completion route, and assert the plan's
+/// step-12 contract — 302 to the new tenant's subdomain, the session cookie
+/// with the full attribute set (asserted on the raw header string; a cookie
+/// jar would drop the `Secure` cookie over plain HTTP), an `active` account
+/// with its tenant mapping, and the session cookie authenticating an API
+/// call on the new subdomain. Hash-only discipline holds end to end: no
+/// `ats_` (or `aml_`) plaintext anywhere in the control database.
+#[actix_web::test]
+async fn signup_complete_end_to_end() {
+    with_control_db("signup_complete_end_to_end", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+        let token = h.signup_token("kenny@example.com", "kenny").await;
+
+        let resp = h.complete("signup", &token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "completion redirects");
+        assert_eq!(
+            resp.headers()
+                .get(LOCATION)
+                .expect("302 carries Location")
+                .to_str()
+                .expect("ascii"),
+            &format!("https://kenny.{BASE_DOMAIN}/"),
+            "redirect lands on the new tenant's subdomain"
+        );
+        let cookie = set_cookie_header(&resp);
+        assert_session_cookie_attributes(&cookie);
+        let session = cookie_session_value(&cookie).to_string();
+
+        // The link is spent and the account is fully provisioned.
+        assert!(
+            h.link_consumed(&token).await,
+            "completion consumes the link"
+        );
+        let (account_id, status): (String, String) =
+            sqlx::query_as("SELECT id, status FROM accounts WHERE subdomain = 'kenny'")
+                .fetch_one(h.control.pool())
+                .await
+                .expect("account row exists");
+        assert_eq!(status, "active");
+        let mappings: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_databases WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_one(h.control.pool())
+                .await
+                .expect("count mappings");
+        assert_eq!(mappings, 1, "exactly one tenant database is recorded");
+
+        // Hash-only, end to end: neither the session secret in the cookie
+        // nor any link plaintext was ever persisted.
+        assert!(
+            !control_db_contains(&url, "ats_").await,
+            "no ats_ substring may appear anywhere in the control database"
+        );
+
+        // The cookie is a working credential on the new subdomain.
+        let resp = h
+            .on_host(Method::GET, &format!("kenny.{BASE_DOMAIN}"), "/api/atoms")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .send()
+            .await
+            .expect("send authenticated call");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the flow-issued session must authenticate tenant API calls"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Double-click safety: the second consumption of the same signup link is a
+/// clean `invalid_link` 400 (the consume UPDATE matched zero rows) — never
+/// a second provision. Account and tenant-mapping rows stay singular.
+#[actix_web::test]
+async fn signup_link_is_single_use() {
+    with_control_db("signup_link_is_single_use", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+        let token = h.signup_token("kenny@example.com", "kenny").await;
+
+        let resp = h.complete("signup", &token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "first click provisions");
+
+        let resp = h.complete("signup", &token).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "second click must be refused"
+        );
+        let body: Value = resp.json().await.expect("denial json");
+        assert_eq!(body["error"], "invalid_link");
+
+        assert_eq!(
+            h.account_count("kenny@example.com").await,
+            1,
+            "no duplicate account"
+        );
+        let mappings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_databases")
+            .fetch_one(h.control.pool())
+            .await
+            .expect("count mappings");
+        assert_eq!(mappings, 1, "no duplicate tenant database mapping");
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Dead tokens — missing, unknown, and expired — all get the one honest
+/// `invalid_link` 400 with byte-identical bodies (no oracle over the
+/// magic-link table), and none of them creates an account.
+#[actix_web::test]
+async fn dead_signup_links_are_one_honest_400() {
+    with_control_db("dead_signup_links_are_one_honest_400", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+
+        // Expired: a real link pushed past its expiry by direct SQL.
+        let expired = h.signup_token("exp@example.com", "expired-slug").await;
+        sqlx::query(
+            "UPDATE magic_links SET expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE token_hash = $1",
+        )
+        .bind(sha256_hex(&expired))
+        .execute(h.control.pool())
+        .await
+        .expect("expire link");
+
+        let mut bodies = Vec::new();
+        for (label, path) in [
+            ("missing token", "/signup/complete".to_string()),
+            (
+                "unknown token",
+                "/signup/complete?token=aml_nonsense".to_string(),
+            ),
+            ("expired token", format!("/signup/complete?token={expired}")),
+        ] {
+            let resp = h
+                .on_host(Method::GET, &format!("app.{BASE_DOMAIN}"), &path)
+                .send()
+                .await
+                .expect("send complete");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label} must 400");
+            bodies.push(resp.bytes().await.expect("body"));
+        }
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "all dead-token refusals must be byte-identical"
+        );
+
+        assert!(
+            !h.link_consumed(&expired).await,
+            "a refused consumption must not stamp consumed_at"
+        );
+        assert_eq!(
+            h.account_count("exp@example.com").await,
+            0,
+            "no account may be created from a dead link"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Purpose crossover: a signup link on `/login/complete` (and a login link
+/// on `/signup/complete`) is refused as `invalid_link` — and because the
+/// purpose pin lives inside the consume UPDATE's WHERE clause, the
+/// wrong-endpoint click does NOT burn the link: both still complete on
+/// their own endpoints afterwards.
+#[actix_web::test]
+async fn completion_purpose_crossover_rejected() {
+    with_control_db("completion_purpose_crossover_rejected", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+        provision_account(
+            &h.control,
+            &h.cluster,
+            NewAccount {
+                email: "alpha@example.com".to_string(),
+                subdomain: "alpha".to_string(),
+            },
+        )
+        .await
+        .expect("provision alpha");
+
+        let signup_token = h.signup_token("new@example.com", "fresh").await;
+        let login_token = h.login_token("alpha@example.com").await;
+
+        for (kind, token) in [("login", &signup_token), ("signup", &login_token)] {
+            let resp = h.complete(kind, token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a {kind} completion must refuse the other purpose's link"
+            );
+            let body: Value = resp.json().await.expect("denial json");
+            assert_eq!(body["error"], "invalid_link");
+        }
+        assert!(
+            !h.link_consumed(&signup_token).await && !h.link_consumed(&login_token).await,
+            "wrong-endpoint clicks must not burn the links"
+        );
+
+        // Both links still work where they belong.
+        let resp = h.complete("signup", &signup_token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let resp = h.complete("login", &login_token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// SubdomainTaken at consume time: two pending signup links for the same
+/// slug, first click wins, second gets a structured 409 telling the user to
+/// restart signup — with no orphan account rows. The second token stays
+/// spent (module docs trade-off: re-requesting is cheap and rate-limited;
+/// un-consuming would reopen the replay window).
+#[actix_web::test]
+async fn subdomain_taken_at_consume_is_conflict() {
+    with_control_db("subdomain_taken_at_consume_is_conflict", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+
+        // Both links issue fine: a link is a request, not a reservation.
+        let first = h.signup_token("first@example.com", "shared").await;
+        let second = h.signup_token("second@example.com", "shared").await;
+
+        let resp = h.complete("signup", &first).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "first consumer wins");
+
+        let resp = h.complete("signup", &second).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the loser gets a structured 409"
+        );
+        let body: Value = resp.json().await.expect("conflict json");
+        assert_eq!(body["error"], "subdomain_taken");
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains("Start signup again"),
+            "the 409 must tell the user to restart signup"
+        );
+
+        // The losing token is spent, and nothing was orphaned: one account
+        // owns the slug, the loser has no rows in any state.
+        assert!(h.link_consumed(&second).await, "the losing token is spent");
+        assert_eq!(h.account_count("second@example.com").await, 0);
+        let provisioning: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE status <> 'active'")
+                .fetch_one(h.control.pool())
+                .await
+                .expect("count non-active accounts");
+        assert_eq!(provisioning, 0, "no account row may be left mid-provision");
+        let owners: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE subdomain = 'shared'")
+                .fetch_one(h.control.pool())
+                .await
+                .expect("count owners");
+        assert_eq!(owners, 1);
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Saturation refuses BEFORE consuming: with the provision cap at 1 and the
+/// only permit held (standing in for a slow in-flight provision), a
+/// completion gets a structured 503 + Retry-After, its token stays
+/// unconsumed, and the same link succeeds once capacity frees up.
+#[actix_web::test]
+async fn saturated_provisioning_refuses_without_consuming() {
+    with_control_db(
+        "saturated_provisioning_refuses_without_consuming",
+        |url| async move {
+            let h = PlaneHarness::spawn(
+                &url,
+                AccountPlaneConfig {
+                    max_concurrent_provisions: 1,
+                    ..AccountPlaneConfig::new(BASE_DOMAIN)
+                },
+            )
+            .await;
+            let token = h.signup_token("kenny@example.com", "kenny").await;
+
+            let held = h
+                .plane
+                .provision_permits()
+                .try_acquire_owned()
+                .expect("hold the only provision permit");
+
+            let resp = h.complete("signup", &token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a saturated process must refuse"
+            );
+            assert!(
+                resp.headers().get(RETRY_AFTER).is_some(),
+                "the 503 carries Retry-After"
+            );
+            let body: Value = resp.json().await.expect("denial json");
+            assert_eq!(body["error"], "provisioning_busy");
+            assert!(body["retry_after_seconds"].as_u64().unwrap_or(0) >= 1);
+
+            // The refusal happened before consumption: the token is live
+            // and no account was created.
+            assert!(
+                !h.link_consumed(&token).await,
+                "saturation must not consume the token"
+            );
+            assert_eq!(h.account_count("kenny@example.com").await, 0);
+
+            // Capacity frees up; the SAME link completes.
+            drop(held);
+            let resp = h.complete("signup", &token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "the token must remain usable after a saturation refusal"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+// ==================== Login completion ====================
+
+/// The full login flow over real HTTP: request a link for an existing
+/// account, complete it, get the session cookie and the redirect to the
+/// account's subdomain, and authenticate an API call with the cookie.
+#[actix_web::test]
+async fn login_complete_end_to_end() {
+    with_control_db("login_complete_end_to_end", |url| async move {
+        let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+        provision_account(
+            &h.control,
+            &h.cluster,
+            NewAccount {
+                email: "alpha@example.com".to_string(),
+                subdomain: "alpha".to_string(),
+            },
+        )
+        .await
+        .expect("provision alpha");
+
+        let token = h.login_token("alpha@example.com").await;
+        let resp = h.complete("login", &token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(LOCATION)
+                .expect("302 carries Location")
+                .to_str()
+                .expect("ascii"),
+            &format!("https://alpha.{BASE_DOMAIN}/"),
+            "login redirects to the account's subdomain"
+        );
+        let cookie = set_cookie_header(&resp);
+        assert_session_cookie_attributes(&cookie);
+        let session = cookie_session_value(&cookie).to_string();
+        assert!(h.link_consumed(&token).await);
+
+        let resp = h
+            .on_host(Method::GET, &format!("alpha.{BASE_DOMAIN}"), "/api/atoms")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .send()
+            .await
+            .expect("send authenticated call");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Chokepoint regression, cookie edition (plan decision 2026-06-09): the
+/// `.{base}` cookie crosses subdomains by design, so a session minted by
+/// the real login flow presented on the WRONG account's subdomain must
+/// still 401 — CloudAuth's account-scoped verification, not the cookie
+/// scope, is what isolates tenants. Slice 1 pinned hand-created sessions;
+/// this pins the flow-issued cookie.
+#[actix_web::test]
+async fn flow_issued_cookie_rejected_on_other_tenants_subdomain() {
+    with_control_db(
+        "flow_issued_cookie_rejected_on_other_tenants_subdomain",
+        |url| async move {
+            let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+            for (email, subdomain) in [
+                ("alpha@example.com", "alpha"),
+                ("bravo@example.com", "bravo"),
+            ] {
+                provision_account(
+                    &h.control,
+                    &h.cluster,
+                    NewAccount {
+                        email: email.to_string(),
+                        subdomain: subdomain.to_string(),
+                    },
+                )
+                .await
+                .expect("provision account");
+            }
+
+            let token = h.login_token("alpha@example.com").await;
+            let resp = h.complete("login", &token).await;
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            let session = cookie_session_value(&set_cookie_header(&resp)).to_string();
+
+            // Alpha's flow-issued cookie on bravo's subdomain → 401.
+            let resp = h
+                .on_host(Method::GET, &format!("bravo.{BASE_DOMAIN}"), "/api/atoms")
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .send()
+                .await
+                .expect("send cross-tenant call");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "a session cookie must not cross tenants"
+            );
+
+            // …and still works where it belongs.
+            let resp = h
+                .on_host(Method::GET, &format!("alpha.{BASE_DOMAIN}"), "/api/atoms")
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .send()
+                .await
+                .expect("send same-tenant call");
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            h.stop().await;
+        },
+    )
     .await;
 }

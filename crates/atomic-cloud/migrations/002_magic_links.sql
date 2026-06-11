@@ -14,10 +14,10 @@
 -- exists only in the emailed link. (The pre-rewrite prototype stored raw
 -- tokens; that is exactly what this schema must never do.)
 --
--- Single use: consumption is an atomic UPDATE guarded by
--- `consumed_at IS NULL AND expires_at > NOW()`; expired or already-consumed
--- rows are inert. `request_ip` is a forensic breadcrumb, nullable because
--- proxies may strip it.
+-- Single use and purpose-pinned: consumption is an atomic UPDATE guarded by
+-- `purpose = $2 AND consumed_at IS NULL AND expires_at > NOW()`; expired,
+-- already-consumed, or wrong-purpose rows are inert. `request_ip` is a
+-- forensic breadcrumb, nullable because proxies may strip it.
 --
 -- Migration discipline (see 001): ADDITIVE-ONLY.
 

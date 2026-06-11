@@ -19,14 +19,14 @@
 //! - [`MagicLinkPurpose::Login`] — no subdomain; the account is found by
 //!   email when the link is consumed.
 //!
-//! Links are short-lived ([`MAGIC_LINK_TTL`], 15 minutes) and single-use:
-//! [`consume_magic_link`] is one atomic UPDATE whose WHERE clause
-//! (`consumed_at IS NULL AND expires_at > NOW()`) makes expired and
-//! already-consumed rows inert. This slice covers issuance and consumption
-//! as library functions; the request-link HTTP routes live in
-//! [`crate::account_plane`], and the consume routes (signup completion →
-//! provisioning, login completion → session) arrive with the rest of the
-//! signup slice.
+//! Links are short-lived ([`MAGIC_LINK_TTL`], 15 minutes), single-use, and
+//! purpose-pinned: [`consume_magic_link`] is one atomic UPDATE whose WHERE
+//! clause (`purpose = $2 AND consumed_at IS NULL AND expires_at > NOW()`)
+//! makes expired and already-consumed rows inert *and* keeps a signup link
+//! from working on the login endpoint (or vice versa) — a wrong-endpoint
+//! click consumes nothing, so the link still works where it belongs. The
+//! HTTP routes (request-link and the completion flows) live in
+//! [`crate::account_plane`].
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -168,29 +168,38 @@ pub async fn issue_magic_link(
     Ok(plaintext)
 }
 
-/// Atomically consume a magic link: mark it used and return its row, or
-/// `None` when the plaintext matches nothing live.
+/// Atomically consume a magic link issued for `purpose`: mark it used and
+/// return its row, or `None` when the plaintext matches nothing live *for
+/// that purpose*.
 ///
-/// Single-use and expiry are one WHERE clause — `consumed_at IS NULL AND
-/// expires_at > NOW()` — on a single UPDATE, so two concurrent clicks of
-/// the same link can never both succeed, and expired or already-consumed
-/// rows are inert. Unlike token/session verification there is no
-/// `account_id` scoping: at signup time no account exists yet, so the link
-/// itself is the whole credential — which is exactly why it is short-lived,
-/// single-use, and stored hash-only.
+/// Single-use, expiry, and the purpose pin are one WHERE clause —
+/// `purpose = $2 AND consumed_at IS NULL AND expires_at > NOW()` — on a
+/// single UPDATE, so two concurrent clicks of the same link can never both
+/// succeed, expired or already-consumed rows are inert, and a link
+/// presented to the wrong completion endpoint (signup link on `/login/
+/// complete` or vice versa) is indistinguishable from an invalid one — and,
+/// because the refusal happens inside the WHERE clause rather than after
+/// consumption, the link is *not* burned and still works on its own
+/// endpoint. Unlike token/session verification there is no `account_id`
+/// scoping: at signup time no account exists yet, so the link itself is the
+/// whole credential — which is exactly why it is short-lived, single-use,
+/// and stored hash-only.
 pub async fn consume_magic_link(
     control: &ControlPlane,
     plaintext: &str,
+    purpose: MagicLinkPurpose,
 ) -> Result<Option<MagicLinkRecord>, CloudError> {
     let row: Option<MagicLinkRow> = sqlx::query_as(
         "UPDATE magic_links SET consumed_at = NOW() \
          WHERE token_hash = $1 \
+           AND purpose = $2 \
            AND consumed_at IS NULL \
            AND expires_at > NOW() \
          RETURNING token_hash, email, purpose, requested_subdomain, \
                    created_at, expires_at, consumed_at, request_ip",
     )
     .bind(sha256_hex(plaintext))
+    .bind(purpose.as_str())
     .fetch_optional(control.pool())
     .await
     .map_err(CloudError::db("consuming magic link"))?;

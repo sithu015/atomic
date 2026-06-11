@@ -3,8 +3,9 @@
 /// Errors produced by the cloud composition layer.
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
-    /// The configured control-plane connection URL failed to parse.
-    #[error("invalid control-plane database URL: {0}")]
+    /// A configured URL (control plane, tenant cluster, or app public
+    /// origin) failed to parse. The message says which.
+    #[error("invalid URL: {0}")]
     InvalidUrl(String),
 
     /// A Postgres database name contained characters outside

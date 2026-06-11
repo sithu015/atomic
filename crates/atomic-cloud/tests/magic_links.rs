@@ -1,5 +1,6 @@
 //! Magic-link issuance/consumption integration tests: hash-only storage,
-//! single-use consumption, and the inertness of expired rows.
+//! single-use purpose-pinned consumption, and the inertness of expired and
+//! wrong-purpose rows.
 //!
 //! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
 //! conventions and the run command. Control plane only — no tenant
@@ -94,11 +95,22 @@ async fn consumption_is_single_use() {
         .await
         .expect("issue magic link");
 
-        // First click wins, with the row intact.
-        let record = consume_magic_link(&control, &plaintext)
+        // The wrong purpose consumes nothing AND burns nothing: the purpose
+        // pin lives inside the UPDATE's WHERE clause, so a login link
+        // presented to the signup endpoint stays live for the login one.
+        assert!(
+            consume_magic_link(&control, &plaintext, MagicLinkPurpose::Signup)
+                .await
+                .expect("consume query")
+                .is_none(),
+            "a login link must not consume as a signup link"
+        );
+
+        // First correct-purpose click wins, with the row intact.
+        let record = consume_magic_link(&control, &plaintext, MagicLinkPurpose::Login)
             .await
             .expect("consume query")
-            .expect("fresh link consumes");
+            .expect("fresh link consumes despite the earlier wrong-purpose attempt");
         assert_eq!(record.email, "kenny@example.com");
         assert_eq!(record.purpose, MagicLinkPurpose::Login);
         assert_eq!(record.requested_subdomain, None);
@@ -109,7 +121,7 @@ async fn consumption_is_single_use() {
 
         // Second click is inert.
         assert!(
-            consume_magic_link(&control, &plaintext)
+            consume_magic_link(&control, &plaintext, MagicLinkPurpose::Login)
                 .await
                 .expect("consume query")
                 .is_none(),
@@ -117,10 +129,12 @@ async fn consumption_is_single_use() {
         );
 
         // Garbage never consumes.
-        assert!(consume_magic_link(&control, "aml_nonsense")
-            .await
-            .expect("consume query")
-            .is_none());
+        assert!(
+            consume_magic_link(&control, "aml_nonsense", MagicLinkPurpose::Login)
+                .await
+                .expect("consume query")
+                .is_none()
+        );
     })
     .await;
 }
@@ -155,7 +169,7 @@ async fn expired_links_are_inert() {
         .expect("expire link");
 
         assert!(
-            consume_magic_link(&control, &plaintext)
+            consume_magic_link(&control, &plaintext, MagicLinkPurpose::Signup)
                 .await
                 .expect("consume query")
                 .is_none(),

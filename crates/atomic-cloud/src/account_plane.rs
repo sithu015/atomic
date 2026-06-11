@@ -27,7 +27,7 @@
 //!   resolve. The e2e suite pins both directions against the live
 //!   composition.
 //!
-//! # Routes (this slice)
+//! # Routes
 //!
 //! - `POST /signup/request-link` `{email, subdomain}` — validate, issue a
 //!   signup magic link, email it. Bad email/slug are honest 400s (they're
@@ -39,9 +39,53 @@
 //! - `POST /login/request-link` `{email}` — if an active account matches,
 //!   email a login link. The response is byte-identical whether or not the
 //!   account exists (no email enumeration; e2e-pinned).
+//! - `GET /signup/complete?token=…` — consume the signup link and provision
+//!   the account synchronously (plan: "Signup" steps 3–12, minus the
+//!   deferred 7–9), then establish a session and 302 to the new tenant. See
+//!   "Completion semantics" below.
+//! - `GET /login/complete?token=…` — consume the login link, find the
+//!   active account by the link's email, establish a session, 302 to the
+//!   account's subdomain.
 //!
-//! The consume routes (`/signup/complete`, `/login/complete`) arrive with
-//! the rest of the signup slice; until then issued links are inert rows.
+//! # Completion semantics
+//!
+//! The completion routes handle a **single-use credential**, so the order
+//! of refusals is load-bearing:
+//!
+//! - **Capacity is checked before the token is consumed.** Synchronous
+//!   provisioning is capped by a process-wide semaphore
+//!   ([`AccountPlaneConfig::max_concurrent_provisions`]; plan: 4–8). A
+//!   saturated process answers a structured 503 + `Retry-After` *without*
+//!   touching the link — consume-then-refuse would burn the user's only
+//!   credential on a condition that retrying cures.
+//! - **Consumption is atomic and purpose-pinned** (one UPDATE; see
+//!   [`crate::magic_links::consume_magic_link`]). Expired, reused,
+//!   wrong-purpose, and unknown tokens are all the same honest
+//!   `invalid_link` 400 — distinguishing WHY would hand out an oracle over
+//!   the magic-link table. A double click is therefore one provision and
+//!   one clean 400, never two provisions.
+//! - **`SubdomainTaken` at consume time is a 409** telling the user to
+//!   restart signup with a different name. The consumed token stays spent —
+//!   un-consuming would reopen the replay window, and a fresh request-link
+//!   is cheap and rate-limited, so the honest trade-off is "this click is
+//!   spent, ask again".
+//! - **A provision failure after consumption** leaves the accounts row in
+//!   `status='provisioning'`; the response is a structured 500 advising
+//!   retry-later. The safety-net reaper (plan: "Failure recovery & the
+//!   reaper"; arrives later in this slice) is what retries or rolls back
+//!   such rows.
+//!
+//! On success the route creates a web session ([`crate::tokens`]) and sets
+//! the [`SESSION_COOKIE`](crate::auth::SESSION_COOKIE) with
+//! `Domain=.<base>; Secure; HttpOnly; SameSite=Lax; Max-Age=<session TTL>`
+//! (plan: "Web sessions" — the leading dot makes one session work across
+//! every subdomain; the account-scoped verification in `CloudAuth` is what
+//! keeps that from crossing tenants). `Secure` is unconditional: on plain-
+//! HTTP dev deployments browsers still accept it for localhost, and a
+//! deployment flag to strip it would eventually strip it in production.
+//! The redirect targets `<slug>.<base>` with the scheme/port of
+//! [`AccountPlaneConfig::app_public_url`] — production defaults yield
+//! `https://<slug>.<base>/`; dev setups keep their explicit port.
 //!
 //! # Anti-abuse limits (plan: "Quotas" table)
 //!
@@ -70,17 +114,39 @@
 
 use std::sync::Arc;
 
+use actix_web::cookie::{Cookie, SameSite};
 use actix_web::guard::{Guard, GuardContext};
 use actix_web::http::header;
 use actix_web::{guard, web, HttpRequest, HttpResponse};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
+use crate::auth::SESSION_COOKIE;
 use crate::control_plane::ControlPlane;
 use crate::email::EmailSender;
-use crate::magic_links::{issue_magic_link, MagicLinkPurpose, MAGIC_LINK_TTL};
-use crate::provision::{email_format_ok, subdomain_format_ok};
+use crate::error::CloudError;
+use crate::magic_links::{consume_magic_link, issue_magic_link, MagicLinkPurpose, MAGIC_LINK_TTL};
+use crate::provision::{
+    email_format_ok, provision_account, subdomain_format_ok, ClusterConfig, NewAccount,
+};
 use crate::rate_limit::SlidingWindow;
 use crate::reserved_subdomains;
+use crate::tokens::create_session;
+
+/// Web-session lifetime, which is also the cookie's `Max-Age`. Thirty days
+/// balances "don't make magic-link users log in weekly" against bounded
+/// exposure for a leaked cookie; sessions are server-stored, so revocation
+/// (account deletion, future "sign out everywhere") is immediate regardless.
+pub const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Default cap on concurrent in-flight provisions per process (plan:
+/// "Signup" — synchronous, capped at 4–8).
+pub const DEFAULT_MAX_CONCURRENT_PROVISIONS: usize = 4;
+
+/// `Retry-After` seconds suggested when the provision semaphore is
+/// saturated. The happy path is ~2–5 s per provision, so a short backoff is
+/// honest.
+const PROVISION_BUSY_RETRY_AFTER_SECS: u64 = 10;
 
 /// The plan's anti-abuse rate-limit numbers ("Quotas" table), with the
 /// windows exposed so tests can shrink them instead of sleeping through
@@ -124,6 +190,14 @@ pub struct AccountPlaneConfig {
     /// spoofing trade-off in both directions.
     pub trust_proxy_header: bool,
     pub rate_limits: RateLimits,
+    /// Cap on concurrent in-flight provisions in this process (the
+    /// signup-completion semaphore; plan says 4–8). Values below 1 are
+    /// clamped to 1 — a zero-permit semaphore would refuse every signup
+    /// forever.
+    pub max_concurrent_provisions: usize,
+    /// Web-session lifetime and cookie `Max-Age`. Production callers use
+    /// the [`SESSION_TTL`] default; tests shrink it.
+    pub session_ttl: std::time::Duration,
 }
 
 impl AccountPlaneConfig {
@@ -134,6 +208,8 @@ impl AccountPlaneConfig {
             app_public_url: None,
             trust_proxy_header: false,
             rate_limits: RateLimits::default(),
+            max_concurrent_provisions: DEFAULT_MAX_CONCURRENT_PROVISIONS,
+            session_ttl: SESSION_TTL,
         }
     }
 }
@@ -141,14 +217,27 @@ impl AccountPlaneConfig {
 /// Everything the account-plane handlers need, shared across workers.
 struct PlaneState {
     control: ControlPlane,
+    /// The shared tenant cluster, for the synchronous provision in
+    /// `/signup/complete`.
+    cluster: ClusterConfig,
     email: Arc<dyn EmailSender>,
     /// Normalized (lowercase, no leading dot, no port) base domain.
     base_domain: String,
     /// Link origin, no trailing slash.
     app_public_url: String,
+    /// Scheme + explicit port of [`Self::app_public_url`], reused for the
+    /// post-completion redirect to `<slug>.<base>` — production defaults
+    /// yield `https://…/`; dev setups keep their `http` and port.
+    tenant_scheme: String,
+    tenant_port: Option<u16>,
     trust_proxy_header: bool,
     signup_ip_limiter: SlidingWindow,
     email_limiter: SlidingWindow,
+    /// The synchronous-signup concurrency cap (module docs: "Completion
+    /// semantics"). Checked with `try_acquire` *before* the token is
+    /// consumed; never waited on — a saturated process answers 503.
+    provision_permits: Arc<Semaphore>,
+    session_ttl: std::time::Duration,
 }
 
 /// The account plane as a registrable unit: construct once, hand a clone to
@@ -159,11 +248,16 @@ pub struct AccountPlane {
 }
 
 impl AccountPlane {
+    /// Build the plane. `cluster` is where `/signup/complete` provisions
+    /// tenant databases. Fails when `app_public_url` (explicit or derived)
+    /// doesn't parse — a misconfigured origin should fail at boot, not on
+    /// the first signup's redirect.
     pub fn new(
         control: ControlPlane,
+        cluster: ClusterConfig,
         email: Arc<dyn EmailSender>,
         config: AccountPlaneConfig,
-    ) -> Self {
+    ) -> Result<Self, CloudError> {
         let base_domain = config
             .base_domain
             .trim_start_matches('.')
@@ -173,21 +267,43 @@ impl AccountPlane {
             .unwrap_or_else(|| format!("https://app.{base_domain}"))
             .trim_end_matches('/')
             .to_string();
+        let parsed = url::Url::parse(&app_public_url).map_err(|e| {
+            CloudError::InvalidUrl(format!("app public URL {app_public_url:?}: {e}"))
+        })?;
+        let tenant_scheme = parsed.scheme().to_string();
+        // `Url::port()` is None for the scheme's default port, which is
+        // exactly right: default ports stay out of the redirect URL.
+        let tenant_port = parsed.port();
         let limits = config.rate_limits;
-        Self {
+        Ok(Self {
             state: web::Data::new(PlaneState {
                 control,
+                cluster,
                 email,
                 base_domain,
                 app_public_url,
+                tenant_scheme,
+                tenant_port,
                 trust_proxy_header: config.trust_proxy_header,
                 signup_ip_limiter: SlidingWindow::new(
                     limits.signup_links_per_ip,
                     limits.signup_ip_window,
                 ),
                 email_limiter: SlidingWindow::new(limits.links_per_email, limits.email_window),
+                provision_permits: Arc::new(Semaphore::new(
+                    config.max_concurrent_provisions.max(1),
+                )),
+                session_ttl: config.session_ttl,
             }),
-        }
+        })
+    }
+
+    /// The signup-completion provision semaphore. Public so the saturation
+    /// test can hold a permit (standing in for a slow in-flight provision)
+    /// and prove a concurrent completion gets 503 without consuming its
+    /// token; production code only touches this through `signup_complete`.
+    pub fn provision_permits(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.state.provision_permits)
     }
 
     /// Register the account-plane routes on `cfg`, each guarded to the app
@@ -199,13 +315,15 @@ impl AccountPlane {
             web::scope("/signup")
                 .guard(app_host_guard(self.state.base_domain.clone()))
                 .app_data(self.state.clone())
-                .route("/request-link", web::post().to(signup_request_link)),
+                .route("/request-link", web::post().to(signup_request_link))
+                .route("/complete", web::get().to(signup_complete)),
         );
         cfg.service(
             web::scope("/login")
                 .guard(app_host_guard(self.state.base_domain.clone()))
                 .app_data(self.state.clone())
-                .route("/request-link", web::post().to(login_request_link)),
+                .route("/request-link", web::post().to(login_request_link))
+                .route("/complete", web::get().to(login_complete)),
         );
     }
 }
@@ -448,6 +566,201 @@ async fn issue_and_send(
     }
 }
 
+/// Query shape of both completion routes. `Option` so a missing parameter
+/// produces this module's structured `invalid_link` response instead of
+/// actix's default deserialization 400.
+#[derive(Deserialize)]
+struct CompleteQuery {
+    token: Option<String>,
+}
+
+/// `GET /signup/complete?token=…` (app host only). Signup steps 3–12 from
+/// the plan, minus the deferred 7–9 (cloud-curated per-DB settings, default
+/// report, managed provider key — later slices). See the module docs
+/// ("Completion semantics") for the refusal ordering this implements.
+async fn signup_complete(
+    state: web::Data<PlaneState>,
+    req: HttpRequest,
+    query: web::Query<CompleteQuery>,
+) -> HttpResponse {
+    let Some(token) = query.into_inner().token else {
+        return invalid_link();
+    };
+
+    // Capacity BEFORE consumption (module docs): a saturated process must
+    // refuse without spending the single-use token, so the same link
+    // succeeds on retry. `try_acquire` — never wait — because each waiter
+    // would pin an HTTP connection behind multi-second provisions.
+    let Ok(_permit) = Arc::clone(&state.provision_permits).try_acquire_owned() else {
+        return provisioning_busy();
+    };
+
+    let record = match consume_magic_link(&state.control, &token, MagicLinkPurpose::Signup).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return invalid_link(),
+        Err(e) => {
+            tracing::error!(error = %e, "consuming signup link failed");
+            return internal_error();
+        }
+    };
+    let Some(subdomain) = record.requested_subdomain else {
+        // Issuance always stores a subdomain on signup links; a row without
+        // one is corruption, not user error.
+        tracing::error!(
+            email = record.email,
+            "signup link row has no requested_subdomain"
+        );
+        return internal_error();
+    };
+
+    // The token is spent from here on. provision_account re-validates,
+    // claims the subdomain via the UNIQUE constraint, and is idempotent
+    // under resume; SubdomainTaken/SubdomainReserved at this point means
+    // the name was claimed (or parked by a deletion) while the link sat in
+    // the inbox.
+    let provisioned = provision_account(
+        &state.control,
+        &state.cluster,
+        NewAccount {
+            email: record.email.clone(),
+            subdomain,
+        },
+    )
+    .await;
+    match provisioned {
+        Ok(account) => {
+            tracing::info!(
+                account_id = account.account_id,
+                subdomain = account.subdomain,
+                "signup completed"
+            );
+            session_redirect(&state, &req, &account.account_id, &account.subdomain).await
+        }
+        // The consumed token stays spent on a name conflict (module docs):
+        // un-consuming would reopen the replay window, and a fresh
+        // request-link is cheap and rate-limited.
+        Err(CloudError::SubdomainTaken(s)) => subdomain_conflict("subdomain_taken", &s),
+        Err(CloudError::SubdomainReserved(s)) => subdomain_conflict("subdomain_reserved", &s),
+        Err(e) => {
+            // The claim may have landed before the failure, leaving the
+            // accounts row in 'provisioning'. That is deliberate: the
+            // safety-net reaper (plan: "Failure recovery & the reaper")
+            // retries or rolls back stuck rows; a user retry can also
+            // resume it (provision_account is idempotent for the same
+            // email + subdomain).
+            tracing::error!(error = %e, email = record.email, "synchronous provision failed");
+            provision_failed()
+        }
+    }
+}
+
+/// `GET /login/complete?token=…` (app host only). Consume the login link
+/// (purpose-pinned — a signup link refuses here without being spent), find
+/// the active account by the link's email, establish a session, redirect.
+async fn login_complete(
+    state: web::Data<PlaneState>,
+    req: HttpRequest,
+    query: web::Query<CompleteQuery>,
+) -> HttpResponse {
+    let Some(token) = query.into_inner().token else {
+        return invalid_link();
+    };
+    let record = match consume_magic_link(&state.control, &token, MagicLinkPurpose::Login).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return invalid_link(),
+        Err(e) => {
+            tracing::error!(error = %e, "consuming login link failed");
+            return internal_error();
+        }
+    };
+
+    // The newest active account wins if an email somehow has several
+    // (accounts.email is not unique); the request-link route only verified
+    // existence. An account deleted between request and click answers the
+    // same `invalid_link` as a stale token — account state is not an oracle
+    // this route hands out.
+    let account: Option<(String, String)> = match sqlx::query_as(
+        "SELECT id, subdomain FROM accounts \
+         WHERE LOWER(email) = LOWER($1) AND status = 'active' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&record.email)
+    .fetch_optional(state.control.pool())
+    .await
+    {
+        Ok(account) => account,
+        Err(e) => {
+            tracing::error!(error = %e, "account lookup for login completion failed");
+            return internal_error();
+        }
+    };
+    let Some((account_id, subdomain)) = account else {
+        return invalid_link();
+    };
+    session_redirect(&state, &req, &account_id, &subdomain).await
+}
+
+/// Step 12: create the web session and answer the 302 that lands the
+/// browser on the account's subdomain with the session cookie set.
+///
+/// Cookie attributes per the plan ("Web sessions"): `Domain=.<base>` (the
+/// leading dot — one session works on every subdomain; `CloudAuth`'s
+/// account-scoped verification is what keeps it from crossing tenants),
+/// `Secure; HttpOnly; SameSite=Lax`, `Max-Age` = the session TTL so browser
+/// and server expire together. `Secure` is unconditional — see module docs.
+async fn session_redirect(
+    state: &PlaneState,
+    req: &HttpRequest,
+    account_id: &str,
+    subdomain: &str,
+) -> HttpResponse {
+    let ip = client_ip(req, state.trust_proxy_header);
+    let ua = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let session = match create_session(
+        &state.control,
+        account_id,
+        state.session_ttl,
+        ip.as_deref(),
+        ua,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "creating session failed");
+            return internal_error();
+        }
+    };
+
+    let cookie = Cookie::build(SESSION_COOKIE, session)
+        .domain(format!(".{}", state.base_domain))
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .max_age(
+            actix_web::cookie::time::Duration::try_from(state.session_ttl)
+                .unwrap_or(actix_web::cookie::time::Duration::MAX),
+        )
+        .finish();
+
+    let port = state
+        .tenant_port
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    let location = format!(
+        "{}://{subdomain}.{}{port}/",
+        state.tenant_scheme, state.base_domain
+    );
+    HttpResponse::Found()
+        .insert_header((header::LOCATION, location))
+        .cookie(cookie)
+        .finish()
+}
+
 // --- Responses --------------------------------------------------------------
 
 /// The shared neutral 200 — byte-identical across both routes and every
@@ -463,6 +776,56 @@ fn validation_error(code: &str, message: &str) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({
         "error": code,
         "message": message,
+    }))
+}
+
+/// The one refusal for every dead token — missing, unknown, expired,
+/// already consumed, or presented to the wrong endpoint. Deliberately
+/// undifferentiated (module docs: no oracle over the magic-link table).
+fn invalid_link() -> HttpResponse {
+    HttpResponse::BadRequest().json(serde_json::json!({
+        "error": "invalid_link",
+        "message": "This link is invalid or expired. Request a new one.",
+    }))
+}
+
+/// The provision semaphore is saturated. Answered *before* the token is
+/// consumed, so the same link works once capacity frees up.
+fn provisioning_busy() -> HttpResponse {
+    HttpResponse::ServiceUnavailable()
+        .insert_header((
+            header::RETRY_AFTER,
+            PROVISION_BUSY_RETRY_AFTER_SECS.to_string(),
+        ))
+        .json(serde_json::json!({
+            "error": "provisioning_busy",
+            "message": "Too many accounts are being set up right now. \
+                        Open your link again in a few seconds.",
+            "retry_after_seconds": PROVISION_BUSY_RETRY_AFTER_SECS,
+        }))
+}
+
+/// The requested name was claimed (`subdomain_taken`) or parked by a
+/// deletion (`subdomain_reserved`) while the link sat unconsumed. The spent
+/// token is not refunded — see the module docs for the trade-off.
+fn subdomain_conflict(code: &str, subdomain: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": code,
+        "message": format!(
+            "The subdomain {subdomain:?} is no longer available. \
+             Start signup again with a different name."
+        ),
+    }))
+}
+
+/// Provisioning failed after the token was consumed. The accounts row may
+/// be parked in 'provisioning'; the reaper owns its recovery (plan:
+/// "Failure recovery & the reaper").
+fn provision_failed() -> HttpResponse {
+    HttpResponse::InternalServerError().json(serde_json::json!({
+        "error": "provision_failed",
+        "message": "Something went wrong setting up your account. \
+                    Try again in a few minutes.",
     }))
 }
 

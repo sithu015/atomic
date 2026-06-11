@@ -120,8 +120,20 @@ enum Command {
         /// Public origin used when building emailed magic links, e.g.
         /// `https://app.atomic.cloud`. Defaults to `https://app.<base-domain>`;
         /// override for local/dev deployments with ports or plain http.
+        /// Post-signup/login redirects to tenant subdomains reuse its
+        /// scheme and port.
         #[arg(long, env = "ATOMIC_CLOUD_APP_PUBLIC_URL")]
         app_public_url: Option<String>,
+
+        /// Max signups provisioning concurrently in this process; further
+        /// signup completions get a 503 + Retry-After without consuming
+        /// their link (the plan budgets 4-8).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_MAX_CONCURRENT_PROVISIONS",
+            default_value_t = atomic_cloud::DEFAULT_MAX_CONCURRENT_PROVISIONS
+        )]
+        max_concurrent_provisions: usize,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -304,6 +316,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             email,
             trust_proxy_header,
             app_public_url,
+            max_concurrent_provisions,
         } => {
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
@@ -316,6 +329,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 app_public_url,
                 trust_proxy_header,
                 rate_limits: RateLimits::default(),
+                max_concurrent_provisions,
                 ..AccountPlaneConfig::new(base_domain.clone())
             };
             serve(
@@ -421,9 +435,13 @@ async fn serve(
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
         .max(std::time::Duration::from_secs(1));
-    let cache = Arc::new(AccountCache::new(control.clone(), cluster, cache_config));
+    let cache = Arc::new(AccountCache::new(
+        control.clone(),
+        cluster.clone(),
+        cache_config,
+    ));
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
-    let account_plane = AccountPlane::new(control, email, plane_config);
+    let account_plane = AccountPlane::new(control, cluster, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
     // a new entry, but a stable working set produces no inserts — without

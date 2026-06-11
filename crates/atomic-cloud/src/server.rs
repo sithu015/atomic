@@ -7,9 +7,11 @@
 //!
 //! - `GET /health` — public, no auth on any host.
 //! - **The account plane** ([`crate::account_plane`]) — `POST
-//!   /signup/request-link` and `POST /login/request-link`, served only on
-//!   the **app host** (the bare base domain or `app.<base>`). No CloudAuth,
-//!   no tenant state: these routes exist for people without accounts. The
+//!   /signup/request-link`, `POST /login/request-link`, `GET
+//!   /signup/complete`, and `GET /login/complete`, served only on the
+//!   **app host** (the bare base domain or `app.<base>`). No CloudAuth,
+//!   no tenant state: these routes exist for people without accounts (or
+//!   without a live session). The
 //!   host split fails closed in both directions — the routes carry an
 //!   app-host guard (404 on tenant subdomains), and tenant routes 404 on
 //!   the app host because `CloudAuth` extracts no subdomain from the bare

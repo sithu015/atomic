@@ -98,9 +98,11 @@ impl CloudHarness {
         // sending mail.
         let account_plane = AccountPlane::new(
             control.clone(),
+            cluster.clone(),
             Arc::new(support::CapturingSender::default()),
             AccountPlaneConfig::new(BASE_DOMAIN),
-        );
+        )
+        .expect("build account plane");
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");

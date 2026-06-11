@@ -68,7 +68,7 @@ impl ClusterConfig {
     /// Connection URL for a tenant database on this cluster.
     pub fn tenant_db_url(&self, db_name: &str) -> Result<String, CloudError> {
         let mut url = url::Url::parse(&self.cluster_url)
-            .map_err(|e| CloudError::InvalidUrl(e.to_string()))?;
+            .map_err(|e| CloudError::InvalidUrl(format!("cluster URL: {e}")))?;
         url.set_path(db_name);
         Ok(url.into())
     }
@@ -78,7 +78,7 @@ impl ClusterConfig {
     /// queries that can't run against the database they target.
     async fn connect_maintenance(&self) -> Result<PgConnection, CloudError> {
         let opts = PgConnectOptions::from_str(&self.cluster_url)
-            .map_err(|e| CloudError::InvalidUrl(e.to_string()))?
+            .map_err(|e| CloudError::InvalidUrl(format!("cluster URL: {e}")))?
             .database("postgres");
         PgConnection::connect_with(&opts)
             .await
@@ -166,11 +166,12 @@ pub(crate) fn email_format_ok(email: &str) -> bool {
 /// record the tenant mapping, and activate the account.
 ///
 /// Implements signup steps 1, 3, 4, 5, 6, 10 and 11 from the plan
-/// ("Provisioning lifecycle" → "Signup"). The remaining steps live in later
-/// slices: 2 (magic link — signup slice), 7 (cloud-curated per-DB settings;
-/// atomic-core's own defaults are seeded here as part of opening the
-/// tenant), 8 (default report — reports slice), 9 (managed OpenRouter key —
-/// provider-management slice), 12 (session + redirect — signup slice).
+/// ("Provisioning lifecycle" → "Signup"). Steps 2 and 12 (magic link;
+/// session + redirect) live in the HTTP layer ([`crate::account_plane`]);
+/// the rest in later slices: 7 (cloud-curated per-DB settings; atomic-core's
+/// own defaults are seeded here as part of opening the tenant), 8 (default
+/// report — reports slice), 9 (managed OpenRouter key — provider-management
+/// slice).
 ///
 /// Re-running for an account stuck in `status='provisioning'` (same email,
 /// same subdomain) resumes and completes it without duplicating rows. The

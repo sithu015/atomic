@@ -183,7 +183,7 @@ impl ControlPlane {
 /// name to [`DEFAULT_CONTROL_DB_NAME`] when the URL omits one.
 fn control_options(control_db_url: &str) -> Result<PgConnectOptions, CloudError> {
     let opts = PgConnectOptions::from_str(control_db_url)
-        .map_err(|e| CloudError::InvalidUrl(e.to_string()))?;
+        .map_err(|e| CloudError::InvalidUrl(format!("control-plane database URL: {e}")))?;
     Ok(match opts.get_database() {
         Some(_) => opts,
         None => opts.database(DEFAULT_CONTROL_DB_NAME),
