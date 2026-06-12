@@ -264,6 +264,15 @@ pub struct AtomicCore {
     /// snapshot the config once at their start, so in-flight work finishes on
     /// the config it started with.
     provider_config: Arc<std::sync::RwLock<Option<ProviderConfig>>>,
+    /// Whether enqueued embedding/tagging pipeline jobs are also executed
+    /// in this process (`true`, the default for every constructor — today's
+    /// behavior) or left in the durable `atom_pipeline_jobs` ledger for a
+    /// dedicated pipeline worker owned by the composing process (`false`;
+    /// see [`set_inline_pipeline`](Self::set_inline_pipeline)). Shared
+    /// across every core resolved from the same Postgres `DatabaseManager`,
+    /// exactly like `provider_config`, so one composition-time switch
+    /// covers all of a manager's logical databases.
+    inline_pipeline: Arc<std::sync::atomic::AtomicBool>,
     /// Per-tag locks to serialize wiki operations (update, propose, accept,
     /// dismiss) against the same article. Prevents background + manual runs
     /// from racing and ensures supersede semantics are consistent. Entries are
@@ -285,6 +294,7 @@ impl AtomicCore {
             storage,
             registry: None,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -449,6 +459,7 @@ impl AtomicCore {
             storage,
             registry,
             provider_config: Arc::new(std::sync::RwLock::new(provider_config)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -535,6 +546,7 @@ impl AtomicCore {
             storage: storage::StorageBackend::Postgres(pg),
             registry: None,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -555,6 +567,7 @@ impl AtomicCore {
             storage: storage::StorageBackend::Postgres(pg),
             registry: self.registry.clone(),
             provider_config: Arc::clone(&self.provider_config),
+            inline_pipeline: Arc::clone(&self.inline_pipeline),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -673,6 +686,7 @@ impl AtomicCore {
             storage,
             registry,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -718,6 +732,38 @@ impl AtomicCore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(config);
+    }
+
+    /// Whether enqueued pipeline jobs are also executed in this process.
+    /// `true` (the default) on every constructor; see
+    /// [`set_inline_pipeline`](Self::set_inline_pipeline).
+    pub fn inline_pipeline(&self) -> bool {
+        self.inline_pipeline
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Choose whether this process executes the embedding/tagging pipeline
+    /// jobs it enqueues.
+    ///
+    /// Hosts that run a **dedicated pipeline worker** can defer execution to
+    /// it: with `inline = false`, every operation that requests pipeline
+    /// work (atom create/update, retries, re-embeds, agent tool mutations)
+    /// still writes its jobs to the durable `atom_pipeline_jobs` ledger and
+    /// returns normally, but no in-process task is spawned to claim and run
+    /// them — the worker claims them via the ledger's lease semantics
+    /// instead. Jobs persist in the ledger either way, so flipping the mode
+    /// never loses work; with no worker attached, deferred jobs simply wait.
+    ///
+    /// The default (`true`) is today's behavior: enqueue, then claim and
+    /// process in-process immediately.
+    ///
+    /// Like [`update_provider_config`](Self::update_provider_config), the
+    /// flag is shared with every core resolved from the same Postgres
+    /// `DatabaseManager` (see `sibling_with_storage`), so one call covers
+    /// all of a manager's logical databases.
+    pub fn set_inline_pipeline(&self, inline: bool) {
+        self.inline_pipeline
+            .store(inline, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Resolved settings map for AI operations (embedding, tagging, search,
@@ -2378,30 +2424,25 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let on_event = self.wrap_event_for_cache(on_event);
-        let canvas_cache = Some(self.canvas_cache.clone());
-        match self.settings_for_background().await {
-            Some(s) => embedding::process_pending_embeddings_with_settings(
-                self.storage.clone(),
-                on_event,
-                s,
-                canvas_cache,
-            )
-            .await
-            .map_err(|e| AtomicCoreError::Embedding(e)),
-            None => {
-                embedding::process_pending_embeddings(self.storage.clone(), on_event, canvas_cache)
-                    .await
-                    .map_err(|e| AtomicCoreError::Embedding(e))
-            }
-        }
+        self.storage
+            .enqueue_pipeline_jobs_from_statuses_sync(None)
+            .await?;
+        self.process_queued_pipeline_jobs(on_event).await
     }
 
     /// Process due jobs from the unified embedding/tagging queue.
+    ///
+    /// With inline pipeline execution off (see
+    /// [`set_inline_pipeline`](Self::set_inline_pipeline)), this is a no-op
+    /// returning 0: enqueued jobs stay unclaimed in the durable ledger for
+    /// the host's dedicated pipeline worker.
     pub async fn process_queued_pipeline_jobs<F>(&self, on_event: F) -> Result<i32, AtomicCoreError>
     where
         F: Fn(EmbeddingEvent) + Send + Sync + 'static,
     {
+        if !self.inline_pipeline() {
+            return Ok(0);
+        }
         let on_event = self.wrap_event_for_cache(on_event);
         let canvas_cache = Some(self.canvas_cache.clone());
         match self.settings_for_background().await {
@@ -2435,30 +2476,10 @@ impl AtomicCore {
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
         let cutoff_rfc3339 = cutoff.to_rfc3339();
-        let on_event = self.wrap_event_for_cache(on_event);
-        let canvas_cache = Some(self.canvas_cache.clone());
-        let count = match self.settings_for_background().await {
-            Some(s) => {
-                embedding::process_pending_embeddings_due_with_settings(
-                    self.storage.clone(),
-                    on_event,
-                    cutoff_rfc3339.clone(),
-                    s,
-                    canvas_cache,
-                )
-                .await
-            }
-            None => {
-                embedding::process_pending_embeddings_due(
-                    self.storage.clone(),
-                    on_event,
-                    cutoff_rfc3339.clone(),
-                    canvas_cache,
-                )
-                .await
-            }
-        }
-        .map_err(|e| AtomicCoreError::Embedding(e))?;
+        self.storage
+            .enqueue_pipeline_jobs_from_statuses_sync(Some(&cutoff_rfc3339))
+            .await?;
+        let count = self.process_queued_pipeline_jobs(on_event).await?;
         if count > 0 {
             tracing::info!(cutoff = %cutoff_rfc3339, count, "Queued pending embeddings due for processing");
         }
@@ -2677,14 +2698,19 @@ impl AtomicCore {
             replace_existing: false,
         };
         self.storage.enqueue_pipeline_jobs_sync(&[job]).await?;
-        embedding::process_queued_pipeline_jobs_with_settings(
-            self.storage.clone(),
-            on_event,
-            bg_settings,
-            Some(self.canvas_cache.clone()),
-        )
-        .await
-        .map_err(AtomicCoreError::Embedding)?;
+        // Direct module call (not `process_queued_pipeline_jobs`) because the
+        // retry forces `auto_tagging_enabled` into the settings map above —
+        // so the inline-execution gate is applied here explicitly.
+        if self.inline_pipeline() {
+            embedding::process_queued_pipeline_jobs_with_settings(
+                self.storage.clone(),
+                on_event,
+                bg_settings,
+                Some(self.canvas_cache.clone()),
+            )
+            .await
+            .map_err(AtomicCoreError::Embedding)?;
+        }
 
         Ok(())
     }
@@ -2859,6 +2885,7 @@ impl AtomicCore {
             content,
             on_event,
             self.settings_for_background().await,
+            self.inline_pipeline(),
         )
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e))
@@ -2882,6 +2909,7 @@ impl AtomicCore {
             content,
             on_event,
             self.settings_for_background().await,
+            self.inline_pipeline(),
             canvas_context,
             page_context,
             Some(self.canvas_cache.clone()),

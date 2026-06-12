@@ -121,6 +121,16 @@ pub struct AccountCacheConfig {
     /// cluster well before the cache entry itself is evicted. Default
     /// 5 minutes.
     pub tenant_pool_idle_timeout: Duration,
+    /// Whether tenant managers execute the embedding/tagging pipeline jobs
+    /// they enqueue in-process (`AtomicCore::set_inline_pipeline`). Default
+    /// `true` — today's behavior, where a tenant's atom saves run their
+    /// pipeline inside the serving process. The dispatcher composition
+    /// (plan: "Worker fairness & job queue"; next phase) sets this `false`
+    /// so request-path saves only write durable `atom_pipeline_jobs` rows
+    /// and the per-pod dispatcher owns all execution. Never set `false`
+    /// without a dispatcher attached: enqueued work would sit in the
+    /// ledgers unexecuted.
+    pub inline_pipeline: bool,
 }
 
 impl Default for AccountCacheConfig {
@@ -130,6 +140,7 @@ impl Default for AccountCacheConfig {
             max_entries: 1000,
             tenant_pool_max_connections: 5,
             tenant_pool_idle_timeout: Duration::from_secs(5 * 60),
+            inline_pipeline: true,
         }
     }
 }
@@ -568,6 +579,18 @@ impl AccountCache {
         )
         .await
         .map_err(CloudError::core("opening tenant database manager"))?;
+
+        // Pipeline execution mode (config docs): the flag slot is shared by
+        // every core the manager resolves — sibling construction clones it —
+        // so flipping it once on the bootstrap core covers all of the
+        // account's knowledge bases, current and future.
+        if !self.config.inline_pipeline {
+            manager
+                .active_core()
+                .await
+                .map_err(CloudError::core("resolving core for pipeline mode"))?
+                .set_inline_pipeline(false);
+        }
 
         // Stamp the credential's last_used_at: handing the key to a serving
         // manager is the moment it goes into use (plan: "Audit /

@@ -21,10 +21,10 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
-    provision_account, set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig,
-    AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin,
-    FallbackAppState, ManagedKeys, NewAccount, NewCredentials, Provider, SecretKey, TenantPlane,
-    TokenScope, SESSION_COOKIE,
+    list_hinted_accounts, provision_account, set_active_provider, upsert_credentials, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
+    CredentialOrigin, FallbackAppState, ManagedKeys, NewAccount, NewCredentials, Provider,
+    SecretKey, TenantPlane, TokenScope, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -118,12 +118,14 @@ impl CloudHarness {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
+        let control_for_app = control.clone();
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
                 auth.clone(),
                 account_plane.clone(),
                 tenant_plane.clone(),
+                control_for_app.clone(),
             ))
         })
         .workers(1)
@@ -1193,4 +1195,51 @@ async fn fallback_state_fails_closed_without_tenant_extension() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The data plane writes dispatch hints (plan: "Worker fairness & job
+/// queue" → "Cross-tenant ledger scan"): read-only requests leave the hint
+/// table untouched, while a mutating request marks the authenticated
+/// account's `dispatch_hints` row — durably, before the response returns,
+/// so no polling is needed here. The hint-clearing semantics (including the
+/// mid-scan bump survival bound) are pinned in `tests/dispatch_hints.rs`.
+#[actix_web::test]
+async fn mutating_requests_mark_dispatch_hints() {
+    with_control_db("mutating_requests_mark_dispatch_hints", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+
+        // Read-only traffic marks nothing.
+        h.list_atoms(&alpha).await;
+        assert!(
+            list_hinted_accounts(&h.control)
+                .await
+                .expect("list hints")
+                .is_empty(),
+            "a GET must not mark a dispatch hint"
+        );
+
+        // A mutating request marks exactly this tenant's hint.
+        let atom = h
+            .create_atom(&alpha, "Alpha's note about Rust workspaces.")
+            .await;
+        let hinted: Vec<String> = list_hinted_accounts(&h.control)
+            .await
+            .expect("list hints")
+            .into_iter()
+            .map(|hint| hint.account_id)
+            .collect();
+        assert_eq!(
+            hinted,
+            vec![alpha.account_id.clone()],
+            "a POST must mark the authenticated account's hint"
+        );
+
+        // Default mode keeps inline pipeline execution on — let it finish
+        // before teardown drops the tenant database under it.
+        let atom_id = atom["id"].as_str().expect("atom id").to_string();
+        h.poll_pipeline_done(&alpha, &atom_id).await;
+        h.stop().await;
+    })
+    .await;
 }

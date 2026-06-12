@@ -148,12 +148,14 @@ impl ProviderHarness {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
+        let control_for_app = control.clone();
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
                 auth.clone(),
                 account_plane.clone(),
                 tenant_plane.clone(),
+                control_for_app.clone(),
             ))
         })
         .workers(1)

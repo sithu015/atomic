@@ -28,6 +28,7 @@ pub mod account_plane;
 pub mod auth;
 pub mod control_plane;
 pub mod curated_models;
+pub mod dispatch_hints;
 pub mod email;
 pub mod error;
 pub mod keyvault;
@@ -53,6 +54,9 @@ pub use control_plane::ControlPlane;
 pub use curated_models::{
     merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
     MANAGED_LLM_MODELS, PINNED_EMBEDDING_DIMENSION,
+};
+pub use dispatch_hints::{
+    clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint, DispatchHint,
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;

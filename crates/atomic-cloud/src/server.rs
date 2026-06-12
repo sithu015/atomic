@@ -106,6 +106,8 @@ use tokio::sync::broadcast;
 
 use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
+use crate::control_plane::ControlPlane;
+use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
 use crate::tenant_plane::TenantPlane;
 
@@ -258,6 +260,13 @@ async fn cloud_ws(
 ///   on tenant subdomains.
 /// - `tenant_plane` — the cloud-owned tenant routes ([`TenantPlane`]):
 ///   account deletion, behind the same `auth`.
+/// - `control` — the control plane, for the dispatch-hint middleware on the
+///   data plane ([`mark_hint_on_mutation`]): mutating `/api/*` requests mark
+///   the account's `dispatch_hints` row so the dispatcher's cross-tenant
+///   scan knows which tenants may hold pending ledger work. Only the
+///   `api_scope` plane carries it — the cloud-owned `/api/account*` routes
+///   mutate control-plane state, never the tenant's work ledgers, and `/ws`
+///   is read-only.
 ///
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
@@ -267,6 +276,7 @@ pub fn configure_cloud_app(
     auth: CloudAuth,
     account_plane: AccountPlane,
     tenant_plane: TenantPlane,
+    control: ControlPlane,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(state).route("/health", web::get().to(health));
@@ -282,7 +292,18 @@ pub fn configure_cloud_app(
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth.clone()),
         )
-        .service(api_scope().wrap(from_fn(cloud_plane_guard)).wrap(auth));
+        .service(
+            api_scope()
+                .app_data(web::Data::new(DispatchHintWriter::new(control)))
+                // Execution order is outermost-last-registered: auth
+                // resolves the tenant, the guard fails closed / unroutes the
+                // fallback-bound planes, and only then does the hint writer
+                // see the request — so unrouted planes and unauthenticated
+                // requests never mark hints.
+                .wrap(from_fn(mark_hint_on_mutation))
+                .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth),
+        );
     }
 }
 

@@ -643,7 +643,7 @@ async fn serve(
         reaper_interval,
     );
 
-    let account_plane = AccountPlane::new(control, cluster, managed, email, plane_config)?;
+    let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
     // a new entry, but a stable working set produces no inserts — without
@@ -684,6 +684,7 @@ async fn serve(
             auth.clone(),
             account_plane.clone(),
             tenant_plane.clone(),
+            control.clone(),
         ))
     })
     .workers(4)
