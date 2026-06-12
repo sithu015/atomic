@@ -141,6 +141,13 @@ pub enum CloudError {
     #[error("unknown credential origin {0:?}")]
     InvalidCredentialOrigin(String),
 
+    /// An `accounts.provider_pause_kind` value didn't parse as a
+    /// [`PauseKind`] (`rate_limit` | `credits`).
+    ///
+    /// [`PauseKind`]: crate::backpressure::PauseKind
+    #[error("unknown provider pause kind {0:?}")]
+    InvalidPauseKind(String),
+
     /// [`set_active_provider`] was asked to point an account at a
     /// `(provider, origin)` with no stored credentials row (or the account
     /// itself doesn't exist). The flip is refused — an active pointer must

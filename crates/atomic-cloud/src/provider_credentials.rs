@@ -45,6 +45,11 @@
 //! that is *never newer* than the credentials it was built from, which is
 //! the invariant the serving cache's staleness check leans on (see
 //! [`crate::account_cache`]).
+//!
+//! The same statement/transaction also **clears the provider circuit
+//! breaker's pause** (live-rotation step 6; see
+//! [`PROVIDER_MUTATION_EFFECTS`] and [`crate::backpressure`]) — every
+//! provider mutation is a fresh chance.
 
 use std::str::FromStr;
 
@@ -308,7 +313,7 @@ pub async fn upsert_credentials(
     .execute(&mut *tx)
     .await
     .map_err(CloudError::db("upserting provider credentials"))?;
-    bump_provider_generation(&mut tx, account_id).await?;
+    record_provider_mutation(&mut tx, account_id).await?;
     tx.commit()
         .await
         .map_err(CloudError::db("committing credential upsert"))?;
@@ -364,7 +369,7 @@ pub async fn insert_credentials_if_absent(
     .rows_affected()
         > 0;
     if inserted {
-        bump_provider_generation(&mut tx, account_id).await?;
+        record_provider_mutation(&mut tx, account_id).await?;
     }
     tx.commit()
         .await
@@ -372,20 +377,39 @@ pub async fn insert_credentials_if_absent(
     Ok(inserted)
 }
 
-/// Bump `accounts.provider_generation` inside the caller's transaction —
-/// the convergence signal every provider mutation must emit (module docs:
-/// "Provider generation"). Zero matched rows is tolerated: a mutation can
-/// legitimately race the accounts-row CASCADE of a concurrent deletion, and
-/// a deleted account has nothing left to converge.
-async fn bump_provider_generation(
+/// The accounts-row side effects of a provider mutation, as one SQL `SET`
+/// list (shared by [`record_provider_mutation`] and the inline UPDATEs in
+/// [`set_active_provider`] so the two can never drift):
+///
+/// - bump `provider_generation` — the convergence signal (module docs:
+///   "Provider generation");
+/// - **clear the circuit-breaker pause** (`provider_paused_until`,
+///   `provider_pause_kind`, `provider_pause_streak`) — live-rotation step 6
+///   (plan): a new key, a pointer flip, or a model change is exactly the
+///   user action a paused tenant takes to recover, and it deserves a fresh
+///   chance immediately rather than waiting out a cooldown computed for the
+///   old configuration. Riding the same statement/transaction as the
+///   mutation keeps "stored config changed" and "pause lifted" atomic.
+const PROVIDER_MUTATION_EFFECTS: &str = "provider_generation = provider_generation + 1, \
+     provider_paused_until = NULL, \
+     provider_pause_kind = NULL, \
+     provider_pause_streak = 0";
+
+/// Apply [`PROVIDER_MUTATION_EFFECTS`] inside the caller's transaction —
+/// every provider mutation must emit them. Zero matched rows is tolerated:
+/// a mutation can legitimately race the accounts-row CASCADE of a
+/// concurrent deletion, and a deleted account has nothing left to converge.
+async fn record_provider_mutation(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> Result<(), CloudError> {
-    sqlx::query("UPDATE accounts SET provider_generation = provider_generation + 1 WHERE id = $1")
-        .bind(account_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(CloudError::db("bumping provider generation"))?;
+    sqlx::query(&format!(
+        "UPDATE accounts SET {PROVIDER_MUTATION_EFFECTS} WHERE id = $1"
+    ))
+    .bind(account_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(CloudError::db("recording provider mutation"))?;
     Ok(())
 }
 
@@ -521,13 +545,13 @@ pub async fn set_active_provider(
 ) -> Result<(), CloudError> {
     match active {
         Some((provider, origin)) => {
-            let result = sqlx::query(
+            let result = sqlx::query(&format!(
                 "UPDATE accounts SET active_provider = $2, active_origin = $3, \
-                     provider_generation = provider_generation + 1 \
+                     {PROVIDER_MUTATION_EFFECTS} \
                  WHERE id = $1 AND EXISTS ( \
                      SELECT 1 FROM provider_credentials \
-                     WHERE account_id = $1 AND provider = $2 AND origin = $3)",
-            )
+                     WHERE account_id = $1 AND provider = $2 AND origin = $3)"
+            ))
             .bind(account_id)
             .bind(provider.as_str())
             .bind(origin.as_str())
@@ -545,11 +569,11 @@ pub async fn set_active_provider(
             }
         }
         None => {
-            let result = sqlx::query(
+            let result = sqlx::query(&format!(
                 "UPDATE accounts SET active_provider = NULL, active_origin = NULL, \
-                     provider_generation = provider_generation + 1 \
-                 WHERE id = $1",
-            )
+                     {PROVIDER_MUTATION_EFFECTS} \
+                 WHERE id = $1"
+            ))
             .bind(account_id)
             .execute(control.pool())
             .await
@@ -607,7 +631,7 @@ pub async fn delete_credentials(
         .execute(&mut *tx)
         .await
         .map_err(CloudError::db("clearing active provider after delete"))?;
-        bump_provider_generation(&mut tx, account_id).await?;
+        record_provider_mutation(&mut tx, account_id).await?;
     }
 
     tx.commit()
@@ -652,7 +676,7 @@ pub async fn update_model_config(
     .rows_affected()
         > 0;
     if updated {
-        bump_provider_generation(&mut tx, account_id).await?;
+        record_provider_mutation(&mut tx, account_id).await?;
     }
     tx.commit()
         .await

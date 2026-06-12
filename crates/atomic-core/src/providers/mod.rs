@@ -13,7 +13,7 @@ pub mod types;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-pub use error::ProviderError;
+pub use error::{classify_provider_failure, ProviderError, ProviderFailureClass};
 pub use models::{
     fetch_and_return_capabilities, get_cached_capabilities_sync, save_capabilities_cache,
     AvailableModel,

@@ -15,8 +15,9 @@
 //!    only tenants something has marked); on the slow-scan interval, add
 //!    *every* active account (the bound on hint loss; see
 //!    [`crate::dispatch_hints`]). Tenants whose `provider_paused_until` is
-//!    in the future are skipped wholesale (the circuit-breaker phase writes
-//!    that column; until it exists the gate reads as never-paused).
+//!    in the future are skipped wholesale — the provider circuit breaker
+//!    ([`crate::backpressure`]) writes that column; their ledger work sits
+//!    durably until the pause lapses or a provider mutation clears it.
 //! 2. **Poll** each candidate tenant (the plan's N+1 poll): resolve its
 //!    [`TenantHandle`] through the [`AccountCache`], fan over its knowledge
 //!    bases, and translate ledger state into [`WorkItem`]s — claimable
@@ -57,14 +58,39 @@
 //! hint-marking middleware, so the worker re-marks the tenant's hint after
 //! any execution that ran (or failed — failures leave backed-off retry rows
 //! the fast path must keep watching).
+//!
+//! # Provider backpressure (plan: "Provider rate-limit handling")
+//!
+//! [`CoreExecutor`] classifies provider failures
+//! ([`classify_provider_failure`]) out of both ledgers' failure surfaces
+//! and applies the two layers:
+//!
+//! - **Layer 1, local backoff.** `task_runs` failures already get
+//!   exponential `next_attempt_at` backoff from the ledger itself
+//!   (`RunHandle::fail`); the dispatcher adds nothing there — its base unit
+//!   (60s with jitter) dominates typical `Retry-After` hints, and the
+//!   breaker pause is the provider-level hold. Pipeline-job failures are
+//!   terminal in core (atom status `failed`, row cleared), so the executor
+//!   **re-enqueues** rate-limit/credits-classified atoms with `not_before`
+//!   honoring the provider's `Retry-After` hint (default
+//!   [`RATE_LIMIT_REQUEUE_DELAY`]; credits failures wait out the pause
+//!   horizon) — the job *sits in the ledger*, exactly the plan's
+//!   blocked-not-failed semantics, and the claim predicate keeps it
+//!   undispatchable until `not_before` passes.
+//! - **Layer 2, the circuit breaker.** Each execution feeds
+//!   [`ProviderBreaker`]: at most one rate-limit observation per executed
+//!   item (one provider 429 can fan out across a batch's atoms — that's
+//!   still one rate-limit response), an immediate credits pause on a 402,
+//!   and a streak reset on a failure-free execution.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use atomic_core::models::TaskRunTrigger;
+use atomic_core::models::{AtomPipelineJobRequest, TaskRunTrigger};
+use atomic_core::providers::{classify_provider_failure, ProviderFailureClass};
 use atomic_core::scheduler::{runner, ScheduledTask, TaskContext};
-use atomic_core::{ingest, reports, wiki, AtomicCore, TaskRun};
+use atomic_core::{ingest, reports, wiki, AtomicCore, EmbeddingEvent, TaskRun};
 use atomic_server::event_bridge;
 use atomic_server::state::ServerEvent;
 use chrono::{DateTime, Utc};
@@ -72,12 +98,19 @@ use rand::Rng;
 use tokio::task::JoinHandle;
 
 use crate::account_cache::{AccountCache, TenantHandle};
+use crate::backpressure::{BreakerConfig, ProviderBreaker};
 use crate::control_plane::ControlPlane;
 use crate::dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint,
 };
 use crate::error::CloudError;
 use crate::pools::{WorkClass, WorkerPools, WorkerPoolsConfig};
+
+/// Layer-1 re-enqueue delay for a rate-limited pipeline job when the
+/// provider sent no `Retry-After` hint. Matches the task ledger's backoff
+/// base unit (`scheduler::ledger::BACKOFF_BASE`) so both ledgers retry on
+/// the same conventions.
+pub const RATE_LIMIT_REQUEUE_DELAY: Duration = Duration::from_secs(60);
 
 /// Tuning knobs for the dispatcher. Every field is a `serve` CLI flag.
 #[derive(Debug, Clone)]
@@ -100,6 +133,9 @@ pub struct DispatcherConfig {
     pub reports_per_tenant_cap: usize,
     /// The four class pools' total / per-tenant caps.
     pub pools: WorkerPoolsConfig,
+    /// Provider circuit-breaker tuning (window, threshold, cooldowns) for
+    /// the [`ProviderBreaker`] the production executor feeds.
+    pub breaker: BreakerConfig,
 }
 
 impl Default for DispatcherConfig {
@@ -110,6 +146,7 @@ impl Default for DispatcherConfig {
             pipeline_batch_size: 8,
             reports_per_tenant_cap: 1,
             pools: WorkerPoolsConfig::default(),
+            breaker: BreakerConfig::default(),
         }
     }
 }
@@ -200,16 +237,29 @@ pub trait WorkExecutor: Send + Sync {
     async fn execute(&self, account_id: &str, item: &WorkItem) -> Result<ExecOutcome, CloudError>;
 }
 
+/// One per-atom pipeline failure observed during a batch execution, with
+/// its provider classification — the input to layer-1 re-enqueueing and
+/// the breaker feed.
+#[derive(Debug, Clone)]
+struct PipelineFailure {
+    atom_id: String,
+    /// Which stage failed: `true` for embedding, `false` for tagging.
+    embedding_stage: bool,
+    class: ProviderFailureClass,
+}
+
 /// The production executor: resolves the tenant through the
-/// [`AccountCache`], claims through the existing core machinery, and
-/// bridges events into the tenant's channel.
+/// [`AccountCache`], claims through the existing core machinery, bridges
+/// events into the tenant's channel, and feeds provider backpressure
+/// (module docs: "Provider backpressure").
 pub struct CoreExecutor {
     cache: Arc<AccountCache>,
+    breaker: Arc<ProviderBreaker>,
 }
 
 impl CoreExecutor {
-    pub fn new(cache: Arc<AccountCache>) -> Self {
-        Self { cache }
+    pub fn new(cache: Arc<AccountCache>, breaker: Arc<ProviderBreaker>) -> Self {
+        Self { cache, breaker }
     }
 
     async fn resolve(
@@ -225,6 +275,145 @@ impl CoreExecutor {
             .map_err(CloudError::core("resolving tenant core for dispatch"))?;
         Ok((core, handle))
     }
+
+    /// Apply both backpressure layers after an execution settles: feed the
+    /// breaker (at most one rate-limit observation and one credits
+    /// observation per execution — one provider response can fan out over a
+    /// batch), re-enqueue classified pipeline failures with an honest
+    /// `not_before`, and reset the streak on a clean run. Backpressure
+    /// errors are logged, never propagated — the execution outcome is
+    /// already settled in the durable ledgers.
+    async fn settle_backpressure(
+        &self,
+        account_id: &str,
+        core: &AtomicCore,
+        outcome: &ExecOutcome,
+        pipeline_failures: Vec<PipelineFailure>,
+    ) {
+        let mut rate_limited = false;
+        let mut payment_required = false;
+        for failure in &pipeline_failures {
+            match failure.class {
+                ProviderFailureClass::RateLimited { .. } => rate_limited = true,
+                ProviderFailureClass::PaymentRequired => payment_required = true,
+                ProviderFailureClass::Other => {}
+            }
+        }
+        // task_runs failures surface as the item's outcome; the ledger has
+        // already scheduled its own next_attempt_at backoff (layer 1).
+        if let ExecOutcome::Failed(error) = outcome {
+            match classify_provider_failure(error) {
+                ProviderFailureClass::RateLimited { .. } => rate_limited = true,
+                ProviderFailureClass::PaymentRequired => payment_required = true,
+                ProviderFailureClass::Other => {}
+            }
+        }
+
+        // Rate-limit first, credits second: when one execution somehow saw
+        // both, the credits pause (which also gates interactive routes) is
+        // the one that must win the shared kind column.
+        if rate_limited {
+            if let Err(e) = self.breaker.record_rate_limited(account_id).await {
+                tracing::warn!(account_id, error = %e, "[dispatcher] breaker rate-limit record failed");
+            }
+        }
+        let mut credits_until = None;
+        if payment_required {
+            // OpenRouter's key-usage endpoint exposes no reset timestamp
+            // (see provisioning_api::RuntimeKeyUsage), so the pause uses
+            // the configured recheck horizon.
+            match self.breaker.record_payment_required(account_id, None).await {
+                Ok(until) => credits_until = until,
+                Err(e) => {
+                    tracing::warn!(account_id, error = %e, "[dispatcher] breaker credits record failed")
+                }
+            }
+        }
+        if !rate_limited && !payment_required && matches!(outcome, ExecOutcome::Executed) {
+            if let Err(e) = self.breaker.record_healthy(account_id).await {
+                tracing::warn!(account_id, error = %e, "[dispatcher] breaker healthy record failed");
+            }
+        }
+
+        if !pipeline_failures.is_empty() {
+            if let Err(e) = self
+                .requeue_pipeline_failures(core, pipeline_failures, credits_until)
+                .await
+            {
+                tracing::warn!(
+                    account_id,
+                    error = %e,
+                    "[dispatcher] re-enqueue of classified pipeline failures failed; \
+                     the atoms stay status=failed until a manual retry"
+                );
+            }
+        }
+    }
+
+    /// Layer 1 for the pipeline ledger: core settles a failed job as
+    /// terminal (atom status `failed`, row cleared), so rate-limit/credits
+    /// failures — which WILL succeed later — are re-enqueued here with
+    /// `not_before` pushed past the provider's horizon. The enqueue
+    /// re-derives stage flags from durable state: a failed embedding
+    /// re-requests embedding (plus tagging iff the atom's tagging is still
+    /// pending — never invent a tagging request the save path didn't make);
+    /// a failed tagging re-requests tagging alone.
+    async fn requeue_pipeline_failures(
+        &self,
+        core: &AtomicCore,
+        failures: Vec<PipelineFailure>,
+        credits_until: Option<DateTime<Utc>>,
+    ) -> Result<(), CloudError> {
+        let now = Utc::now();
+        let mut requests = Vec::new();
+        for failure in failures {
+            let not_before = match failure.class {
+                ProviderFailureClass::RateLimited { retry_after_secs } => {
+                    let delay = retry_after_secs
+                        .map(Duration::from_secs)
+                        .unwrap_or(RATE_LIMIT_REQUEUE_DELAY);
+                    now + chrono::Duration::from_std(delay).unwrap_or_default()
+                }
+                ProviderFailureClass::PaymentRequired => credits_until.unwrap_or_else(|| {
+                    now + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY).unwrap_or_default()
+                }),
+                // Genuine failures stay settled; retrying them is the
+                // user's call (the existing retry routes).
+                ProviderFailureClass::Other => continue,
+            };
+            let (embed_requested, tag_requested) = if failure.embedding_stage {
+                let tagging_pending = core
+                    .get_atom(&failure.atom_id)
+                    .await
+                    .map_err(CloudError::core("reading atom for pipeline re-enqueue"))?
+                    .map(|found| found.atom.tagging_status == "pending")
+                    .unwrap_or(false);
+                (true, tagging_pending)
+            } else {
+                (false, true)
+            };
+            requests.push(AtomPipelineJobRequest {
+                atom_id: failure.atom_id,
+                embed_requested,
+                tag_requested,
+                not_before: Some(not_before.to_rfc3339()),
+                reason: "provider-backoff".to_string(),
+                replace_existing: false,
+            });
+        }
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let count = requests.len();
+        core.enqueue_pipeline_jobs(&requests)
+            .await
+            .map_err(CloudError::core("re-enqueueing backed-off pipeline jobs"))?;
+        tracing::info!(
+            count,
+            "[dispatcher] re-enqueued provider-limited pipeline jobs"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -232,18 +421,43 @@ impl WorkExecutor for CoreExecutor {
     async fn execute(&self, account_id: &str, item: &WorkItem) -> Result<ExecOutcome, CloudError> {
         let (core, handle) = self.resolve(account_id, item.db_id()).await?;
         let event_tx = handle.event_tx.clone();
-        match item {
+        let mut pipeline_failures = Vec::new();
+        let outcome = match item {
             WorkItem::PipelineBatch { batch, .. } => {
+                // Per-job failures settle on the jobs themselves (status
+                // columns + queue events) and never surface in the return
+                // value — collect them off the event stream, classified,
+                // for the backpressure pass below.
+                let failures: Arc<Mutex<Vec<PipelineFailure>>> = Arc::default();
+                let forward = event_bridge::embedding_event_callback(event_tx);
+                let sink = Arc::clone(&failures);
                 let claimed = core
-                    .run_pipeline_jobs_batch(
-                        *batch,
-                        event_bridge::embedding_event_callback(event_tx),
-                    )
+                    .run_pipeline_jobs_batch(*batch, move |event: EmbeddingEvent| {
+                        let observed = match &event {
+                            EmbeddingEvent::EmbeddingFailed { atom_id, error } => {
+                                Some((atom_id.clone(), true, error))
+                            }
+                            EmbeddingEvent::TaggingFailed { atom_id, error } => {
+                                Some((atom_id.clone(), false, error))
+                            }
+                            _ => None,
+                        };
+                        if let Some((atom_id, embedding_stage, error)) = observed {
+                            sink.lock()
+                                .expect("failure sink poisoned")
+                                .push(PipelineFailure {
+                                    atom_id,
+                                    embedding_stage,
+                                    class: classify_provider_failure(error),
+                                });
+                        }
+                        forward(event);
+                    })
                     .await
                     .map_err(CloudError::core("running pipeline batch"))?;
-                // Per-job failures settle on the jobs themselves (status
-                // columns + queue events); the batch as a unit "executed"
-                // iff the claim returned work.
+                pipeline_failures =
+                    std::mem::take(&mut *failures.lock().expect("failure sink poisoned"));
+                // The batch as a unit "executed" iff the claim returned work.
                 Ok(if claimed > 0 {
                     ExecOutcome::Executed
                 } else {
@@ -341,7 +555,11 @@ impl WorkExecutor for CoreExecutor {
                     reports::RunOutcome::Skipped => Ok(ExecOutcome::Skipped),
                 }
             }
-        }
+        }?;
+
+        self.settle_backpressure(account_id, &core, &outcome, pipeline_failures)
+            .await;
+        Ok(outcome)
     }
 }
 
@@ -385,43 +603,38 @@ pub struct Dispatcher {
     pools: Arc<WorkerPools>,
     executor: Arc<dyn WorkExecutor>,
     config: DispatcherConfig,
-    /// Whether `accounts.provider_paused_until` exists (it ships with the
-    /// circuit-breaker phase; this phase gates on its presence so the pause
-    /// check is live the moment the column lands). Detected once at build.
-    pause_column_present: bool,
     last_slow_scan: Mutex<Option<Instant>>,
 }
 
 impl Dispatcher {
     /// Production construction: real [`CoreExecutor`] over the same cache
     /// the serving stack uses (so workers publish into the channels live
-    /// WebSocket clients hold).
-    pub async fn new(
-        control: ControlPlane,
-        cache: Arc<AccountCache>,
-        config: DispatcherConfig,
-    ) -> Result<Self, CloudError> {
-        let executor = Arc::new(CoreExecutor::new(Arc::clone(&cache)));
-        Self::with_executor(control, cache, config, executor).await
+    /// WebSocket clients hold), feeding a [`ProviderBreaker`] over the same
+    /// control plane the pause gate reads.
+    pub fn new(control: ControlPlane, cache: Arc<AccountCache>, config: DispatcherConfig) -> Self {
+        let breaker = Arc::new(ProviderBreaker::new(
+            control.clone(),
+            config.breaker.clone(),
+        ));
+        let executor = Arc::new(CoreExecutor::new(Arc::clone(&cache), breaker));
+        Self::with_executor(control, cache, config, executor)
     }
 
     /// Test seam: same dispatcher, custom executor.
-    pub async fn with_executor(
+    pub fn with_executor(
         control: ControlPlane,
         cache: Arc<AccountCache>,
         config: DispatcherConfig,
         executor: Arc<dyn WorkExecutor>,
-    ) -> Result<Self, CloudError> {
-        let pause_column_present = pause_column_exists(&control).await?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             control,
             cache,
             pools: Arc::new(WorkerPools::new(config.pools)),
             executor,
             config,
-            pause_column_present,
             last_slow_scan: Mutex::new(None),
-        })
+        }
     }
 
     /// The pools, for instrumentation in tests and metrics.
@@ -664,14 +877,15 @@ impl Dispatcher {
     }
 
     /// The tenant-pause gate (plan: per-tenant circuit breaker). The
-    /// breaker phase writes `accounts.provider_paused_until`; until the
-    /// column exists this returns the empty set. Failures fail open with a
-    /// warning — an unreadable pause column must not stop all dispatch.
+    /// [`ProviderBreaker`] writes `accounts.provider_paused_until`
+    /// (migration 007); both pause kinds hold background dispatch.
+    /// Failures fail open with a warning — an unreadable pause column must
+    /// not stop all dispatch.
     async fn paused_accounts(
         &self,
         candidates: &[(String, Option<DateTime<Utc>>)],
     ) -> HashSet<String> {
-        if !self.pause_column_present || candidates.is_empty() {
+        if candidates.is_empty() {
             return HashSet::new();
         }
         let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
@@ -798,20 +1012,4 @@ struct TenantPoll {
     /// produced no item this tick, e.g. a backed-off retry) — the "keep
     /// the hint" signal.
     ledger_active: bool,
-}
-
-/// Whether `accounts.provider_paused_until` exists yet (see
-/// [`Dispatcher::paused_accounts`]).
-async fn pause_column_exists(control: &ControlPlane) -> Result<bool, CloudError> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = 'accounts'
-              AND column_name = 'provider_paused_until'
-         )",
-    )
-    .fetch_one(control.pool())
-    .await
-    .map_err(CloudError::db("checking for provider_paused_until column"))
 }

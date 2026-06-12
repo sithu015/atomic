@@ -26,6 +26,7 @@
 pub mod account_cache;
 pub mod account_plane;
 pub mod auth;
+pub mod backpressure;
 pub mod control_plane;
 pub mod curated_models;
 pub mod dispatch_hints;
@@ -52,6 +53,10 @@ pub use account_plane::{
     AccountPlane, AccountPlaneConfig, RateLimits, DEFAULT_MAX_CONCURRENT_PROVISIONS, SESSION_TTL,
 };
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
+pub use backpressure::{
+    ai_interactive_route, out_of_credits_guard, BreakerConfig, PauseKind, ProviderBreaker,
+    ProviderPause,
+};
 pub use control_plane::ControlPlane;
 pub use curated_models::{
     merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
@@ -62,7 +67,7 @@ pub use dispatch_hints::{
 };
 pub use dispatcher::{
     CoreExecutor, Dispatcher, DispatcherConfig, ExecOutcome, TenantQueue, TickOutcome,
-    WorkExecutor, WorkItem,
+    WorkExecutor, WorkItem, RATE_LIMIT_REQUEUE_DELAY,
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;

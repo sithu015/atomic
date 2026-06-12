@@ -106,6 +106,7 @@ use tokio::sync::broadcast;
 
 use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
+use crate::backpressure::out_of_credits_guard;
 use crate::control_plane::ControlPlane;
 use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
@@ -297,10 +298,15 @@ pub fn configure_cloud_app(
                 .app_data(web::Data::new(DispatchHintWriter::new(control)))
                 // Execution order is outermost-last-registered: auth
                 // resolves the tenant, the guard fails closed / unroutes the
-                // fallback-bound planes, and only then does the hint writer
-                // see the request — so unrouted planes and unauthenticated
-                // requests never mark hints.
+                // fallback-bound planes, the credits guard 402s the
+                // AI-interactive routes while the tenant's credits pause is
+                // in force (crate::backpressure — a denied request never
+                // reaches a handler, so it also never marks a hint), and
+                // only then does the hint writer see the request — so
+                // unrouted planes and unauthenticated requests never mark
+                // hints.
                 .wrap(from_fn(mark_hint_on_mutation))
+                .wrap(from_fn(out_of_credits_guard))
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth),
         );

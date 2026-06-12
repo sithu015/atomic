@@ -25,10 +25,10 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, list_hinted_accounts, mark_hint, provision_account,
     set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
-    AccountPlaneConfig, CloudAuth, CloudError, ClusterConfig, ControlPlane, CoreExecutor,
-    CredentialOrigin, Dispatcher, DispatcherConfig, ExecOutcome, FallbackAppState, ManagedKeys,
-    NewAccount, NewCredentials, PoolCaps, Provider, SecretKey, TenantPlane, TenantQueue,
-    TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
+    AccountPlaneConfig, BreakerConfig, CloudAuth, CloudError, ClusterConfig, ControlPlane,
+    CoreExecutor, CredentialOrigin, Dispatcher, DispatcherConfig, ExecOutcome, FallbackAppState,
+    ManagedKeys, NewAccount, NewCredentials, PoolCaps, Provider, ProviderBreaker, SecretKey,
+    TenantPlane, TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
 };
 use atomic_core::models::{TaskRunState, TaskRunTrigger};
 use atomic_core::{DatabaseManager, TaskRun};
@@ -86,6 +86,7 @@ fn test_config(pools: WorkerPoolsConfig) -> DispatcherConfig {
         pipeline_batch_size: 4,
         reports_per_tenant_cap: 1,
         pools,
+        breaker: BreakerConfig::default(),
     }
 }
 
@@ -418,9 +419,7 @@ async fn round_robin_interleaves_tenants_fairly() {
                 ..WorkerPoolsConfig::default()
             }),
             recorder.clone(),
-        )
-        .await
-        .expect("build dispatcher");
+        );
 
         let mut queues: VecDeque<TenantQueue> = VecDeque::from([
             TenantQueue {
@@ -475,9 +474,7 @@ async fn pool_caps_respected_under_load() {
                 ..WorkerPoolsConfig::default()
             }),
             recorder.clone(),
-        )
-        .await
-        .expect("build dispatcher");
+        );
 
         let mut queues: VecDeque<TenantQueue> = VecDeque::from([
             TenantQueue {
@@ -536,9 +533,7 @@ async fn reports_per_tenant_override_serializes_reports() {
                 dispatch_cache(&control),
                 test_config(WorkerPoolsConfig::default()), // llm: 16 total / 2 per-tenant
                 recorder.clone(),
-            )
-            .await
-            .expect("build dispatcher");
+            );
 
             let items: VecDeque<WorkItem> = VecDeque::from([
                 WorkItem::Report {
@@ -619,21 +614,17 @@ async fn two_dispatchers_execute_each_ledger_row_once() {
                     .await
                     .expect("load tenant");
                 receivers.push(handle.event_tx.subscribe());
-                dispatchers.push(
-                    Dispatcher::new(
-                        control.clone(),
-                        cache,
-                        DispatcherConfig {
-                            // Small batches so the pods interleave claims
-                            // over the six rows instead of one pod taking
-                            // everything in a single claim.
-                            pipeline_batch_size: 2,
-                            ..test_config(WorkerPoolsConfig::default())
-                        },
-                    )
-                    .await
-                    .expect("build dispatcher"),
-                );
+                dispatchers.push(Dispatcher::new(
+                    control.clone(),
+                    cache,
+                    DispatcherConfig {
+                        // Small batches so the pods interleave claims
+                        // over the six rows instead of one pod taking
+                        // everything in a single claim.
+                        pipeline_batch_size: 2,
+                        ..test_config(WorkerPoolsConfig::default())
+                    },
+                ));
             }
 
             // Enqueue six durable pipeline rows through an inline-off core
@@ -770,16 +761,19 @@ async fn expired_lease_is_reclaimed_and_completed() {
 
             // "Pod 2": a fresh dispatcher reclaims and completes it.
             let cache = dispatch_cache(&control);
-            let counting = CountingExecutor::new(Arc::new(CoreExecutor::new(Arc::clone(&cache))));
+            let breaker = Arc::new(ProviderBreaker::new(
+                control.clone(),
+                BreakerConfig::default(),
+            ));
+            let counting =
+                CountingExecutor::new(Arc::new(CoreExecutor::new(Arc::clone(&cache), breaker)));
             let executor: Arc<dyn WorkExecutor> = counting.clone();
             let dispatcher = Dispatcher::with_executor(
                 control.clone(),
                 cache,
                 test_config(WorkerPoolsConfig::default()),
                 executor,
-            )
-            .await
-            .expect("build dispatcher");
+            );
 
             let outcome = dispatcher.tick().await;
             for handle in outcome.handles {
@@ -826,9 +820,7 @@ async fn tick_clears_hint_for_idle_tenant() {
             Arc::clone(&cache),
             test_config(WorkerPoolsConfig::default()),
             RecordingExecutor::new(Duration::ZERO),
-        )
-        .await
-        .expect("build dispatcher");
+        );
 
         let outcome = dispatcher.tick().await;
         for handle in outcome.handles {
@@ -859,16 +851,12 @@ async fn hint_marked_mid_tick_survives() {
         disable_system_tasks(&tenant).await;
 
         let cache = dispatch_cache(&control);
-        let dispatcher = Arc::new(
-            Dispatcher::with_executor(
-                control.clone(),
-                Arc::clone(&cache),
-                test_config(WorkerPoolsConfig::default()),
-                RecordingExecutor::new(Duration::ZERO),
-            )
-            .await
-            .expect("build dispatcher"),
-        );
+        let dispatcher = Arc::new(Dispatcher::with_executor(
+            control.clone(),
+            Arc::clone(&cache),
+            test_config(WorkerPoolsConfig::default()),
+            RecordingExecutor::new(Duration::ZERO),
+        ));
 
         let mut survived = false;
         for _ in 0..5 {
@@ -897,10 +885,11 @@ async fn hint_marked_mid_tick_survives() {
     .await;
 }
 
-/// The tenant pause gate: with `accounts.provider_paused_until` present
-/// (added here exactly as the circuit-breaker phase will) and in the
-/// future, the tenant is skipped wholesale — nothing polled, nothing
-/// executed, hint untouched. Once the pause lapses, dispatch resumes.
+/// The tenant pause gate (`accounts.provider_paused_until`, migration 007):
+/// a tenant paused into the future is skipped wholesale — nothing polled,
+/// nothing executed, hint untouched — while a healthy tenant in the same
+/// tick proceeds (fairness: the pause is per-tenant, never a tick stall).
+/// Once the pause lapses, dispatch resumes.
 #[tokio::test]
 async fn paused_tenant_is_skipped_until_pause_lapses() {
     with_control_db(
@@ -908,13 +897,14 @@ async fn paused_tenant_is_skipped_until_pause_lapses() {
         |url| async move {
             let control = connect_control(&url).await;
             let tenant = provision_tenant(&control, None, "alpha").await;
+            // A second, healthy tenant: its due work (a fresh tenant always
+            // has draft_pipeline due) must dispatch in the same tick that
+            // skips the paused one.
+            let healthy = provision_tenant(&control, None, "bravo").await;
 
-            sqlx::query("ALTER TABLE accounts ADD COLUMN provider_paused_until TIMESTAMPTZ")
-                .execute(control.pool())
-                .await
-                .expect("add pause column");
             sqlx::query(
-                "UPDATE accounts SET provider_paused_until = NOW() + interval '1 hour' \
+                "UPDATE accounts SET provider_paused_until = NOW() + interval '1 hour', \
+                     provider_pause_kind = 'rate_limit' \
                  WHERE id = $1",
             )
             .bind(&tenant.account_id)
@@ -923,30 +913,46 @@ async fn paused_tenant_is_skipped_until_pause_lapses() {
             .expect("pause tenant");
 
             mark_hint(&control, &tenant.account_id).await.expect("mark");
+            mark_hint(&control, &healthy.account_id)
+                .await
+                .expect("mark healthy");
 
-            // Built AFTER the column exists, so detection finds it.
             let recorder = RecordingExecutor::new(Duration::ZERO);
             let dispatcher = Dispatcher::with_executor(
                 control.clone(),
                 dispatch_cache(&control),
                 test_config(WorkerPoolsConfig::default()),
                 recorder.clone(),
-            )
-            .await
-            .expect("build dispatcher");
+            );
 
             let outcome = dispatcher.tick().await;
             for handle in outcome.handles {
                 handle.await.expect("worker task");
             }
-            assert_eq!(outcome.polled, 0, "paused tenant must not be polled");
+            assert_eq!(
+                outcome.polled, 1,
+                "only the healthy tenant polls; the paused one is skipped"
+            );
             assert!(
-                recorder.completions().is_empty(),
+                !recorder
+                    .completions()
+                    .iter()
+                    .any(|(acct, _)| acct == &tenant.account_id),
                 "paused tenant must not execute work"
             );
-            assert_eq!(
-                list_hinted_accounts(&control).await.unwrap().len(),
-                1,
+            assert!(
+                recorder
+                    .completions()
+                    .iter()
+                    .any(|(acct, _)| acct == &healthy.account_id),
+                "the healthy tenant's due work must dispatch in the same tick"
+            );
+            assert!(
+                list_hinted_accounts(&control)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.account_id == tenant.account_id),
                 "the pause must not clear the hint — work waits, not vanishes"
             );
 
@@ -1022,19 +1028,15 @@ impl DispatcherHarness {
 
         // The dispatcher over the SAME cache the server resolves tenants
         // through — workers publish into the channels WS clients hold.
-        let dispatcher = Arc::new(
-            Dispatcher::new(
-                control.clone(),
-                Arc::clone(&cache),
-                DispatcherConfig {
-                    tick_interval: Duration::from_millis(100),
-                    slow_scan_interval: Duration::from_secs(2),
-                    ..DispatcherConfig::default()
-                },
-            )
-            .await
-            .expect("build dispatcher"),
-        );
+        let dispatcher = Arc::new(Dispatcher::new(
+            control.clone(),
+            Arc::clone(&cache),
+            DispatcherConfig {
+                tick_interval: Duration::from_millis(100),
+                slow_scan_interval: Duration::from_secs(2),
+                ..DispatcherConfig::default()
+            },
+        ));
         let dispatcher_loop = tokio::spawn(dispatcher.run_loop());
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");

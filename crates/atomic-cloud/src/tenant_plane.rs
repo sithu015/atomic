@@ -54,15 +54,18 @@
 //!   stored. A same-dimension embedding-model change returns a loud
 //!   `reembed_warning` — every stored vector is invalidated by it.
 //!
-//! **Live rotation** (plan steps 1-5): after any successful write the fresh
+//! **Live rotation** (plan steps 1-6): after any successful write the fresh
 //! [`ProviderConfig`] is applied to the account's cached entry via
 //! [`AccountCache::update_provider_config`] — an in-place swap, not an
 //! eviction, so in-flight operations finish on the config they started with
-//! and open WebSockets are untouched. Step 6 (clearing
-//! `accounts.provider_paused_until` when the circuit breaker is open)
-//! arrives with the dispatcher slice, which owns the breaker itself. The
-//! three mutating routes are serialized per account ([`AccountLocks`]) so
-//! the stored and live configs cannot diverge under concurrent writes.
+//! and open WebSockets are untouched. Step 6 — clearing the circuit
+//! breaker's pause (`accounts.provider_paused_until` + kind + streak) — is
+//! not handled here at all: it rides the same statement/transaction as the
+//! credential write's `provider_generation` bump (see
+//! `crate::provider_credentials`), so a rotation and its fresh chance are
+//! atomic by construction. The three mutating routes are serialized per
+//! account ([`AccountLocks`]) so the stored and live configs cannot diverge
+//! under concurrent writes.
 //!
 //! # `DELETE /api/account` (plan: "Provisioning lifecycle" → "Account deletion")
 //!

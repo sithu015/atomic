@@ -41,6 +41,38 @@ pub struct MockAiServer {
     counters: Arc<MockAiCounters>,
 }
 
+/// An injectable failure response, served instead of the normal payload
+/// while set (see [`MockAiServer::set_embedding_failure`] /
+/// [`MockAiServer::set_chat_failure`]). Lets tests exercise providers'
+/// status-code handling — retry/backoff behavior, rate-limit hints,
+/// billing rejections — against the real HTTP clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedFailure {
+    /// HTTP 429, optionally carrying a `Retry-After: <secs>` header.
+    RateLimited { retry_after_secs: Option<u64> },
+    /// HTTP 402 with a provider-style error body.
+    PaymentRequired,
+}
+
+impl InjectedFailure {
+    fn response(self) -> ResponseTemplate {
+        match self {
+            InjectedFailure::RateLimited { retry_after_secs } => {
+                let mut response = ResponseTemplate::new(429).set_body_json(json!({
+                    "error": { "message": "mock rate limit exceeded" }
+                }));
+                if let Some(secs) = retry_after_secs {
+                    response = response.insert_header("Retry-After", secs.to_string().as_str());
+                }
+                response
+            }
+            InjectedFailure::PaymentRequired => ResponseTemplate::new(402).set_body_json(json!({
+                "error": { "message": "mock insufficient credits" }
+            })),
+        }
+    }
+}
+
 #[derive(Default)]
 struct MockAiCounters {
     embedding_requests: AtomicUsize,
@@ -49,6 +81,11 @@ struct MockAiCounters {
     /// arrival order — lets tests assert *which* model an operation selected,
     /// not just that a call happened.
     chat_models: Mutex<Vec<String>>,
+    /// When set, `/v1/embeddings` serves this failure instead of embeddings.
+    embedding_failure: Mutex<Option<InjectedFailure>>,
+    /// When set, `/v1/chat/completions` serves this failure instead of a
+    /// completion.
+    chat_failure: Mutex<Option<InjectedFailure>>,
 }
 
 impl MockAiServer {
@@ -102,6 +139,26 @@ impl MockAiServer {
             .lock()
             .expect("chat_models lock")
             .clone()
+    }
+
+    /// Make `/v1/embeddings` fail with `failure` until cleared with `None`.
+    /// Requests are still counted while failing.
+    pub fn set_embedding_failure(&self, failure: Option<InjectedFailure>) {
+        *self
+            .counters
+            .embedding_failure
+            .lock()
+            .expect("embedding_failure lock") = failure;
+    }
+
+    /// Make `/v1/chat/completions` fail with `failure` until cleared with
+    /// `None`. Requests are still counted while failing.
+    pub fn set_chat_failure(&self, failure: Option<InjectedFailure>) {
+        *self
+            .counters
+            .chat_failure
+            .lock()
+            .expect("chat_failure lock") = failure;
     }
 
     pub fn reset_counts(&self) {
@@ -304,6 +361,14 @@ impl Respond for EmbedResponder {
         self.counters
             .embedding_requests
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(failure) = *self
+            .counters
+            .embedding_failure
+            .lock()
+            .expect("embedding_failure lock")
+        {
+            return failure.response();
+        }
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(_) => return ResponseTemplate::new(400),
@@ -338,6 +403,14 @@ struct ChatResponder {
 impl Respond for ChatResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(failure) = *self
+            .counters
+            .chat_failure
+            .lock()
+            .expect("chat_failure lock")
+        {
+            return failure.response();
+        }
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(_) => return ResponseTemplate::new(400),

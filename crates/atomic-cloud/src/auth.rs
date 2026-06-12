@@ -118,6 +118,14 @@ pub struct AuthPrincipal {
 pub struct ResolvedTenant {
     pub principal: AuthPrincipal,
     pub subdomain: String,
+    /// The account's provider circuit-breaker pause, read off the same
+    /// accounts row the auth lookup already pays for. `Some` whenever the
+    /// pause columns are set — consumers check
+    /// [`active_at`](crate::backpressure::ProviderPause::active_at)
+    /// themselves (an expired pause is inert, not an error). Only the
+    /// `credits` kind affects request handling (the `out_of_ai_credits`
+    /// guard); `rate_limit` pauses govern background dispatch alone.
+    pub provider_pause: Option<crate::backpressure::ProviderPause>,
 }
 
 /// Everything a request needs to be authenticated, shared across workers.
@@ -222,19 +230,32 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         .and_then(|host| subdomain_from_host(host, &ctx.base_domain))
         .ok_or_else(not_found)?;
 
-    // 2 — subdomain → account. The provider generation rides along on the
-    // lookup this middleware already makes per request (no auth caching),
-    // making the cache's rotation-convergence check in step 7 free.
-    let account: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT id, status, provider_generation FROM accounts WHERE subdomain = $1")
-            .bind(&subdomain)
-            .fetch_optional(ctx.control.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "account lookup failed");
-                internal_error()
-            })?;
-    let (account_id, status, provider_generation) = account.ok_or_else(not_found)?;
+    // 2 — subdomain → account. The provider generation and the circuit-
+    // breaker pause ride along on the lookup this middleware already makes
+    // per request (no auth caching), making the cache's rotation-convergence
+    // check in step 7 — and the out-of-credits guard — free.
+    type AccountRow = (
+        String,
+        String,
+        i64,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    );
+    let account: Option<AccountRow> = sqlx::query_as(
+        "SELECT id, status, provider_generation, provider_paused_until, provider_pause_kind \
+         FROM accounts WHERE subdomain = $1",
+    )
+    .bind(&subdomain)
+    .fetch_optional(ctx.control.pool())
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "account lookup failed");
+        internal_error()
+    })?;
+    let (account_id, status, provider_generation, paused_until, pause_kind) =
+        account.ok_or_else(not_found)?;
+    let provider_pause =
+        crate::backpressure::ProviderPause::from_columns(paused_until, pause_kind.as_deref());
     match status.as_str() {
         "active" => {}
         "provisioning" => return Err(account_provisioning()),
@@ -308,6 +329,7 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
     req.extensions_mut().insert(ResolvedTenant {
         principal,
         subdomain,
+        provider_pause,
     });
     Ok(())
 }

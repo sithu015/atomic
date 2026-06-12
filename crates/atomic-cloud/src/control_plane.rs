@@ -51,6 +51,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (5, include_str!("../migrations/005_provider_generation.sql")),
     (6, include_str!("../migrations/006_dispatch_hints.sql")),
+    (
+        7,
+        include_str!("../migrations/007_provider_backpressure.sql"),
+    ),
 ];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks
@@ -96,6 +100,14 @@ impl ControlPlane {
     /// The underlying connection pool, for control-plane queries.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Wrap an existing pool — for unit tests of components whose pure
+    /// logic never touches the database (e.g. the breaker's detection
+    /// window). Never used by production code paths.
+    #[cfg(test)]
+    pub(crate) fn from_pool_for_tests(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Resolve a subdomain to its `accounts.id`, regardless of account

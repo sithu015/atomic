@@ -448,6 +448,10 @@ impl DispatcherArgs {
                     per_tenant: self.maintenance_pool_per_tenant,
                 },
             },
+            // The breaker's numbers are the plan's (3×429 in 60s → 60s
+            // cooldown, doubling, 1h cap); promote to CLI flags when a real
+            // deployment needs to tune them.
+            breaker: atomic_cloud::BreakerConfig::default(),
         })
     }
 }
@@ -821,8 +825,7 @@ async fn serve(
                 slow_scan_secs = config.slow_scan_interval.as_secs(),
                 "dispatcher enabled; tenant pipeline execution runs in worker pools"
             );
-            let dispatcher =
-                Arc::new(Dispatcher::new(control.clone(), Arc::clone(&cache), config).await?);
+            let dispatcher = Arc::new(Dispatcher::new(control.clone(), Arc::clone(&cache), config));
             tokio::spawn(dispatcher.run_loop());
         }
         None => {

@@ -2498,6 +2498,27 @@ impl AtomicCore {
         .map_err(AtomicCoreError::Embedding)
     }
 
+    /// Enqueue pipeline-ledger rows without executing anything — the
+    /// companion write primitive to
+    /// [`run_pipeline_jobs_batch`](Self::run_pipeline_jobs_batch) for hosts
+    /// that drive the ledger from a dedicated worker. Unlike the save-path
+    /// enqueues, the caller controls every field of each
+    /// [`AtomPipelineJobRequest`](models::AtomPipelineJobRequest) —
+    /// including `not_before`, which is how a worker reschedules
+    /// transiently-failed work (e.g. honoring a provider's retry hint)
+    /// instead of leaving it terminally failed. Coalesces with any existing
+    /// row per the ledger's upsert semantics (flags OR together,
+    /// `not_before` takes the earliest). Returns the number of rows
+    /// written. Inert with respect to execution: with inline pipeline
+    /// execution on, the next save/startup pass picks the rows up; with it
+    /// off, the host's worker does.
+    pub async fn enqueue_pipeline_jobs(
+        &self,
+        jobs: &[models::AtomPipelineJobRequest],
+    ) -> Result<i32, AtomicCoreError> {
+        self.storage.enqueue_pipeline_jobs_sync(jobs).await
+    }
+
     // ==================== Ledger scanning ====================
     //
     // Read-only visibility into the two durable work ledgers
