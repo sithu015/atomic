@@ -556,6 +556,9 @@ impl DispatcherArgs {
 /// has been brought to the compiled schema target and the failure-rate
 /// policy admits. See `atomic_cloud::deploy` for the policy table and
 /// `atomic-cloud deploy status` / `deploy advance` for the operator surface.
+/// The per-tenant fields (connect timeout, retry backoff) are shared with
+/// the reaper's failed-migrations retry arm, so a reaper retry and a boot
+/// attempt run and record identically.
 #[derive(Args)]
 struct FleetArgs {
     /// Tenant databases migrating concurrently during the boot fleet run
@@ -586,6 +589,29 @@ struct FleetArgs {
         default_value_t = 10
     )]
     fleet_connect_timeout_secs: u64,
+
+    /// Base in seconds of the exponential backoff horizon recorded on a
+    /// failed tenant migration (`base * 2^retry_count`, capped below); the
+    /// always-running reaper retries the row once the horizon passes. One
+    /// flag feeds both writers of `migration_retry_after` — the boot fleet
+    /// runner and the reaper's retry arm — so they can never disagree on
+    /// backoff arithmetic.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MIGRATION_RETRY_BACKOFF_BASE_SECS",
+        default_value_t = 60
+    )]
+    migration_retry_backoff_base_secs: u64,
+
+    /// Ceiling in seconds on that backoff horizon. The reaper keeps
+    /// retrying at the cap; a row past 5 retries is escalated to an
+    /// error-level alert (plan: "alerts when retry_count > 5").
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MIGRATION_RETRY_BACKOFF_CAP_SECS",
+        default_value_t = 1800
+    )]
+    migration_retry_backoff_cap_secs: u64,
 
     /// Failure-rate threshold below which the deploy proceeds without
     /// operator action (plan: 1%). Sub-threshold failures are stragglers:
@@ -620,7 +646,14 @@ impl FleetArgs {
                 wall_clock_limit: std::time::Duration::from_secs(
                     self.fleet_migration_timeout_secs.max(1),
                 ),
-                ..FleetMigrationConfig::default()
+                // Zero base is legal ("retry on the very next reaper pass");
+                // only the cap needs a floor for the doubling to terminate.
+                retry_backoff_base: std::time::Duration::from_secs(
+                    self.migration_retry_backoff_base_secs,
+                ),
+                retry_backoff_cap: std::time::Duration::from_secs(
+                    self.migration_retry_backoff_cap_secs.max(1),
+                ),
             },
             DeployPolicy {
                 ready_failure_rate: self.deploy_ready_failure_rate,
