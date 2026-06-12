@@ -24,12 +24,13 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, list_hinted_accounts, mark_hint, provision_account,
-    set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
-    AccountPlaneConfig, BreakerConfig, ChatStreamLimiter, CloudAuth, CloudError, ClusterConfig,
-    ControlPlane, CoreExecutor, CredentialOrigin, Dispatcher, DispatcherConfig, ExecOutcome,
-    FallbackAppState, ManagedKeys, NewAccount, NewCredentials, PoolCaps, Provider, ProviderBreaker,
-    SecretKey, TenantPlane, TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem,
-    WorkerPoolsConfig, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    set_active_provider, tenant_schema_target, upsert_credentials, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, BreakerConfig, ChatStreamLimiter,
+    CloudAuth, CloudError, ClusterConfig, ControlPlane, CoreExecutor, CredentialOrigin, Dispatcher,
+    DispatcherConfig, ExecOutcome, FallbackAppState, ManagedKeys, NewAccount, NewCredentials,
+    PoolCaps, Provider, ProviderBreaker, Readiness, SecretKey, TenantPlane, TenantQueue,
+    TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use atomic_core::models::{TaskRunState, TaskRunTrigger};
 use atomic_core::{DatabaseManager, TaskRun};
@@ -989,6 +990,109 @@ async fn paused_tenant_is_skipped_until_pause_lapses() {
     .await;
 }
 
+/// Deploy gating's dispatcher arm (plan: "Schema migration on deploy"): a
+/// tenant whose `last_migrated_version` lags the compiled tenant schema
+/// target is mid-upgrade — its database may not yet carry the schema this
+/// binary's executors expect — so the tick skips it wholesale (nothing
+/// polled, nothing executed, hint untouched) while a current tenant in the
+/// same tick proceeds, exactly like the provider-pause hold above. Once the
+/// fleet runner (or the reaper) stamps the tenant current, dispatch resumes.
+#[tokio::test]
+async fn unmigrated_tenant_is_skipped_until_stamped_current() {
+    with_control_db(
+        "unmigrated_tenant_is_skipped_until_stamped_current",
+        |url| async move {
+            let control = connect_control(&url).await;
+            let tenant = provision_tenant(&control, None, "alpha").await;
+            // A second, current tenant: its due work (a fresh tenant always
+            // has draft_pipeline due) must dispatch in the same tick that
+            // skips the lagging one.
+            let healthy = provision_tenant(&control, None, "bravo").await;
+
+            // Provisioning stamps the compiled target; rewind alpha to
+            // simulate a tenant a deploy hasn't migrated yet. (The database
+            // itself is current — the gate keys on the stamp, the same
+            // predicate CloudAuth's straggler 503 reads.)
+            sqlx::query(
+                "UPDATE account_databases SET last_migrated_version = $2 WHERE account_id = $1",
+            )
+            .bind(&tenant.account_id)
+            .bind(tenant_schema_target() - 1)
+            .execute(control.pool())
+            .await
+            .expect("rewind migration stamp");
+
+            mark_hint(&control, &tenant.account_id).await.expect("mark");
+            mark_hint(&control, &healthy.account_id)
+                .await
+                .expect("mark healthy");
+
+            let recorder = RecordingExecutor::new(Duration::ZERO);
+            let dispatcher = Dispatcher::with_executor(
+                control.clone(),
+                dispatch_cache(&control),
+                test_config(WorkerPoolsConfig::default()),
+                recorder.clone(),
+            );
+
+            let outcome = dispatcher.tick().await;
+            for handle in outcome.handles {
+                handle.await.expect("worker task");
+            }
+            assert_eq!(
+                outcome.polled, 1,
+                "only the current tenant polls; the mid-upgrade one is skipped"
+            );
+            assert!(
+                !recorder
+                    .completions()
+                    .iter()
+                    .any(|(acct, _)| acct == &tenant.account_id),
+                "a mid-upgrade tenant must not execute work"
+            );
+            assert!(
+                recorder
+                    .completions()
+                    .iter()
+                    .any(|(acct, _)| acct == &healthy.account_id),
+                "the current tenant's due work must dispatch in the same tick"
+            );
+            assert!(
+                list_hinted_accounts(&control)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.account_id == tenant.account_id),
+                "the hold must not clear the hint — work waits, not vanishes"
+            );
+
+            // The fleet runner stamps the tenant current → dispatch resumes.
+            sqlx::query(
+                "UPDATE account_databases SET last_migrated_version = $2 WHERE account_id = $1",
+            )
+            .bind(&tenant.account_id)
+            .bind(tenant_schema_target())
+            .execute(control.pool())
+            .await
+            .expect("stamp current");
+
+            let outcome = dispatcher.tick().await;
+            for handle in outcome.handles {
+                handle.await.expect("worker task");
+            }
+            assert!(outcome.polled >= 1, "stamped tenant polls again");
+            assert!(
+                recorder
+                    .completions()
+                    .iter()
+                    .any(|(acct, _)| acct == &tenant.account_id),
+                "the stamped tenant's due work must dispatch"
+            );
+        },
+    )
+    .await;
+}
+
 // ==================== Full e2e: HTTP → hint → pool → WS ====================
 
 type WsStream =
@@ -1049,6 +1153,9 @@ impl DispatcherHarness {
         let state = fallback.data();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        // This harness runs no fleet gate; the deploy-gating suite owns
+        // readiness behavior.
+        let readiness = Readiness::ready(control.clone());
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -1057,6 +1164,7 @@ impl DispatcherHarness {
                 tenant_plane.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
+                readiness.clone(),
             ))
         })
         .workers(1)

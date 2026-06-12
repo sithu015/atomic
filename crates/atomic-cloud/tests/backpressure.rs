@@ -30,7 +30,7 @@ use atomic_cloud::{
     set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
     AccountPlaneConfig, BreakerConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
     CredentialOrigin, Dispatcher, DispatcherConfig, FallbackAppState, ManagedKeys, NewAccount,
-    NewCredentials, Provider, ProviderBreaker, SecretKey, TenantPlane, TokenScope,
+    NewCredentials, Provider, ProviderBreaker, Readiness, SecretKey, TenantPlane, TokenScope,
     DEFAULT_CHAT_STREAMS_PER_ACCOUNT, DEFAULT_RETRY_AFTER_CAP,
 };
 use atomic_core::models::{TaskRun, TaskRunState};
@@ -518,6 +518,9 @@ impl Harness {
         let state = fallback.data();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        // This harness runs no fleet gate; the deploy-gating suite owns
+        // readiness behavior.
+        let readiness = Readiness::ready(control.clone());
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -526,6 +529,7 @@ impl Harness {
                 tenant_plane.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
+                readiness.clone(),
             ))
         })
         .workers(1)

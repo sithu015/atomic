@@ -30,6 +30,7 @@ pub mod backpressure;
 pub mod chat_streams;
 pub mod control_plane;
 pub mod curated_models;
+pub mod deploy;
 pub mod dispatch_hints;
 pub mod dispatcher;
 pub mod email;
@@ -68,6 +69,11 @@ pub use curated_models::{
     merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
     MANAGED_LLM_MODELS, PINNED_EMBEDDING_DIMENSION,
 };
+pub use deploy::{
+    advance_deploy, deploy_run_status, evaluate_policy, finish_deploy_run, latest_deploy_run,
+    run_fleet_gate, start_deploy_run, AdvanceOutcome, DeployPolicy, DeployRun, DeployStatus,
+    Readiness,
+};
 pub use dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint, DispatchHint,
 };
@@ -78,8 +84,9 @@ pub use dispatcher::{
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
 pub use fleet_migration::{
-    list_unmigrated, record_migration_failure, record_migration_success, tenant_schema_target,
-    UnmigratedTenant, MIGRATION_ERROR_MAX_LEN,
+    list_failed_migrations, list_unmigrated, migration_backoff_horizon, record_migration_failure,
+    record_migration_success, tenant_schema_target, FailedTenantMigration, FleetMigrationConfig,
+    FleetMigrator, FleetRunOutcome, UnmigratedTenant, MIGRATION_ERROR_MAX_LEN,
 };
 pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
 pub use magic_links::{

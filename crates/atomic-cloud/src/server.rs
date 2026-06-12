@@ -5,7 +5,13 @@
 //! binary listens on. The composition is deliberately narrower than the
 //! self-hosted server's [`configure_app`](atomic_server::app::configure_app):
 //!
-//! - `GET /health` — public, no auth on any host.
+//! - `GET /health` — public, no auth on any host: liveness, always up.
+//! - `GET /ready` — public, no auth on any host: deploy-gated readiness
+//!   ([`crate::deploy::Readiness`]). 503 `{"status":"migrating", ...}`
+//!   while the boot fleet migration runs, 503 with the holding status when
+//!   the failure-rate policy held the pod back, 200 once it admits (or an
+//!   operator runs `deploy advance`). Liveness and readiness are split
+//!   exactly so orchestrators keep migrating pods alive but unrouted.
 //! - **The account plane** ([`crate::account_plane`]) — `POST
 //!   /signup/request-link`, `POST /login/request-link`, `GET
 //!   /signup/complete`, and `GET /login/complete`, served only on the
@@ -109,6 +115,7 @@ use crate::auth::CloudAuth;
 use crate::backpressure::out_of_credits_guard;
 use crate::chat_streams::{chat_stream_guard, ChatStreamLimiter};
 use crate::control_plane::ControlPlane;
+use crate::deploy::Readiness;
 use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
 use crate::tenant_plane::TenantPlane;
@@ -247,6 +254,13 @@ async fn cloud_ws(
     ws::start_event_session(&req, stream, events.0)
 }
 
+/// The public readiness probe (module docs): delegates to
+/// [`Readiness::probe`], which owns the state machine and the
+/// awaiting-review advance re-check.
+async fn ready(readiness: web::Data<Readiness>) -> HttpResponse {
+    readiness.probe().await
+}
+
 /// Build the cloud application's route table as a [`web::ServiceConfig`]
 /// closure, suitable for `App::new().configure(...)` — the multi-tenant
 /// counterpart of atomic-server's `configure_app`. See the module docs for
@@ -273,6 +287,10 @@ async fn cloud_ws(
 ///   ([`crate::chat_streams`]). MUST be one process-wide instance cloned
 ///   into every worker's call (it counts in memory; a per-worker instance
 ///   would multiply the cap by the worker count).
+/// - `readiness` — this process's deploy-gated readiness handle
+///   ([`crate::deploy::Readiness`]), served publicly at `/ready`. Like the
+///   chat limiter, it must be the one process-wide instance: `serve`'s
+///   fleet gate flips exactly this handle.
 ///
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
@@ -284,9 +302,16 @@ pub fn configure_cloud_app(
     tenant_plane: TenantPlane,
     control: ControlPlane,
     chat_streams: ChatStreamLimiter,
+    readiness: Readiness,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     move |cfg: &mut web::ServiceConfig| {
-        cfg.app_data(state).route("/health", web::get().to(health));
+        cfg.app_data(state)
+            .route("/health", web::get().to(health))
+            .service(
+                web::resource("/ready")
+                    .app_data(web::Data::new(readiness))
+                    .route(web::get().to(ready)),
+            );
         account_plane.configure(cfg);
         // Before api_scope: its exact-path /api/account resource must win
         // the route match over the /api scope.

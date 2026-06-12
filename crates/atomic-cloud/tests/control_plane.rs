@@ -264,9 +264,20 @@ async fn migration_008_backfills_preexisting_active_rows() {
             assert_eq!(version, 0, "non-active rows keep the column default");
             assert!(at.is_none());
 
-            // The runner sees the manual application as already-current.
+            // The runner sees the manual application as current through 008
+            // and applies exactly the migrations past it (009+ — counted
+            // against the final version so adding migration N just works),
+            // never re-running 008 against the backfilled rows.
             let applied = control.initialize().await.expect("initialize");
-            assert_eq!(applied, 0, "schema is current after manual 008");
+            let current: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(control.pool())
+                .await
+                .expect("read schema version");
+            assert_eq!(
+                applied as i32,
+                current - 8,
+                "the runner applies only the post-008 migrations"
+            );
         },
     )
     .await;

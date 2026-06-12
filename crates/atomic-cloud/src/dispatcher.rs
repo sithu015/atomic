@@ -14,10 +14,17 @@
 //! 1. **Scan** ([`Dispatcher::tick`]): read `dispatch_hints` (fast path —
 //!    only tenants something has marked); on the slow-scan interval, add
 //!    *every* active account (the bound on hint loss; see
-//!    [`crate::dispatch_hints`]). Tenants whose `provider_paused_until` is
-//!    in the future are skipped wholesale — the provider circuit breaker
-//!    ([`crate::backpressure`]) writes that column; their ledger work sits
-//!    durably until the pause lapses or a provider mutation clears it.
+//!    [`crate::dispatch_hints`]). Two per-tenant holds skip a candidate
+//!    wholesale (work sits durably in its ledgers, hints untouched):
+//!    tenants whose `provider_paused_until` is in the future — the provider
+//!    circuit breaker ([`crate::backpressure`]) writes that column; the
+//!    pause lapses or a provider mutation clears it — and tenants whose
+//!    `last_migrated_version` lags the compiled tenant schema target. The
+//!    latter is deploy gating's dispatcher arm
+//!    ([`crate::fleet_migration`]): a mid-upgrade tenant's database is
+//!    behind the schema this binary's work executors expect, exactly the
+//!    state CloudAuth 503s on the request path, so background work waits
+//!    until the fleet runner (or the reaper) stamps the tenant current.
 //! 2. **Poll** each candidate tenant (the plan's N+1 poll): resolve its
 //!    [`TenantHandle`] through the [`AccountCache`], fan over its knowledge
 //!    bases, and translate ledger state into [`WorkItem`]s — claimable
@@ -808,13 +815,14 @@ impl Dispatcher {
                 return outcome;
             }
         };
-        let paused = self.paused_accounts(&candidates).await;
+        let held = self.held_accounts(&candidates).await;
 
         let mut queues: VecDeque<TenantQueue> = VecDeque::new();
         for (account_id, hint_stamp) in candidates {
-            if paused.contains(&account_id) {
-                // Dispatch is paused, not the work: the hint (and the
-                // ledger rows behind it) stay put for when the pause lifts.
+            if held.contains(&account_id) {
+                // Dispatch is held (provider pause or mid-upgrade tenant),
+                // not the work: the hint (and the ledger rows behind it)
+                // stay put for when the hold lifts.
                 continue;
             }
             outcome.polled += 1;
@@ -1022,12 +1030,25 @@ impl Dispatcher {
             .expect("slow-scan marker poisoned") = Some(Instant::now());
     }
 
-    /// The tenant-pause gate (plan: per-tenant circuit breaker). The
-    /// [`ProviderBreaker`] writes `accounts.provider_paused_until`
-    /// (migration 007); both pause kinds hold background dispatch.
-    /// Failures fail open with a warning — an unreadable pause column must
-    /// not stop all dispatch.
-    async fn paused_accounts(
+    /// The per-tenant dispatch holds (module docs, tick step 1), one round
+    /// trip for both:
+    ///
+    /// - **Provider pause** (plan: per-tenant circuit breaker): the
+    ///   [`ProviderBreaker`] writes `accounts.provider_paused_until`
+    ///   (migration 007); both pause kinds hold background dispatch.
+    /// - **Mid-upgrade tenant** (plan: "Schema migration on deploy"): any
+    ///   active `account_databases` row lagging the compiled tenant schema
+    ///   target — the same predicate CloudAuth's straggler gate applies per
+    ///   request. Executing work against a behind-schema tenant would run
+    ///   this binary's queries on tables/columns that don't exist there
+    ///   yet; the ledger rows wait for the stamp instead.
+    ///
+    /// Failures fail open with a warning — an unreadable hold column must
+    /// not stop all dispatch. For the migration hold that errs toward
+    /// dispatching to a mid-upgrade tenant, whose work then fails on the
+    /// missing schema and retries through the ledgers' own backoff —
+    /// recoverable noise, unlike a fleet-wide dispatch stall.
+    async fn held_accounts(
         &self,
         candidates: &[(String, Option<DateTime<Utc>>)],
     ) -> HashSet<String> {
@@ -1038,16 +1059,20 @@ impl Dispatcher {
         let result: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
             "SELECT id FROM accounts \
              WHERE id = ANY($1) \
-               AND provider_paused_until IS NOT NULL \
-               AND provider_paused_until > NOW()",
+               AND ((provider_paused_until IS NOT NULL AND provider_paused_until > NOW()) \
+                    OR EXISTS (SELECT 1 FROM account_databases ad \
+                               WHERE ad.account_id = accounts.id \
+                                 AND ad.status = 'active' \
+                                 AND ad.last_migrated_version < $2))",
         )
         .bind(&ids)
+        .bind(crate::fleet_migration::tenant_schema_target())
         .fetch_all(self.control.pool())
         .await;
         match result {
-            Ok(paused) => paused.into_iter().collect(),
+            Ok(held) => held.into_iter().collect(),
             Err(e) => {
-                tracing::warn!(error = %e, "[dispatcher] pause lookup failed; assuming none paused");
+                tracing::warn!(error = %e, "[dispatcher] dispatch-hold lookup failed; assuming none held");
                 HashSet::new()
             }
         }

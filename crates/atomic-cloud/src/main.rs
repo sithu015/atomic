@@ -34,11 +34,13 @@ use std::sync::Arc;
 
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
-    configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
-    ClusterConfig, ControlPlane, Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault,
-    FallbackAppState, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
-    NewAccount, OpenRouterProvisioning, PoolCaps, RateLimits, TenantPlane, TokenScope,
+    advance_deploy, configure_cloud_app, delete_account, issue_token, latest_deploy_run,
+    list_failed_migrations, list_unmigrated, provision_account, run_fleet_gate,
+    tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
+    AdvanceOutcome, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DeployPolicy,
+    Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState,
+    FleetMigrationConfig, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
+    NewAccount, OpenRouterProvisioning, PoolCaps, RateLimits, Readiness, TenantPlane, TokenScope,
     WorkerPoolsConfig,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -180,6 +182,9 @@ enum Command {
         #[command(flatten)]
         dispatcher: DispatcherArgs,
 
+        #[command(flatten)]
+        fleet: FleetArgs,
+
         /// Max concurrent streaming-chat requests per account in this
         /// process (plan: streaming chat is not pooled — a per-tenant
         /// semaphore at the route caps it). Over-cap chat sends get a
@@ -207,6 +212,12 @@ enum Command {
     Token {
         #[command(subcommand)]
         action: TokenAction,
+    },
+
+    /// Inspect and acknowledge boot-time fleet migrations (deploy gating).
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
     },
 }
 
@@ -539,6 +550,86 @@ impl DispatcherArgs {
     }
 }
 
+/// Boot-time fleet migration + deploy gating (plan: "Schema migration on
+/// deploy"). The new binary boots in migrating mode: `/health` (liveness) is
+/// up immediately, `/ready` answers 503 until every lagging tenant database
+/// has been brought to the compiled schema target and the failure-rate
+/// policy admits. See `atomic_cloud::deploy` for the policy table and
+/// `atomic-cloud deploy status` / `deploy advance` for the operator surface.
+#[derive(Args)]
+struct FleetArgs {
+    /// Tenant databases migrating concurrently during the boot fleet run
+    /// (the plan starts at 16; tune from production).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_MIGRATION_CONCURRENCY",
+        default_value_t = 16
+    )]
+    fleet_migration_concurrency: usize,
+
+    /// Wall-clock limit in seconds on the boot fleet migration; past it the
+    /// run is abandoned and the pod holds not-ready with
+    /// deploy_status='migration_timeout' (plan: 30 minutes).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_MIGRATION_TIMEOUT_SECS",
+        default_value_t = 1800
+    )]
+    fleet_migration_timeout_secs: u64,
+
+    /// Ceiling in seconds on establishing one tenant's migration connection
+    /// — an unreachable tenant database fails fast and recorded instead of
+    /// holding a fan-out slot.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_CONNECT_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    fleet_connect_timeout_secs: u64,
+
+    /// Failure-rate threshold below which the deploy proceeds without
+    /// operator action (plan: 1%). Sub-threshold failures are stragglers:
+    /// CloudAuth 503s them per request and the reaper retries them.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DEPLOY_READY_FAILURE_RATE",
+        default_value_t = 0.01
+    )]
+    deploy_ready_failure_rate: f64,
+
+    /// Failure-rate threshold below which (and at/above the ready
+    /// threshold) the pod holds with deploy_status='awaiting_review' for an
+    /// operator's `deploy advance`; at/above it, 'rollback_required' — no
+    /// override short of redeploying the old binary (plan: 10%).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DEPLOY_REVIEW_FAILURE_RATE",
+        default_value_t = 0.10
+    )]
+    deploy_review_failure_rate: f64,
+}
+
+impl FleetArgs {
+    fn into_configs(self) -> (FleetMigrationConfig, DeployPolicy) {
+        (
+            FleetMigrationConfig {
+                concurrency: self.fleet_migration_concurrency.max(1),
+                tenant_connect_timeout: std::time::Duration::from_secs(
+                    self.fleet_connect_timeout_secs.max(1),
+                ),
+                wall_clock_limit: std::time::Duration::from_secs(
+                    self.fleet_migration_timeout_secs.max(1),
+                ),
+                ..FleetMigrationConfig::default()
+            },
+            DeployPolicy {
+                ready_failure_rate: self.deploy_ready_failure_rate,
+                review_failure_rate: self.deploy_review_failure_rate,
+            },
+        )
+    }
+}
+
 impl EmailArgs {
     /// Build the configured sender, erroring when mailgun mode is missing
     /// credentials — fail at boot, not on the first signup.
@@ -603,6 +694,22 @@ enum AccountAction {
         #[arg(long)]
         subdomain: String,
     },
+}
+
+#[derive(Subcommand)]
+enum DeployAction {
+    /// Print the latest deploy run (counts, verdict) plus every tenant
+    /// whose migration is currently failed.
+    Status,
+
+    /// Acknowledge an awaiting-review deploy: flips every awaiting_review
+    /// run at the latest target version to 'advanced' in the control plane,
+    /// so EVERY pod holding on that review (each boots its own run row)
+    /// observes the acknowledgment on its next readiness probe and goes
+    /// ready. rollback_required deliberately has no override — the
+    /// migration itself is broken; redeploy the old binary (see
+    /// atomic_cloud::deploy).
+    Advance,
 }
 
 #[derive(Subcommand)]
@@ -682,6 +789,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_concurrent_provisions,
             provisioning,
             dispatcher,
+            fleet,
             chat_streams_per_account,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
@@ -693,6 +801,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
             let managed = provisioning.into_managed_keys(Arc::clone(&vault))?;
             let dispatcher_config = dispatcher.into_config();
+            let (fleet_config, deploy_policy) = fleet.into_configs();
 
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
@@ -739,6 +848,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 email.into_sender()?,
                 plane_config,
                 dispatcher_config,
+                fleet_config,
+                deploy_policy,
                 ChatStreamLimiter::new(chat_streams_per_account),
             )
             .await
@@ -827,7 +938,112 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
         },
+
+        Command::Deploy { action } => match action {
+            DeployAction::Status => {
+                print_deploy_status(&control).await?;
+                Ok(())
+            }
+            DeployAction::Advance => match advance_deploy(&control).await? {
+                AdvanceOutcome::Advanced {
+                    target_version,
+                    runs,
+                } => {
+                    println!(
+                        "advanced {runs} awaiting_review deploy run(s) at target \
+                         version {target_version}"
+                    );
+                    println!("every pod holding on that review goes ready on its next probe");
+                    Ok(())
+                }
+                AdvanceOutcome::RefusedRollbackRequired => Err(
+                    "refusing to advance: the latest deploy run is rollback_required \
+                     (failure rate ≥ the rollback threshold). The migration itself is \
+                     broken; there is deliberately no override — redeploy the previous \
+                     binary (additive-only migrations make that safe), fix the \
+                     migration, and deploy again."
+                        .into(),
+                ),
+                AdvanceOutcome::NothingToAdvance { status } => {
+                    println!("nothing awaiting review (latest deploy run is '{status}')");
+                    Ok(())
+                }
+                AdvanceOutcome::NoRuns => {
+                    println!("no deploy runs recorded yet");
+                    Ok(())
+                }
+            },
+        },
     }
+}
+
+/// `deploy status`: the latest run, the compiled target plus how many
+/// tenants still lag it, and the currently-failed tenant migrations.
+async fn print_deploy_status(control: &ControlPlane) -> Result<(), Box<dyn std::error::Error>> {
+    let target = tenant_schema_target();
+    println!("compiled tenant schema target: {target}");
+    let lagging = list_unmigrated(control, target).await?;
+    println!("tenants below target: {}", lagging.len());
+
+    match latest_deploy_run(control).await? {
+        None => println!("no deploy runs recorded yet"),
+        Some(run) => {
+            println!("latest deploy run: {}", run.id);
+            println!("  status:         {}", run.deploy_status);
+            println!("  target version: {}", run.target_version);
+            println!("  started:        {}", run.started_at.to_rfc3339());
+            match run.finished_at {
+                Some(finished) => println!("  finished:       {}", finished.to_rfc3339()),
+                None => println!("  finished:       (still running, or the pod died mid-run)"),
+            }
+            if let (Some(total), Some(migrated), Some(failed)) =
+                (run.total, run.migrated, run.failed)
+            {
+                let rate = if total > 0 {
+                    failed as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "  tenants:        {total} enumerated, {migrated} migrated, \
+                     {failed} failed ({rate:.2}% failure rate), {} unattempted",
+                    total - migrated - failed
+                );
+            }
+            if let Some(advanced_at) = run.advanced_at {
+                println!("  advanced:       {}", advanced_at.to_rfc3339());
+            }
+        }
+    }
+
+    let failures = list_failed_migrations(control).await?;
+    if failures.is_empty() {
+        println!("failed tenant migrations: none");
+    } else {
+        println!("failed tenant migrations: {}", failures.len());
+        for f in failures {
+            println!(
+                "  {} ({}) at v{}, {} retr{}, failed {}, next retry {}: {}",
+                f.account_id,
+                f.db_name,
+                f.last_migrated_version,
+                f.migration_retry_count,
+                if f.migration_retry_count == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                f.migration_failed_at.to_rfc3339(),
+                f.migration_retry_after
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(unset)".to_string()),
+                f.last_migration_error
+                    .as_deref()
+                    .unwrap_or("(no error recorded)"),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Run the composed multi-tenant server until interrupted. See
@@ -840,6 +1056,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// `--dispatcher=false` to disable) runs the per-pod background dispatcher;
 /// the caller must have built `cache_config` with `inline_pipeline` set to
 /// the matching value (off exactly when a dispatcher runs).
+/// `fleet_config` + `deploy_policy` drive the boot fleet migration gate:
+/// the process starts serving immediately (liveness up) but `/ready` holds
+/// 503 until the gate's policy admits (see `atomic_cloud::deploy`).
 /// `chat_streams` is the process-wide streaming-chat semaphore, cloned into
 /// every HTTP worker.
 #[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
@@ -857,6 +1076,8 @@ async fn serve(
     email: Arc<dyn EmailSender>,
     plane_config: AccountPlaneConfig,
     dispatcher_config: Option<DispatcherConfig>,
+    fleet_config: FleetMigrationConfig,
+    deploy_policy: DeployPolicy,
     chat_streams: ChatStreamLimiter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
@@ -890,6 +1111,22 @@ async fn serve(
         managed.clone(),
         reaper_interval,
     );
+
+    // Deploy gate (plan: "Schema migration on deploy"): boot in migrating
+    // mode and run the fleet migration concurrently with serving, so
+    // liveness is up from the first request while `/ready` holds 503 until
+    // every lagging tenant is migrated and the failure-rate policy admits.
+    // The dispatcher below is safe to start immediately — its tick skips
+    // tenants whose schema still lags the compiled target, exactly as
+    // CloudAuth 503s their requests.
+    let readiness = Readiness::new(control.clone());
+    tokio::spawn(run_fleet_gate(
+        control.clone(),
+        cluster.clone(),
+        fleet_config,
+        deploy_policy,
+        readiness.clone(),
+    ));
 
     let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
 
@@ -957,6 +1194,7 @@ async fn serve(
             tenant_plane.clone(),
             control.clone(),
             chat_streams.clone(),
+            readiness.clone(),
         ))
     })
     .workers(4)

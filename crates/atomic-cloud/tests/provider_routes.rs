@@ -23,8 +23,8 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
-    FallbackAppState, ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, TenantPlane,
-    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, MANAGED_LLM_MODELS, SESSION_COOKIE,
+    FallbackAppState, ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, Readiness,
+    TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, MANAGED_LLM_MODELS, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -150,6 +150,9 @@ impl ProviderHarness {
         let state = fallback.data();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        // This harness runs no fleet gate; the deploy-gating suite owns
+        // readiness behavior.
+        let readiness = Readiness::ready(control.clone());
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -158,6 +161,7 @@ impl ProviderHarness {
                 tenant_plane.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
+                readiness.clone(),
             ))
         })
         .workers(1)

@@ -24,8 +24,8 @@ use atomic_cloud::{
     list_hinted_accounts, provision_account, set_active_provider, tenant_schema_target,
     upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
     ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin, FallbackAppState,
-    ManagedKeys, NewAccount, NewCredentials, Provider, SecretKey, TenantPlane, TokenScope,
-    DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
+    ManagedKeys, NewAccount, NewCredentials, Provider, Readiness, SecretKey, TenantPlane,
+    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -121,6 +121,9 @@ impl CloudHarness {
         let state = fallback.data();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        // This harness runs no fleet gate; the deploy-gating suite owns
+        // readiness behavior.
+        let readiness = Readiness::ready(control.clone());
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -129,6 +132,7 @@ impl CloudHarness {
                 tenant_plane.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
+                readiness.clone(),
             ))
         })
         .workers(1)
