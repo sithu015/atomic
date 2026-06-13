@@ -34,14 +34,14 @@ use std::sync::Arc;
 
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
-    advance_deploy, configure_cloud_app, delete_account, issue_token, latest_deploy_run,
-    list_failed_migrations, list_unmigrated, provision_account, run_fleet_gate,
-    tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    AdvanceOutcome, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DeployPolicy,
-    Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState,
-    FleetMigrationConfig, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
-    NewAccount, OpenRouterProvisioning, PoolCaps, RateLimits, Readiness, TenantPlane, TokenScope,
-    WorkerPoolsConfig,
+    abandoned_run_threshold, advance_deploy, configure_cloud_app, delete_account,
+    finalize_abandoned_runs, issue_token, latest_deploy_run, list_failed_migrations,
+    list_unmigrated, provision_account, run_fleet_gate, tenant_schema_target, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, ChatStreamLimiter,
+    CloudAuth, ClusterConfig, ControlPlane, DeployPolicy, Dispatcher, DispatcherConfig,
+    EmailSender, EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender,
+    MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PoolCaps,
+    RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
@@ -974,39 +974,59 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Deploy { action } => match action {
             DeployAction::Status => {
+                finalize_stale_runs(&control).await;
                 print_deploy_status(&control).await?;
                 Ok(())
             }
-            DeployAction::Advance => match advance_deploy(&control).await? {
-                AdvanceOutcome::Advanced {
-                    target_version,
-                    runs,
-                } => {
-                    println!(
-                        "advanced {runs} awaiting_review deploy run(s) at target \
+            DeployAction::Advance => {
+                finalize_stale_runs(&control).await;
+                match advance_deploy(&control).await? {
+                    AdvanceOutcome::Advanced {
+                        target_version,
+                        runs,
+                    } => {
+                        println!(
+                            "advanced {runs} awaiting_review deploy run(s) at target \
                          version {target_version}"
-                    );
-                    println!("every pod holding on that review goes ready on its next probe");
-                    Ok(())
-                }
-                AdvanceOutcome::RefusedRollbackRequired => Err(
-                    "refusing to advance: the latest deploy run is rollback_required \
+                        );
+                        println!("every pod holding on that review goes ready on its next probe");
+                        Ok(())
+                    }
+                    AdvanceOutcome::RefusedRollbackRequired => Err(
+                        "refusing to advance: the latest deploy run is rollback_required \
                      (failure rate ≥ the rollback threshold). The migration itself is \
                      broken; there is deliberately no override — redeploy the previous \
                      binary (additive-only migrations make that safe), fix the \
                      migration, and deploy again."
-                        .into(),
-                ),
-                AdvanceOutcome::NothingToAdvance { status } => {
-                    println!("nothing awaiting review (latest deploy run is '{status}')");
-                    Ok(())
+                            .into(),
+                    ),
+                    AdvanceOutcome::NothingToAdvance { status } => {
+                        println!("nothing awaiting review (latest deploy run is '{status}')");
+                        Ok(())
+                    }
+                    AdvanceOutcome::NoRuns => {
+                        println!("no deploy runs recorded yet");
+                        Ok(())
+                    }
                 }
-                AdvanceOutcome::NoRuns => {
-                    println!("no deploy runs recorded yet");
-                    Ok(())
-                }
-            },
+            }
         },
+    }
+}
+
+/// Finalize stale `migrating` deploy runs before any operator command reads
+/// them — a dead pod's row must not shadow `deploy advance` (see
+/// `atomic_cloud::deploy::finalize_abandoned_runs`). The CLI doesn't know
+/// the fleet's `--fleet-migration-timeout-secs`, so the threshold derives
+/// from the default config (conservative: a custom shorter timeout only
+/// delays finalization, never mislabels a live run). Best-effort — a
+/// failure is reported and the command proceeds on the unfinalized rows.
+async fn finalize_stale_runs(control: &ControlPlane) {
+    let threshold = abandoned_run_threshold(&FleetMigrationConfig::default());
+    match finalize_abandoned_runs(control, threshold).await {
+        Ok(0) => {}
+        Ok(n) => println!("finalized {n} stale 'migrating' deploy run(s) as 'abandoned'"),
+        Err(e) => eprintln!("warning: finalizing stale deploy runs failed: {e}"),
     }
 }
 

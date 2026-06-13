@@ -70,9 +70,9 @@ pub use curated_models::{
     MANAGED_LLM_MODELS, PINNED_EMBEDDING_DIMENSION,
 };
 pub use deploy::{
-    advance_deploy, deploy_run_status, evaluate_policy, finish_deploy_run, latest_deploy_run,
-    run_fleet_gate, start_deploy_run, AdvanceOutcome, DeployPolicy, DeployRun, DeployStatus,
-    Readiness,
+    abandoned_run_threshold, advance_deploy, deploy_run_status, evaluate_policy,
+    finalize_abandoned_runs, finish_deploy_run, latest_deploy_run, run_fleet_gate,
+    start_deploy_run, AdvanceOutcome, DeployPolicy, DeployRun, DeployStatus, Readiness,
 };
 pub use dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint, DispatchHint,

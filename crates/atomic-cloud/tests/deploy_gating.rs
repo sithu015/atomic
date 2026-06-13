@@ -24,11 +24,11 @@ use std::time::Duration;
 
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
-    advance_deploy, configure_cloud_app, latest_deploy_run, run_fleet_gate, tenant_db_name,
-    tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    AdvanceOutcome, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DeployPolicy,
-    FallbackAppState, FleetMigrationConfig, FleetMigrator, ManagedKeys, Readiness, TenantPlane,
-    DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    abandoned_run_threshold, advance_deploy, configure_cloud_app, finalize_abandoned_runs,
+    latest_deploy_run, run_fleet_gate, tenant_db_name, tenant_schema_target, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, ChatStreamLimiter,
+    CloudAuth, ClusterConfig, ControlPlane, DeployPolicy, FallbackAppState, FleetMigrationConfig,
+    FleetMigrator, ManagedKeys, Readiness, TenantPlane, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use atomic_core::storage::PostgresStorage;
 use chrono::{DateTime, Utc};
@@ -482,18 +482,26 @@ async fn rollback_band_holds_and_advance_refuses() {
 
 /// Wall-clock policy: a wedged tenant (atomic-core's migration advisory
 /// lock held by an outside session, so `initialize()` blocks forever) plus
-/// a tiny wall-clock limit produces `migration_timeout` — the pod holds
+/// a small wall-clock limit produces `migration_timeout` — the pod holds
 /// not-ready, the wedged tenant is *unattempted* (no failure recorded, no
-/// stamp moved), and nothing is advanceable.
+/// stamp moved), and nothing is advanceable. A healthy tenant migrated
+/// before the deadline is still counted and persisted: a timed-out run's
+/// `deploy_runs` row reports the partial work that really happened, not
+/// zeros.
 #[tokio::test]
 async fn wall_clock_timeout_holds_with_migration_timeout() {
     with_control_db(
         "wall_clock_timeout_holds_with_migration_timeout",
         |url| async move {
             let control = connect_control(&url).await;
+            let target = tenant_schema_target();
 
             let db_name = create_empty_tenant_db().await;
             seed_stamped_tenant(&control, "wedged", "c1", &db_name, 0).await;
+            // A healthy stale-stamped tenant on an already-current database
+            // migrates (a fast no-op) well inside the limit.
+            let healthy_db = create_current_tenant_db().await;
+            seed_stamped_tenant(&control, "healthy", "c2", &healthy_db, target - 1).await;
 
             // Hold atomic-core's migration advisory lock from a session the
             // runner can't see; its initialize() blocks acquiring it.
@@ -530,10 +538,15 @@ async fn wall_clock_timeout_holds_with_migration_timeout() {
             assert_eq!(body["status"], "migration_timeout");
 
             // The wedged tenant was abandoned, not failed: no failure state,
-            // no stamp movement — it stays enumerated for the next run.
+            // no stamp movement — it stays enumerated for the next run (and
+            // for the reaper's lagging-row arm).
             let (version, _, failed_at, error, _, retries) = row_state(&control, "wedged").await;
             assert_eq!(version, 0);
             assert!(failed_at.is_none() && error.is_none() && retries == 0);
+            // The healthy tenant finished inside the limit and is stamped.
+            let (version, _, failed_at, _, _, _) = row_state(&control, "healthy").await;
+            assert_eq!(version, target, "the healthy tenant migrated");
+            assert!(failed_at.is_none());
 
             let run = latest_deploy_run(&control)
                 .await
@@ -542,8 +555,9 @@ async fn wall_clock_timeout_holds_with_migration_timeout() {
             assert_eq!(run.deploy_status, "migration_timeout");
             assert_eq!(
                 (run.total, run.migrated, run.failed),
-                (Some(1), Some(0), Some(0)),
-                "the wedged tenant is unattempted, not failed"
+                (Some(2), Some(1), Some(0)),
+                "partial counts persist on timeout: the healthy migration is \
+                 counted, the wedged tenant is unattempted, not failed"
             );
 
             assert!(
@@ -633,6 +647,176 @@ async fn concurrent_fleet_runs_converge_without_errors() {
                     "{account_id}: no migration version recorded twice"
                 );
             }
+        },
+    )
+    .await;
+}
+
+// ==================== Stale-run finalization ====================
+
+/// A dead pod's stuck `migrating` row must not shadow a live review:
+/// without finalization, `deploy advance` would answer NothingToAdvance
+/// ('migrating') forever. `finalize_abandoned_runs` flips stale rows to the
+/// terminal 'abandoned', `advance_deploy` skips abandoned rows — and a
+/// *fresh* `migrating` row still shadows, conservatively, by design.
+#[tokio::test]
+async fn stale_migrating_run_cannot_shadow_advance() {
+    with_control_db(
+        "stale_migrating_run_cannot_shadow_advance",
+        |url| async move {
+            let control = connect_control(&url).await;
+            let target = tenant_schema_target();
+            let threshold = abandoned_run_threshold(&fast_config());
+
+            // Pod A's review, then pod B's later row — B died mid-run hours
+            // ago and its row is stuck 'migrating'.
+            sqlx::query(
+                "INSERT INTO deploy_runs (id, target_version, started_at, deploy_status) \
+                 VALUES ('review-run', $1, NOW() - interval '4 hours', 'awaiting_review'), \
+                        ('dead-run', $1, NOW() - interval '3 hours', 'migrating')",
+            )
+            .bind(target)
+            .execute(control.pool())
+            .await
+            .expect("seed deploy runs");
+
+            // The unfixed failure mode: the dead row shadows the review.
+            match advance_deploy(&control).await.expect("advance attempt") {
+                AdvanceOutcome::NothingToAdvance { status } => assert_eq!(status, "migrating"),
+                other => panic!("expected NothingToAdvance, got {other:?}"),
+            }
+
+            // Finalization (run on boot and by `deploy status`/`advance`).
+            let finalized = finalize_abandoned_runs(&control, threshold)
+                .await
+                .expect("finalize stale runs");
+            assert_eq!(finalized, 1, "only the stale migrating row");
+            assert_eq!(
+                finalize_abandoned_runs(&control, threshold)
+                    .await
+                    .expect("re-finalize"),
+                0,
+                "idempotent"
+            );
+
+            // The abandoned row is terminal history...
+            let (status, finished): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT deploy_status, finished_at FROM deploy_runs WHERE id = 'dead-run'",
+            )
+            .fetch_one(control.pool())
+            .await
+            .expect("read dead run");
+            assert_eq!(status, "abandoned");
+            assert!(finished.is_some(), "finalization stamps finished_at");
+
+            // ...and cannot shadow: advance now finds and flips the review.
+            match advance_deploy(&control).await.expect("advance") {
+                AdvanceOutcome::Advanced {
+                    target_version,
+                    runs,
+                } => {
+                    assert_eq!(target_version, target);
+                    assert_eq!(runs, 1);
+                }
+                other => panic!("expected Advanced, got {other:?}"),
+            }
+
+            // A FRESH migrating row (a pod genuinely mid-run) is neither
+            // finalized nor skipped: the conservative gate holds.
+            sqlx::query("INSERT INTO deploy_runs (id, target_version) VALUES ('live-run', $1)")
+                .bind(target)
+                .execute(control.pool())
+                .await
+                .expect("seed live run");
+            assert_eq!(
+                finalize_abandoned_runs(&control, threshold)
+                    .await
+                    .expect("finalize with live run"),
+                0,
+                "a fresh migrating row is a live pod, not debris"
+            );
+            match advance_deploy(&control).await.expect("advance attempt") {
+                AdvanceOutcome::NothingToAdvance { status } => assert_eq!(status, "migrating"),
+                other => panic!("expected NothingToAdvance, got {other:?}"),
+            }
+        },
+    )
+    .await;
+}
+
+// ==================== Bookkeeping retries ====================
+
+/// The gate's bookkeeping writes retry on transient control-plane errors
+/// instead of wedging the pod in migrating mode forever (the silent stalled
+/// rollout: liveness green, readiness 503, orchestrator never restarts).
+/// Honest injection: a trigger refuses `deploy_runs` INSERTs while a
+/// sentinel row exists — a real SQL error through the production path — and
+/// the fault clears mid-gate.
+#[tokio::test]
+async fn bookkeeping_retries_survive_a_transient_control_plane_fault() {
+    with_control_db(
+        "bookkeeping_retries_survive_a_transient_control_plane_fault",
+        |url| async move {
+            let control = connect_control(&url).await;
+            sqlx::raw_sql(
+                "CREATE TABLE fault_sentinel (armed INT); \
+                 INSERT INTO fault_sentinel VALUES (1); \
+                 CREATE FUNCTION reject_deploy_runs() RETURNS trigger AS $$ \
+                 BEGIN \
+                     IF EXISTS (SELECT 1 FROM fault_sentinel) THEN \
+                         RAISE EXCEPTION 'injected: transient control-plane fault'; \
+                     END IF; \
+                     RETURN NEW; \
+                 END $$ LANGUAGE plpgsql; \
+                 CREATE TRIGGER reject_deploy_runs_trigger \
+                     BEFORE INSERT ON deploy_runs \
+                     FOR EACH ROW EXECUTE FUNCTION reject_deploy_runs();",
+            )
+            .execute(control.pool())
+            .await
+            .expect("arm control-plane fault");
+
+            let readiness = Readiness::new(control.clone());
+            let gate = tokio::spawn(run_fleet_gate(
+                control.clone(),
+                cluster_config(),
+                fast_config(),
+                DeployPolicy::default(),
+                readiness.clone(),
+            ));
+
+            // While the fault holds, the pod is migrating — retrying, not
+            // dead.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !readiness.is_ready().await,
+                "still migrating under the fault"
+            );
+            assert!(
+                latest_deploy_run(&control)
+                    .await
+                    .expect("read runs")
+                    .is_none(),
+                "no run row landed yet"
+            );
+
+            // The fault clears; the gate's next 5s retry records the run,
+            // the (empty) fleet migrates vacuously, and readiness flips.
+            sqlx::query("DELETE FROM fault_sentinel")
+                .execute(control.pool())
+                .await
+                .expect("clear fault");
+            gate.await.expect("gate task");
+            assert!(
+                readiness.is_ready().await,
+                "one transient bookkeeping error must not wedge the pod"
+            );
+            let run = latest_deploy_run(&control)
+                .await
+                .expect("read latest run")
+                .expect("the retried start landed");
+            assert_eq!(run.deploy_status, "ready");
+            assert!(run.finished_at.is_some());
         },
     )
     .await;

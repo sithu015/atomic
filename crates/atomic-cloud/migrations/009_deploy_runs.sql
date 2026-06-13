@@ -31,6 +31,11 @@
 --   'advanced'           an operator acknowledged an awaiting_review run;
 --                        every pod holding on it flips ready on its next
 --                        readiness probe
+--   'abandoned'          a 'migrating' row stale past the run timeout was
+--                        finalized by a later boot or `deploy status` (the
+--                        pod died mid-run); terminal history that cannot
+--                        shadow `deploy advance`. Additive vocabulary
+--                        (TEXT column), added post-009 without a migration.
 --
 -- Migration discipline (see 001): ADDITIVE-ONLY.
 

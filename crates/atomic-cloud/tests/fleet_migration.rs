@@ -8,8 +8,8 @@
 mod support;
 
 use atomic_cloud::{
-    list_unmigrated, record_migration_failure, record_migration_success, tenant_schema_target,
-    ControlPlane, MIGRATION_ERROR_MAX_LEN,
+    list_retryable_failures, list_unmigrated, record_migration_failure, record_migration_success,
+    tenant_schema_target, ControlPlane, MIGRATION_ERROR_MAX_LEN,
 };
 use chrono::{Duration, Utc};
 use support::with_control_db;
@@ -98,15 +98,23 @@ async fn enumerate_and_record_machinery() {
         // exactly as migrated as before the attempt).
         let retry_after = Utc::now() + Duration::minutes(5);
         let oversized = "x".repeat(MIGRATION_ERROR_MAX_LEN + 200);
-        record_migration_failure(&control, "far-behind", &far_db, &oversized, retry_after)
-            .await
-            .expect("record failure");
+        record_migration_failure(
+            &control,
+            "far-behind",
+            &far_db,
+            &oversized,
+            retry_after,
+            target,
+        )
+        .await
+        .expect("record failure");
         record_migration_failure(
             &control,
             "far-behind",
             &far_db,
             "second failure",
             retry_after,
+            target,
         )
         .await
         .expect("record second failure");
@@ -132,9 +140,16 @@ async fn enumerate_and_record_machinery() {
 
         // The oversized first error was bounded before storage — prove it
         // via the count the truncation guarantees on the re-recorded one.
-        record_migration_failure(&control, "far-behind", &far_db, &oversized, retry_after)
-            .await
-            .expect("record oversized failure");
+        record_migration_failure(
+            &control,
+            "far-behind",
+            &far_db,
+            &oversized,
+            retry_after,
+            target,
+        )
+        .await
+        .expect("record oversized failure");
         let stored_error: String = sqlx::query_scalar(
             "SELECT last_migration_error FROM account_databases WHERE account_id = 'far-behind'",
         )
@@ -185,6 +200,88 @@ async fn enumerate_and_record_machinery() {
         .await
         .expect("read current row");
         assert_eq!(version, target, "a stale success never regresses the stamp");
+    })
+    .await;
+}
+
+/// The reaper's worklist owns every lagging row, failure state or not
+/// (the deploy-gating hardening): a never-attempted lagging row (NULL
+/// horizon) is due immediately and listed first, a failed-and-due row
+/// follows, a failed row inside its backoff horizon waits, and current or
+/// retired rows are never listed. And the failure-recording guard: a stale
+/// failure recording against an already-current row writes nothing.
+#[tokio::test]
+async fn retry_worklist_owns_all_lagging_rows() {
+    with_control_db("retry_worklist_owns_all_lagging_rows", |url| async move {
+        let control = setup(&url).await;
+        let target = tenant_schema_target();
+        let due_horizon = Utc::now() - Duration::minutes(1);
+        let future_horizon = Utc::now() + Duration::hours(1);
+
+        // Lagging, never attempted: no failure state at all.
+        let unattempted_db = seed_tenant(&control, "unattempted", "f", target - 1, "active").await;
+        // Lagging with failure state, backoff horizon passed.
+        let failed_db = seed_tenant(&control, "failed-due", "g", target - 1, "active").await;
+        record_migration_failure(
+            &control,
+            "failed-due",
+            &failed_db,
+            "boom",
+            due_horizon,
+            target,
+        )
+        .await
+        .expect("record due failure");
+        // Lagging with failure state, still backing off.
+        let waiting_db = seed_tenant(&control, "backing-off", "h", target - 1, "active").await;
+        record_migration_failure(
+            &control,
+            "backing-off",
+            &waiting_db,
+            "boom",
+            future_horizon,
+            target,
+        )
+        .await
+        .expect("record backing-off failure");
+        // Current and retired: never the reaper's business.
+        let current_db = seed_tenant(&control, "current", "i", target, "active").await;
+        seed_tenant(&control, "retired", "j", 0, "retired").await;
+
+        let due = list_retryable_failures(&control, target)
+            .await
+            .expect("list retryable");
+        let ids: Vec<&str> = due.iter().map(|t| t.account_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["unattempted", "failed-due"],
+            "all lagging-and-due rows, never-attempted first (NULLS FIRST)"
+        );
+        assert_eq!(due[0].db_name, unattempted_db);
+        assert!(due[0].migration_failed_at.is_none());
+
+        // The stale-failure guard: a failure recording against a row
+        // already stamped at the target (a concurrent success won) is
+        // dropped — no permanent lie in the triage view.
+        record_migration_failure(
+            &control,
+            "current",
+            &current_db,
+            "stale loser-pod connect error",
+            due_horizon,
+            target,
+        )
+        .await
+        .expect("stale recording is a no-op, not an error");
+        let (failed_at, retries): (Option<chrono::DateTime<Utc>>, i32) = sqlx::query_as(
+            "SELECT migration_failed_at, migration_retry_count \
+             FROM account_databases WHERE account_id = 'current'",
+        )
+        .fetch_one(control.pool())
+        .await
+        .expect("read current row");
+        assert!(failed_at.is_none(), "no failure state on a current row");
+        assert_eq!(retries, 0);
     })
     .await;
 }

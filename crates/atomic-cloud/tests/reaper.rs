@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use atomic_cloud::reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 use atomic_cloud::{
-    provision_account, tenant_db_name, tenant_schema_target, ClusterConfig, ControlPlane,
-    ManagedKeys, NewAccount, ProvisionedAccount,
+    provision_account, record_migration_success, tenant_db_name, tenant_schema_target,
+    ClusterConfig, ControlPlane, ManagedKeys, NewAccount, ProvisionedAccount,
 };
 use sqlx::{Connection, PgConnection};
 use support::{create_database, drop_database, with_control_db, with_db_guard};
@@ -1137,7 +1137,7 @@ async fn provider_outage_past_the_ceiling_rolls_back() {
     .await;
 }
 
-// ==================== Arm 4: failed tenant migrations ====================
+// ==================== Arm 4: lagging tenant migrations ====================
 
 /// Insert an active account plus an active mapping row at version 0
 /// carrying recorded migration-failure state. `failed_minutes_ago` orders
@@ -1193,12 +1193,44 @@ async fn migration_row_state(control: &ControlPlane, account_id: &str) -> (i32, 
     .expect("read mapping row state")
 }
 
-/// The happy arm: a due failed row pointing at a real (empty) tenant
-/// database is retried, the migration actually runs, the stamp lands at the
-/// compiled target, and the failure state clears — while a lagging row with
-/// NO failure state (an unattempted straggler — the boot runner's job, not
-/// the reaper's) and a failed row whose backoff horizon hasn't passed are
-/// both left strictly alone.
+/// Insert an active account plus an active mapping row at `version` with NO
+/// failure state — the ownerless straggler class the lagging-row arm exists
+/// for (an old-binary signup stamping its lower target mid-deploy, a lost
+/// recording, a panicked task).
+async fn seed_lagging_tenant(
+    control: &ControlPlane,
+    account_id: &str,
+    db_name: &str,
+    version: i32,
+) {
+    sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan) \
+         VALUES ($1, $1, 'k@example.com', 'active', 'free')",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .expect("insert account");
+    sqlx::query(
+        "INSERT INTO account_databases \
+             (account_id, cluster_id, db_name, status, last_migrated_version) \
+         VALUES ($1, 'c1', $2, 'active', $3)",
+    )
+    .bind(account_id)
+    .bind(db_name)
+    .bind(version)
+    .execute(control.pool())
+    .await
+    .expect("insert lagging mapping row");
+}
+
+/// The happy arm: a due failed row AND a lagging row with no failure state
+/// at all (the MAJOR straggler class: stamped by an old binary after the
+/// boot runners enumerated, or left unrecorded by a crash) — both pointing
+/// at real (empty) tenant databases — are retried, the migrations actually
+/// run, the stamps land at the compiled target, and any failure state
+/// clears. A failed row whose backoff horizon hasn't passed and a tenant
+/// already stamped current are both left strictly alone.
 #[tokio::test]
 async fn due_failed_migration_is_retried_to_recovery() {
     with_control_db(
@@ -1207,28 +1239,18 @@ async fn due_failed_migration_is_retried_to_recovery() {
             let (control, cluster) = setup(&url).await;
             let target = tenant_schema_target();
 
-            // The recoverable straggler: real, empty tenant database.
+            // The recoverable straggler with recorded failure state.
             let real_db = tenant_db_name(Uuid::new_v4());
             create_database(&cluster.cluster_url, &real_db).await;
             seed_failed_migration(&control, "recoverable", &real_db, 1, 10, -60.0).await;
 
-            // Lagging but never failed: not arm 4's business.
-            sqlx::query(
-                "INSERT INTO accounts (id, subdomain, email, status, plan) \
-                 VALUES ('unattempted', 'unattempted', 'k@example.com', 'active', 'free')",
-            )
-            .execute(control.pool())
-            .await
-            .expect("insert unattempted account");
-            sqlx::query(
-                "INSERT INTO account_databases \
-                     (account_id, cluster_id, db_name, status, last_migrated_version) \
-                 VALUES ('unattempted', 'c1', $1, 'active', 0)",
-            )
-            .bind(tenant_db_name(Uuid::new_v4()))
-            .execute(control.pool())
-            .await
-            .expect("insert unattempted mapping row");
+            // Lagging but never failed: ALSO the arm's business (the boot
+            // runner enumerated before this row lagged; nothing else will
+            // ever retry it). Old behavior — leaving it alone — was exactly
+            // the permanent-straggler bug.
+            let unattempted_db = tenant_db_name(Uuid::new_v4());
+            create_database(&cluster.cluster_url, &unattempted_db).await;
+            seed_lagging_tenant(&control, "unattempted", &unattempted_db, 0).await;
 
             // Failed but inside its backoff horizon: not due yet.
             seed_failed_migration(
@@ -1241,6 +1263,9 @@ async fn due_failed_migration_is_retried_to_recovery() {
             )
             .await;
 
+            // Already current: never the arm's business.
+            seed_lagging_tenant(&control, "current", &tenant_db_name(Uuid::new_v4()), target).await;
+
             let summary = run_reaper_pass(
                 &control,
                 &cluster,
@@ -1251,37 +1276,46 @@ async fn due_failed_migration_is_retried_to_recovery() {
             assert_no_errors(&summary);
             assert_eq!(
                 summary.migrations_recovered,
-                vec!["recoverable".to_string()]
+                // Worklist order: never-attempted rows (NULL failure time)
+                // first, then oldest failure.
+                vec!["unattempted".to_string(), "recoverable".to_string()]
             );
             assert!(summary.migrations_still_failing.is_empty(), "{summary:?}");
             assert!(summary.migration_alerts.is_empty(), "{summary:?}");
             assert!(summary.migrations_deferred.is_empty(), "{summary:?}");
 
-            let (version, has_failure, retries) =
-                migration_row_state(&control, "recoverable").await;
-            assert_eq!(version, target, "recovered row stamped at the target");
-            assert!(!has_failure, "failure state cleared");
-            assert_eq!(retries, 0, "retry count reset");
+            for (account_id, db_name) in
+                [("recoverable", &real_db), ("unattempted", &unattempted_db)]
+            {
+                let (version, has_failure, retries) =
+                    migration_row_state(&control, account_id).await;
+                assert_eq!(version, target, "{account_id} stamped at the target");
+                assert!(!has_failure, "{account_id}: no failure state");
+                assert_eq!(retries, 0, "{account_id}: retry count reset");
 
-            // The stamp is honest: the retry ran the real migrations.
-            let tenant_url = cluster.tenant_db_url(&real_db).expect("tenant url");
-            let mut conn = PgConnection::connect(&tenant_url)
-                .await
-                .expect("connect recovered tenant");
-            let schema: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
-                .fetch_one(&mut conn)
-                .await
-                .expect("read tenant schema version");
-            conn.close().await.expect("close");
-            assert_eq!(schema, target, "tenant schema is really at the target");
+                // The stamp is honest: the retry ran the real migrations.
+                let tenant_url = cluster.tenant_db_url(db_name).expect("tenant url");
+                let mut conn = PgConnection::connect(&tenant_url)
+                    .await
+                    .expect("connect recovered tenant");
+                let schema: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("read tenant schema version");
+                conn.close().await.expect("close");
+                assert_eq!(schema, target, "{account_id}: schema really at the target");
+            }
 
-            // Bystanders untouched.
-            let (version, has_failure, retries) =
-                migration_row_state(&control, "unattempted").await;
-            assert_eq!((version, has_failure, retries), (0, false, 0));
+            // Bystanders untouched: inside-horizon and already-current.
             let (version, has_failure, retries) =
                 migration_row_state(&control, "backing-off").await;
             assert_eq!((version, has_failure, retries), (0, true, 2));
+            let (version, has_failure, retries) = migration_row_state(&control, "current").await;
+            assert_eq!(
+                (version, has_failure, retries),
+                (target, false, 0),
+                "a current tenant is never touched by the arm"
+            );
 
             // The arm is idempotent at steady state: nothing left due.
             let summary = run_reaper_pass(
@@ -1442,6 +1476,237 @@ async fn contended_lock_defers_failed_migration_retry() {
             let (version, has_failure, _) = migration_row_state(&control, "contended-mig").await;
             assert_eq!(version, tenant_schema_target());
             assert!(!has_failure);
+        },
+    )
+    .await;
+}
+
+/// Install a control-plane trigger that makes one class of
+/// migration-tracking write fail for real (a genuine sqlx error through the
+/// production code path — no mocks): `"stamp"` rejects any change to
+/// `last_migrated_version` (success recordings), `"bump"` rejects any
+/// change to `migration_retry_count` (failure recordings). Paired with
+/// [`drop_recording_fault`].
+async fn install_recording_fault(control: &ControlPlane, mode: &str) {
+    let condition = match mode {
+        "stamp" => "NEW.last_migrated_version IS DISTINCT FROM OLD.last_migrated_version",
+        "bump" => "NEW.migration_retry_count IS DISTINCT FROM OLD.migration_retry_count",
+        other => panic!("unknown fault mode {other:?}"),
+    };
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION reject_recording() RETURNS trigger AS $$ \
+         BEGIN \
+             IF {condition} THEN \
+                 RAISE EXCEPTION 'injected: control plane refused the recording write'; \
+             END IF; \
+             RETURN NEW; \
+         END $$ LANGUAGE plpgsql; \
+         CREATE TRIGGER reject_recording_trigger \
+             BEFORE UPDATE ON account_databases \
+             FOR EACH ROW EXECUTE FUNCTION reject_recording();"
+    ))
+    .execute(control.pool())
+    .await
+    .expect("install recording fault");
+}
+
+async fn drop_recording_fault(control: &ControlPlane) {
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_recording_trigger ON account_databases; \
+         DROP FUNCTION reject_recording();",
+    )
+    .execute(control.pool())
+    .await
+    .expect("drop recording fault");
+}
+
+/// The lost-success-recording producer, constructed for real: the tenant
+/// migration runs to completion but the control plane refuses the success
+/// stamp, leaving a lagging row with NO failure state — under the old
+/// "failure state drives retries" split this tenant was stranded forever
+/// (the boot runner had already enumerated; arm 4 ignored it). The
+/// lagging-row arm owns it: once the control plane recovers, the next pass
+/// re-runs the (now no-op) migration and records the success.
+#[tokio::test]
+async fn lost_success_recording_is_healed_by_the_lagging_row_arm() {
+    with_control_db(
+        "lost_success_recording_is_healed_by_the_lagging_row_arm",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let target = tenant_schema_target();
+            let real_db = tenant_db_name(Uuid::new_v4());
+            create_database(&cluster.cluster_url, &real_db).await;
+            seed_lagging_tenant(&control, "victim", &real_db, 0).await;
+
+            install_recording_fault(&control, "stamp").await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_eq!(summary.migrations_still_failing, vec!["victim".to_string()]);
+            assert!(summary.migrations_recovered.is_empty(), "{summary:?}");
+            assert!(
+                summary.migration_alerts.is_empty(),
+                "nothing was recorded, so no count crossed the threshold: {summary:?}"
+            );
+
+            // The migration really ran — only the recording was lost...
+            let tenant_url = cluster.tenant_db_url(&real_db).expect("tenant url");
+            let mut conn = PgConnection::connect(&tenant_url)
+                .await
+                .expect("connect tenant");
+            let schema: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&mut conn)
+                .await
+                .expect("read tenant schema version");
+            conn.close().await.expect("close");
+            assert_eq!(schema, target, "tenant schema is current on disk");
+
+            // ...so the control-plane row is exactly the ownerless
+            // straggler shape: lagging, no failure state, gated by
+            // CloudAuth (fail-closed) — and still due for the next pass.
+            let (version, has_failure, retries) = migration_row_state(&control, "victim").await;
+            assert_eq!((version, has_failure, retries), (0, false, 0));
+
+            // Control plane recovers: the next ordinary pass heals it.
+            drop_recording_fault(&control).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert_eq!(summary.migrations_recovered, vec!["victim".to_string()]);
+            let (version, has_failure, retries) = migration_row_state(&control, "victim").await;
+            assert_eq!((version, has_failure, retries), (target, false, 0));
+        },
+    )
+    .await;
+}
+
+/// Minor-d honesty: when the failure-recording write itself fails, the
+/// summary must report the count actually stored on the row — not the
+/// `count + 1` that was never written. Seeded at exactly the alert
+/// threshold so the difference is observable: an inflated report would
+/// alert; the honest one must not. Once the control plane recovers, the
+/// recorded failure crosses the threshold and the alert fires for real.
+#[tokio::test]
+async fn unrecorded_failure_reports_the_stored_retry_count() {
+    with_control_db(
+        "unrecorded_failure_reports_the_stored_retry_count",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let alert_threshold = ReaperPolicy::default().migration_alert_retries;
+            // Ghost database: the migration honestly fails to connect.
+            seed_failed_migration(
+                &control,
+                "victim",
+                &tenant_db_name(Uuid::new_v4()),
+                alert_threshold,
+                30,
+                -60.0,
+            )
+            .await;
+
+            install_recording_fault(&control, "bump").await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_eq!(summary.migrations_still_failing, vec!["victim".to_string()]);
+            assert!(
+                summary.migration_alerts.is_empty(),
+                "the count never moved past the threshold; reporting count+1 \
+                 here would be the lie: {summary:?}"
+            );
+            let (_, _, retries) = migration_row_state(&control, "victim").await;
+            assert_eq!(retries, alert_threshold, "the row is untouched");
+
+            // Control plane recovers: the next failure records honestly,
+            // crosses the threshold, and escalates.
+            drop_recording_fault(&control).await;
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_eq!(summary.migrations_still_failing, vec!["victim".to_string()]);
+            assert_eq!(summary.migration_alerts, vec!["victim".to_string()]);
+            let (_, _, retries) = migration_row_state(&control, "victim").await;
+            assert_eq!(retries, alert_threshold + 1);
+        },
+    )
+    .await;
+}
+
+/// The mixed-fleet reaper race (rolling deploy): an OLD binary's reaper
+/// no-op-initializes a tenant at its own lower target and records that
+/// success, erasing failure state another pod recorded toward the NEW
+/// target. Under the old failure-state-driven split that stranded the
+/// tenant; under lagging-ness-driven ownership the row — `GREATEST`-stamped
+/// at the old target, still below the new one — is simply picked up by the
+/// next new-binary reaper pass and healed to full health.
+#[tokio::test]
+async fn old_binary_success_recording_cannot_strand_the_tenant() {
+    with_control_db(
+        "old_binary_success_recording_cannot_strand_the_tenant",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let target = tenant_schema_target();
+            let real_db = tenant_db_name(Uuid::new_v4());
+            create_database(&cluster.cluster_url, &real_db).await;
+            // A new-target failure record, due for retry.
+            seed_failed_migration(&control, "raced", &real_db, 3, 10, -60.0).await;
+
+            // The old binary's reaper (compiled target = target - 1)
+            // retried, no-oped, and recorded ITS success — clearing the
+            // failure columns unconditionally.
+            record_migration_success(&control, "raced", &real_db, target - 1)
+                .await
+                .expect("old binary records its success");
+            let (version, has_failure, retries) = migration_row_state(&control, "raced").await;
+            assert_eq!(
+                (version, has_failure, retries),
+                (target - 1, false, 0),
+                "the old success cleared the new-target failure record \
+                 (and GREATEST kept the stamp monotone)"
+            );
+
+            // The row is lagging with no failure state — exactly what the
+            // lagging-row arm owns. One new-binary pass heals it fully.
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert_eq!(summary.migrations_recovered, vec!["raced".to_string()]);
+            let (version, has_failure, retries) = migration_row_state(&control, "raced").await;
+            assert_eq!((version, has_failure, retries), (target, false, 0));
+
+            // Full health on disk too.
+            let tenant_url = cluster.tenant_db_url(&real_db).expect("tenant url");
+            let mut conn = PgConnection::connect(&tenant_url)
+                .await
+                .expect("connect tenant");
+            let schema: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&mut conn)
+                .await
+                .expect("read tenant schema version");
+            conn.close().await.expect("close");
+            assert_eq!(schema, target);
         },
     )
     .await;

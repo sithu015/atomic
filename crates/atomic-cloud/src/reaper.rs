@@ -74,20 +74,26 @@
 //!    milliseconds-wide step-5→6 window; that is safe — `delete_account`
 //!    is idempotent and writes its reservation before the row delete.
 //!
-//! 4. **Failed tenant migrations** — `account_databases` rows with recorded
-//!    failure state whose backoff horizon has passed (plan: "Failure
-//!    recovery & the reaper" → `migration_failed_at IS NOT NULL AND
-//!    (migration_retry_after IS NULL OR migration_retry_after <= now())`).
-//!    These are the deploy gate's sub-threshold stragglers: the boot fleet
-//!    run recorded their failure and went ready without them, CloudAuth is
-//!    503ing their requests with `account_upgrading`, and this arm is what
-//!    eventually heals them short of another pod boot. Each due row is
-//!    retried through the boot runner's own per-tenant step
-//!    ([`fleet_migration::migrate_tenant`]): success stamps the target and
-//!    clears the failure state (the straggler starts serving on its next
-//!    request); failure re-records with a doubled backoff horizon. Retries
-//!    are capped per pass ([`ReaperPolicy::max_migration_retries_per_pass`])
-//!    for the same reason resumes are; a row whose retry count climbs past
+//! 4. **Lagging tenant migrations** — every active `account_databases` row
+//!    whose `last_migrated_version` lags the compiled target and whose
+//!    backoff horizon, if any, has passed
+//!    ([`fleet_migration::list_retryable_failures`]). This arm owns *all*
+//!    lagging rows, not just those with recorded failure state: the boot
+//!    fleet runner enumerates exactly once per pod lifetime, so a row that
+//!    becomes lagging afterwards — an old-binary pod completing a signup
+//!    mid-rolling-deploy, a lost success/failure recording, a panicked
+//!    migration task — has no other owner, and CloudAuth 503s its every
+//!    request (`account_upgrading`) until something retries it. This arm is
+//!    that something, and it is what heals every straggler short of another
+//!    pod boot. Each due row is retried through the boot runner's own
+//!    per-tenant step ([`fleet_migration::migrate_tenant`]): success stamps
+//!    the target and clears any failure state (the straggler starts serving
+//!    on its next request); failure records normal failure state with a
+//!    doubled backoff horizon — a never-attempted row that fails its first
+//!    reaper retry enters the same backoff discipline as a boot-run
+//!    failure. Retries are capped per pass
+//!    ([`ReaperPolicy::max_migration_retries_per_pass`]) for the same
+//!    reason resumes are; a row whose *recorded* retry count climbs past
 //!    [`ReaperPolicy::migration_alert_retries`] is escalated to
 //!    `tracing::error!` (plan: "alerts when retry_count > 5") — backoff has
 //!    reached its cap and the tenant needs a human
@@ -132,8 +138,9 @@
 //!   mechanisms the multi-pod boot itself leans on — atomic-core's
 //!   per-database migration advisory lock serializes the actual DDL, and
 //!   both sides' recordings converge (monotone `GREATEST` stamping on
-//!   success; a redundant failure recording just re-arms a backoff the next
-//!   success clears).
+//!   success; a failure recording that loses to a concurrent success is
+//!   dropped by its version guard, and one that wins just re-arms a backoff
+//!   the next success clears).
 //!
 //! - **Under-lock re-checks.** The work lists are read unlocked, so every
 //!   row is re-verified after its lock is acquired: arm 1 re-reads the
@@ -202,14 +209,15 @@ pub struct ReaperPolicy {
     /// its own caller.
     pub deletion_recovery_grace: Duration,
 
-    /// Maximum failed-migration retries (arm 4) per pass — the same
+    /// Maximum lagging-migration retries (arm 4) per pass — the same
     /// rationale as [`max_resumes_per_pass`](Self::max_resumes_per_pass):
     /// each retry can run tenant migrations for seconds (or burn a connect
     /// timeout on an unreachable database), and a backlog must not turn the
     /// 60-second job into a minutes-long one. Surplus rows are deferred to
     /// the next pass ([`ReaperSummary::migrations_deferred`]); a *large*
-    /// backlog of broken tenants is the boot runner's problem (a restart
-    /// re-runs the whole fleet under real concurrency), not the reaper's.
+    /// backlog of lagging tenants is the boot runner's problem (a restart
+    /// re-runs the whole fleet under real concurrency) — the reaper is the
+    /// per-row backstop, not a second fleet runner.
     pub max_migration_retries_per_pass: usize,
 
     /// Escalation threshold for arm 4 (plan: "alerts when
@@ -296,20 +304,24 @@ pub struct ReaperSummary {
     /// Interrupted-deletion candidates skipped because another pass holds
     /// their lock.
     pub deletions_skipped_locked: Vec<String>,
-    /// Failed tenant migrations retried to success (account ids; stamps
+    /// Lagging tenant migrations retried to success (account ids; stamps
     /// current, failure state cleared — the stragglers stop 503ing).
     pub migrations_recovered: Vec<String>,
-    /// Failed-migration retries that failed again (account ids; fresh
-    /// backoff horizons and bumped retry counts recorded).
+    /// Lagging-migration retries whose rows are still lagging after the
+    /// attempt (account ids) — the migration failed (failure state and a
+    /// fresh backoff horizon recorded, when that write itself landed), or
+    /// it succeeded but the success recording was lost.
     pub migrations_still_failing: Vec<String>,
-    /// Failed-migration rows skipped because another pass holds their lock.
+    /// Lagging-migration rows skipped because another pass holds their lock.
     pub migrations_skipped_locked: Vec<String>,
-    /// Failed-migration rows past
+    /// Lagging-migration rows past
     /// [`ReaperPolicy::max_migration_retries_per_pass`], deferred untouched.
     pub migrations_deferred: Vec<String>,
-    /// Failed-migration rows whose retry count climbed past
+    /// Lagging-migration rows whose *recorded* retry count climbed past
     /// [`ReaperPolicy::migration_alert_retries`] this pass — each was
-    /// escalated with a `tracing::error!` naming the tenant.
+    /// escalated with a `tracing::error!` naming the tenant. A failure
+    /// whose recording write itself failed does not bump the count and so
+    /// never inflates this alert (the row's stored count is the truth).
     pub migration_alerts: Vec<String>,
     /// Reservations cleared because their subdomain belongs to an active
     /// account (subdomains).
@@ -964,32 +976,36 @@ async fn complete_interrupted_deletions(
     Ok(())
 }
 
-/// What arm 4 decided about one due failed-migration row, post-lock.
+/// What arm 4 decided about one due lagging-migration row, post-lock.
 enum MigrationRetryOutcome {
     /// The retry succeeded: stamp current, failure state cleared.
     Recovered,
-    /// The retry failed again; a doubled backoff horizon and the bumped
-    /// retry count are recorded.
-    StillFailing { retry_count: i32 },
+    /// The row is still lagging after the attempt. `recorded_retry_count`
+    /// is the count actually stored on the row now — bumped when the
+    /// failure recording landed, unchanged when the recording itself
+    /// failed (or when the migration succeeded but its success recording
+    /// was lost). The alert threshold compares against this honest number.
+    StillFailing { recorded_retry_count: i32 },
     /// The under-lock re-check found the row no longer due — a concurrent
     /// pass (or a booting pod's fleet runner) already healed it, or pushed
     /// its horizon. Nothing to do.
     AlreadySettled,
 }
 
-/// Arm 4 — failed tenant migrations (plan: "Failure recovery & the reaper":
-/// `account_databases WHERE migration_failed_at IS NOT NULL AND
-/// (migration_retry_after IS NULL OR migration_retry_after <= now())`).
-/// Each due row is retried through the boot fleet runner's own per-tenant
-/// step under the per-account advisory lock; see the module docs for why
-/// racing a booting pod is safe.
+/// Arm 4 — lagging tenant migrations (plan: "Failure recovery & the
+/// reaper", with ownership widened to every lagging row — see the module
+/// docs and [`fleet_migration::list_retryable_failures`]). Each due row is
+/// retried through the boot fleet runner's own per-tenant step under the
+/// per-account advisory lock; see the module docs for why racing a booting
+/// pod is safe.
 async fn retry_failed_migrations(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     policy: &ReaperPolicy,
     summary: &mut ReaperSummary,
 ) -> Result<(), CloudError> {
-    let due = crate::fleet_migration::list_retryable_failures(control).await?;
+    let target = crate::fleet_migration::tenant_schema_target();
+    let due = crate::fleet_migration::list_retryable_failures(control, target).await?;
 
     let mut retries_used = 0usize;
     for tenant in due {
@@ -1024,12 +1040,14 @@ async fn retry_failed_migrations(
         }
         match outcome {
             Ok(MigrationRetryOutcome::Recovered) => summary.migrations_recovered.push(account_id),
-            Ok(MigrationRetryOutcome::StillFailing { retry_count }) => {
-                if retry_count > policy.migration_alert_retries {
+            Ok(MigrationRetryOutcome::StillFailing {
+                recorded_retry_count,
+            }) => {
+                if recorded_retry_count > policy.migration_alert_retries {
                     tracing::error!(
                         account_id,
                         db_name = tenant.db_name,
-                        retry_count,
+                        retry_count = recorded_retry_count,
                         "failed tenant migration has exhausted its backoff \
                          schedule and needs an operator (see `atomic-cloud \
                          deploy status` for the stored error)"
@@ -1049,7 +1067,7 @@ async fn retry_failed_migrations(
     Ok(())
 }
 
-/// One due failed-migration row, lock held: re-check, then retry through
+/// One due lagging-migration row, lock held: re-check, then retry through
 /// [`fleet_migration::migrate_tenant`] — the boot runner's exact per-tenant
 /// step, so what runs and what gets recorded are identical either way.
 ///
@@ -1060,52 +1078,70 @@ async fn process_failed_migration(
     policy: &ReaperPolicy,
     tenant: &crate::fleet_migration::UnmigratedTenant,
 ) -> Result<MigrationRetryOutcome, CloudError> {
-    // Re-read under the lock: between the unlocked listing and lock
-    // acquisition, a concurrent pass or a booting pod's fleet runner may
-    // have healed the row (failure state cleared) or re-failed it (horizon
-    // pushed into the future). The fresh row also carries the current retry
-    // count, which the backoff arithmetic below must not understate.
+    use crate::fleet_migration::TenantMigrationOutcome;
+
+    let target = crate::fleet_migration::tenant_schema_target();
+    // Re-read under the lock, with the worklist's own predicate: between
+    // the unlocked listing and lock acquisition, a concurrent pass or a
+    // booting pod's fleet runner may have healed the row (stamped current)
+    // or re-failed it (horizon pushed into the future). The fresh row also
+    // carries the current retry count, which the backoff arithmetic below
+    // must not understate.
     let row: Option<crate::fleet_migration::UnmigratedTenant> = sqlx::query_as(
         "SELECT account_id, db_name, last_migrated_version, migration_failed_at, \
                 migration_retry_after, migration_retry_count \
          FROM account_databases \
          WHERE account_id = $1 AND db_name = $2 AND status = 'active' \
-           AND migration_failed_at IS NOT NULL \
+           AND last_migrated_version < $3 \
            AND (migration_retry_after IS NULL OR migration_retry_after <= NOW())",
     )
     .bind(&tenant.account_id)
     .bind(&tenant.db_name)
+    .bind(target)
     .fetch_optional(control.pool())
     .await
-    .map_err(CloudError::db("re-reading failed migration under lock"))?;
+    .map_err(CloudError::db("re-reading lagging migration under lock"))?;
     let Some(fresh) = row else {
         return Ok(MigrationRetryOutcome::AlreadySettled);
     };
 
     let retry_count = fresh.migration_retry_count;
-    let recovered = crate::fleet_migration::migrate_tenant(
+    let outcome = crate::fleet_migration::migrate_tenant(
         control,
         cluster,
         &policy.migration_retry,
         fresh,
-        crate::fleet_migration::tenant_schema_target(),
+        target,
     )
     .await;
-    if recovered {
-        tracing::info!(
-            account_id = tenant.account_id,
-            db_name = tenant.db_name,
-            "reaper recovered a failed tenant migration; the straggler is \
-             current and serving again"
-        );
-        Ok(MigrationRetryOutcome::Recovered)
-    } else {
-        // migrate_tenant recorded the new failure state (bumping the count
-        // by one) and warned with the error; the caller decides whether the
-        // new count crosses the alert threshold.
-        Ok(MigrationRetryOutcome::StillFailing {
-            retry_count: retry_count + 1,
-        })
+    match outcome {
+        TenantMigrationOutcome::Migrated => {
+            tracing::info!(
+                account_id = tenant.account_id,
+                db_name = tenant.db_name,
+                "reaper recovered a lagging tenant migration; the straggler \
+                 is current and serving again"
+            );
+            Ok(MigrationRetryOutcome::Recovered)
+        }
+        // Honest accounting (the summary reports what is recorded, not what
+        // ran): a bumped count only when the failure recording landed; an
+        // unchanged count when that write failed or when the success
+        // recording was lost. Either way the row stays lagging and due, so
+        // the next pass owns it again.
+        TenantMigrationOutcome::Failed {
+            failure_recorded: true,
+        } => Ok(MigrationRetryOutcome::StillFailing {
+            recorded_retry_count: retry_count + 1,
+        }),
+        TenantMigrationOutcome::Failed {
+            failure_recorded: false,
+        }
+        | TenantMigrationOutcome::SuccessRecordingFailed => {
+            Ok(MigrationRetryOutcome::StillFailing {
+                recorded_retry_count: retry_count,
+            })
+        }
     }
 }
 

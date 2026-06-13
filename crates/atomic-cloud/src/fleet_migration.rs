@@ -15,10 +15,16 @@
 //!   ([`record_migration_success`] / [`record_migration_failure`]). The
 //!   deploy gate around it (readiness, the failure-rate policy, the
 //!   `deploy_runs` history) lives in [`crate::deploy`].
-//! - **The reaper's failed-migrations arm** ([`crate::reaper`], arm 4)
-//!   retries rows whose `migration_retry_after` has passed
-//!   ([`list_retryable_failures`]) through the same per-tenant step and
-//!   record functions ([`migrate_tenant`]).
+//! - **The reaper's lagging-migrations arm** ([`crate::reaper`], arm 4)
+//!   owns *every* lagging row whose backoff horizon (if any) has passed
+//!   ([`list_retryable_failures`]) and retries each through the same
+//!   per-tenant step and record functions ([`migrate_tenant`]). Ownership
+//!   is deliberately keyed on lagging-ness, not on recorded failure state:
+//!   the boot runner enumerates exactly once per pod lifetime, so any row
+//!   that becomes (or stays) lagging *after* that enumeration — an
+//!   old-binary signup completing mid-rolling-deploy, a lost success or
+//!   failure recording, a panicked migration task — would otherwise have
+//!   no owner and 503 forever. The reaper is the standing backstop.
 //! - **CloudAuth's straggler gate** reads `last_migrated_version` on its
 //!   per-request account lookup and returns the structured 503
 //!   `account_upgrading` while a tenant lags [`tenant_schema_target`] (see
@@ -111,6 +117,15 @@ pub async fn list_unmigrated(
 /// old binary (target N) racing a new one (target N+1) over the same tenant
 /// must not regress the stamp and re-flag an already-upgraded tenant as a
 /// straggler to the new pods.
+///
+/// The failure-column clearing is unconditional, and that is safe even in
+/// the mixed-fleet race where an *old* binary's no-op success erases
+/// failure state another pod recorded toward a *newer* target: retry
+/// ownership is driven by lagging-ness (`last_migrated_version < target`,
+/// see [`list_retryable_failures`]), not by failure state, so the row —
+/// still lagging the new target after the `GREATEST` stamp — is simply
+/// re-listed by every new-binary reaper pass. Clearing merely resets the
+/// backoff to "due now", which only makes the next retry sooner.
 pub async fn record_migration_success(
     control: &ControlPlane,
     account_id: &str,
@@ -140,12 +155,21 @@ pub async fn record_migration_success(
 /// text, the failure time, the reaper's next-retry horizon, and a bumped
 /// retry count. `last_migrated_version` is untouched: the tenant is exactly
 /// as migrated as it was before the attempt.
+///
+/// The `last_migrated_version < $5` guard drops *stale* failure recordings:
+/// if the row is already stamped at (or past) `target`, a concurrent
+/// attempt succeeded after this one failed — usually a transient connect
+/// error on the losing pod of a multi-pod race — and writing failure state
+/// onto a current row would leave a permanent lie in the operator's
+/// triage view ([`list_failed_migrations`]) that no retry can ever clear
+/// (the retry list is keyed on lagging-ness, and the row doesn't lag).
 pub async fn record_migration_failure(
     control: &ControlPlane,
     account_id: &str,
     db_name: &str,
     error: &str,
     retry_after: DateTime<Utc>,
+    target: i32,
 ) -> Result<(), CloudError> {
     sqlx::query(
         "UPDATE account_databases \
@@ -153,12 +177,13 @@ pub async fn record_migration_failure(
              last_migration_error = $3, \
              migration_retry_after = $4, \
              migration_retry_count = migration_retry_count + 1 \
-         WHERE account_id = $1 AND db_name = $2",
+         WHERE account_id = $1 AND db_name = $2 AND last_migrated_version < $5",
     )
     .bind(account_id)
     .bind(db_name)
     .bind(truncate_error(error))
     .bind(retry_after)
+    .bind(target)
     .execute(control.pool())
     .await
     .map_err(CloudError::db("recording tenant migration failure"))?;
@@ -171,35 +196,48 @@ fn truncate_error(error: &str) -> String {
     error.chars().take(MIGRATION_ERROR_MAX_LEN).collect()
 }
 
-/// The reaper's failed-migrations worklist (plan: "Failure recovery & the
-/// reaper": `account_databases WHERE migration_failed_at IS NOT NULL AND
-/// (migration_retry_after IS NULL OR migration_retry_after <= now())`):
-/// active rows with recorded failure state whose backoff horizon has passed
-/// (or was never written), oldest failure first — the tenants that have
-/// been broken longest get retried soonest.
+/// The reaper's lagging-migrations worklist (plan: "Failure recovery & the
+/// reaper", as amended by the deploy-gating hardening): every active row
+/// whose schema lags `target` and whose backoff horizon — if one was ever
+/// recorded — has passed. Rows that never had a failure recorded (NULL
+/// horizon) are due immediately, listed first; failed rows follow oldest
+/// failure first — the tenants broken longest get retried soonest.
 ///
-/// Deliberately *no* version filter: a row can carry failure state while
-/// its stamp is already current (a concurrent pod's success raced this
-/// pod's failure recording). Retrying it is an idempotent no-op
-/// `initialize()` whose success recording clears the stale failure state —
-/// self-healing, where a version filter would strand it forever. And
-/// conversely, a lagging row with **no** failure state is *not* this list's
-/// business — unattempted tenants belong to the boot runner
-/// ([`list_unmigrated`]), not the reaper.
+/// Deliberately keyed on **lagging-ness, not failure state**. The boot
+/// fleet runner enumerates exactly once per pod lifetime, so a row can
+/// become lagging with no failure state *after* every pod has enumerated —
+/// and without this list owning it, nothing would ever retry it while
+/// CloudAuth 503s its every request:
+///
+/// - an old-binary pod completes a signup mid-rolling-deploy and stamps its
+///   own lower target;
+/// - a migration succeeds but the success recording fails (the tenant is
+///   current on disk, lagging in the control plane — fail-closed);
+/// - a failure recording itself fails, or the migration task panics, so
+///   nothing was recorded at all.
+///
+/// Retrying an already-current-on-disk tenant is an idempotent no-op
+/// `initialize()` whose success recording stamps the row — the same
+/// already-paid-for safety the multi-pod boot story leans on (module
+/// docs): per-tenant advisory locks make a race against a concurrent boot
+/// runner safe, merely wasteful. Rows already stamped current are not
+/// listed; there is nothing to retry.
 pub async fn list_retryable_failures(
     control: &ControlPlane,
+    target: i32,
 ) -> Result<Vec<UnmigratedTenant>, CloudError> {
     sqlx::query_as(
         "SELECT account_id, db_name, last_migrated_version, migration_failed_at, \
                 migration_retry_after, migration_retry_count \
          FROM account_databases \
-         WHERE status = 'active' AND migration_failed_at IS NOT NULL \
+         WHERE status = 'active' AND last_migrated_version < $1 \
            AND (migration_retry_after IS NULL OR migration_retry_after <= NOW()) \
-         ORDER BY migration_failed_at ASC, account_id ASC",
+         ORDER BY migration_failed_at ASC NULLS FIRST, account_id ASC",
     )
+    .bind(target)
     .fetch_all(control.pool())
     .await
-    .map_err(CloudError::db("listing retryable failed migrations"))
+    .map_err(CloudError::db("listing retryable lagging migrations"))
 }
 
 /// An `account_databases` row carrying recorded migration-failure state —
@@ -297,10 +335,11 @@ pub struct FleetRunOutcome {
     /// This deliberately also counts the rarer fault where the migration
     /// itself *succeeded* but the control-plane success recording failed
     /// (fail-closed: an unstamped tenant is still gated, so claiming it
-    /// migrated would be a lie). A control plane flaky enough during boot
-    /// to inflate this count into the review band is itself worth an
-    /// operator's attention; the error-level log on each such recording
-    /// failure is the discriminator.
+    /// migrated would be a lie; the reaper's lagging-row arm re-records
+    /// it). A control plane flaky enough during boot to inflate this count
+    /// into the review band is itself worth an operator's attention; the
+    /// error-level log on each such recording failure is the
+    /// discriminator.
     pub failed: usize,
     /// Whether the run hit [`FleetMigrationConfig::wall_clock_limit`].
     pub timed_out: bool,
@@ -393,7 +432,7 @@ impl FleetMigrator {
         );
 
         let mut pending: VecDeque<UnmigratedTenant> = pending.into();
-        let mut join_set: JoinSet<bool> = JoinSet::new();
+        let mut join_set: JoinSet<TenantMigrationOutcome> = JoinSet::new();
         let mut migrated = 0usize;
         let mut failed = 0usize;
         let mut timed_out = false;
@@ -418,24 +457,38 @@ impl FleetMigrator {
                 // aborted tasks' sessions close, releasing any held
                 // migration advisory lock; nothing is recorded for them —
                 // they are exactly as migrated as their last completed
-                // statement, and stay enumerated for the next run.
+                // statement, and stay enumerated for the reaper and the
+                // next run. Tasks that *completed* before the deadline but
+                // were never joined are drained below: their outcomes are
+                // already recorded in the control plane, and discarding
+                // them would make the persisted run counts lie.
                 Err(_) => {
                     timed_out = true;
                     join_set.abort_all();
+                    while let Some(joined) = join_set.join_next().await {
+                        match joined {
+                            Ok(TenantMigrationOutcome::Migrated) => migrated += 1,
+                            Ok(_) => failed += 1,
+                            Err(join_error) if join_error.is_cancelled() => {} // abandoned in flight
+                            Err(join_error) => {
+                                tracing::error!(error = %join_error, "fleet migration: tenant task panicked");
+                                failed += 1;
+                            }
+                        }
+                    }
                     break;
                 }
-                Ok(Some(Ok(success))) => {
-                    if success {
-                        migrated += 1;
-                    } else {
-                        failed += 1;
-                    }
-                }
+                Ok(Some(Ok(TenantMigrationOutcome::Migrated))) => migrated += 1,
+                // Fail-closed counting (see FleetRunOutcome::failed): a lost
+                // success recording leaves the tenant gated, so the run
+                // reports it failed even though the schema is current.
+                Ok(Some(Ok(_))) => failed += 1,
                 Ok(Some(Err(join_error))) => {
                     // A panicked migration task is a bug, but the fleet run
                     // keeps the same never-abort contract as a recorded
                     // failure. Nothing was recorded for the tenant; it
-                    // stays enumerated.
+                    // stays enumerated (and the reaper's lagging-row arm
+                    // owns it from here).
                     tracing::error!(error = %join_error, "fleet migration: tenant task panicked");
                     failed += 1;
                 }
@@ -476,17 +529,41 @@ impl FleetMigrator {
     }
 }
 
+/// What one per-tenant migration attempt did — both what ran against the
+/// tenant database and what was actually recorded in the control plane.
+/// Consumers must not infer recorded state from "the migration worked":
+/// the recording writes can fail independently, and reporting state that
+/// was never written is exactly the lie this enum exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantMigrationOutcome {
+    /// Migrated (or no-oped on an already-current schema) and stamped;
+    /// failure/backoff state cleared.
+    Migrated,
+    /// The migration succeeded but the success recording failed: the
+    /// tenant is current on disk yet still lagging in the control plane
+    /// (fail-closed — CloudAuth keeps gating it), and nothing was written.
+    /// The reaper's lagging-row arm re-runs it (an idempotent no-op) and
+    /// re-records.
+    SuccessRecordingFailed,
+    /// The migration failed. `failure_recorded` says whether the failure
+    /// state (error text, backoff horizon, bumped retry count) actually
+    /// landed; when `false`, the row is untouched — still lagging, still
+    /// due — and only the logs carry the error.
+    Failed { failure_recorded: bool },
+}
+
 /// Plan step 3 for one tenant: connect a [`PostgresStorage`] to the tenant
 /// database, run `initialize()` (atomic-core's advisory-locked migration
 /// runner — concurrent pods serialize per tenant; an already-current schema
-/// no-ops), and record the outcome. Returns `true` on recorded success.
+/// no-ops), and record the outcome. See [`TenantMigrationOutcome`] for the
+/// honest accounting of ran-vs-recorded.
 ///
 /// A connect or migration failure records `migration_failed_at`,
 /// `last_migration_error`, and the exponential `migration_retry_after`
 /// horizon — and never aborts the fleet run. A failure *recording* failure
 /// is logged (the tenant stays enumerated either way).
 ///
-/// `pub(crate)`: the reaper's failed-migrations arm
+/// `pub(crate)`: the reaper's lagging-migrations arm
 /// ([`crate::reaper`], arm 4) retries [`list_retryable_failures`] rows
 /// through this exact step, so a reaper retry and a boot-runner attempt are
 /// indistinguishable in what they run and what they record. Of its
@@ -499,7 +576,7 @@ pub(crate) async fn migrate_tenant(
     config: &FleetMigrationConfig,
     tenant: UnmigratedTenant,
     target: i32,
-) -> bool {
+) -> TenantMigrationOutcome {
     let result = run_tenant_migration(cluster, config, &tenant.db_name).await;
 
     match result {
@@ -518,11 +595,11 @@ pub(crate) async fn migrate_tenant(
                     account_id = tenant.account_id,
                     error = %e,
                     "fleet migration: success recording failed; the tenant is \
-                     migrated but stays gated until a later run re-records it"
+                     migrated but stays gated until the reaper re-records it"
                 );
-                return false;
+                return TenantMigrationOutcome::SuccessRecordingFailed;
             }
-            true
+            TenantMigrationOutcome::Migrated
         }
         Err(e) => {
             let retry_after = migration_backoff_horizon(
@@ -538,22 +615,28 @@ pub(crate) async fn migrate_tenant(
                 error = %e,
                 "fleet migration: tenant migration failed; recorded for the reaper"
             );
-            if let Err(record_err) = record_migration_failure(
+            let failure_recorded = match record_migration_failure(
                 control,
                 &tenant.account_id,
                 &tenant.db_name,
                 &e.to_string(),
                 retry_after,
+                target,
             )
             .await
             {
-                tracing::error!(
-                    account_id = tenant.account_id,
-                    error = %record_err,
-                    "fleet migration: failure recording failed"
-                );
-            }
-            false
+                Ok(()) => true,
+                Err(record_err) => {
+                    tracing::error!(
+                        account_id = tenant.account_id,
+                        error = %record_err,
+                        "fleet migration: failure recording failed; the row \
+                         is untouched and stays due for the reaper"
+                    );
+                    false
+                }
+            };
+            TenantMigrationOutcome::Failed { failure_recorded }
         }
     }
 }

@@ -42,6 +42,17 @@
 //! here would just be a footgun pointed at the largest possible blast
 //! radius.
 //!
+//! **Small fleets hit the rollback band on a single tenant — by design.**
+//! One permanently broken tenant in a 2-tenant fleet is a 50% failure rate
+//! and `rollback_required` with no override; the percentage policy has no
+//! special case for small denominators, deliberately — at that scale the
+//! operator can and should look at the actual tenant rather than trust a
+//! rate. The operator path: inspect `deploy status` for the stored error,
+//! fix the broken tenant (restore/repair its database) or delete the
+//! account, then redeploy — the fresh gate run finds the fleet healthy.
+//! Tuning `--deploy-review-failure-rate` for a small fleet is the knob if
+//! the policy itself is wrong for the deployment.
+//!
 //! # What readiness does NOT gate
 //!
 //! Readiness is the load balancer's signal, not a request gate: a pod that
@@ -63,8 +74,8 @@ use crate::provision::ClusterConfig;
 
 /// Lifecycle of a deploy run — both the persisted `deploy_runs.deploy_status`
 /// vocabulary and (minus `Advanced`, which only exists as an acknowledgment
-/// record) the readiness hold reason. See the module docs for the policy
-/// table.
+/// record, and `Abandoned`, which only exists as finalized history) the
+/// readiness hold reason. See the module docs for the policy table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployStatus {
     /// The fleet migration is in flight (or the pod died mid-run).
@@ -81,6 +92,12 @@ pub enum DeployStatus {
     /// An operator acknowledged an `AwaitingReview` run; pods holding on it
     /// flip ready on their next probe.
     Advanced,
+    /// A `Migrating` row went stale past the run timeout — the pod that
+    /// inserted it crashed (or its outcome write never landed) — and a
+    /// later boot or `deploy status` finalized it
+    /// ([`finalize_abandoned_runs`]). Terminal history: without this, a
+    /// dead pod's `migrating` row would shadow `deploy advance` forever.
+    Abandoned,
 }
 
 impl DeployStatus {
@@ -93,6 +110,7 @@ impl DeployStatus {
             DeployStatus::RollbackRequired => "rollback_required",
             DeployStatus::MigrationTimeout => "migration_timeout",
             DeployStatus::Advanced => "advanced",
+            DeployStatus::Abandoned => "abandoned",
         }
     }
 
@@ -106,6 +124,7 @@ impl DeployStatus {
             "rollback_required" => DeployStatus::RollbackRequired,
             "migration_timeout" => DeployStatus::MigrationTimeout,
             "advanced" => DeployStatus::Advanced,
+            "abandoned" => DeployStatus::Abandoned,
             _ => return None,
         })
     }
@@ -234,6 +253,56 @@ pub async fn latest_deploy_run(control: &ControlPlane) -> Result<Option<DeployRu
     .map_err(CloudError::db("reading latest deploy run"))
 }
 
+/// How old a `migrating` row must be before [`finalize_abandoned_runs`]
+/// treats it as a dead pod's debris, derived from the run's wall-clock
+/// limit: one full run budget plus one bookkeeping retry budget (the
+/// outcome write retries for up to another `wall_clock_limit` — see
+/// [`run_fleet_gate`]), so a live pod's row can never be that old.
+pub fn abandoned_run_threshold(config: &FleetMigrationConfig) -> std::time::Duration {
+    config.wall_clock_limit * 2
+}
+
+/// Finalize stale `migrating` rows as `abandoned` (minor-but-real
+/// robustness: a pod killed mid-fleet-run leaves its row `migrating`
+/// forever, and the *latest-run* gate in [`advance_deploy`] would report
+/// [`NothingToAdvance`] forever — a dead pod must not shadow a live
+/// review). Returns how many rows were finalized.
+///
+/// Run on boot ([`run_fleet_gate`]) and from the operator surface
+/// (`deploy status`, `deploy advance`), with `older_than` from
+/// [`abandoned_run_threshold`]. The race against a slow-but-alive pod is
+/// self-correcting: its eventual `finish_deploy_run` overwrites
+/// `abandoned` with the real verdict (the outcome UPDATE is by id,
+/// unconditional).
+///
+/// [`NothingToAdvance`]: AdvanceOutcome::NothingToAdvance
+pub async fn finalize_abandoned_runs(
+    control: &ControlPlane,
+    older_than: std::time::Duration,
+) -> Result<u64, CloudError> {
+    let stale_secs = older_than.as_secs_f64();
+    let finalized = sqlx::query(
+        "UPDATE deploy_runs \
+         SET deploy_status = $1, finished_at = NOW() \
+         WHERE deploy_status = $2 AND started_at < NOW() - make_interval(secs => $3)",
+    )
+    .bind(DeployStatus::Abandoned.as_str())
+    .bind(DeployStatus::Migrating.as_str())
+    .bind(stale_secs)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("finalizing abandoned deploy runs"))?
+    .rows_affected();
+    if finalized > 0 {
+        tracing::warn!(
+            finalized,
+            "deploy runs stuck 'migrating' past the run timeout were \
+             finalized as 'abandoned' (dead pods; see `deploy status`)"
+        );
+    }
+    Ok(finalized)
+}
+
 /// What `deploy advance` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvanceOutcome {
@@ -265,9 +334,24 @@ pub enum AdvanceOutcome {
 /// the latest run settles. Conservative by design: the command can refuse
 /// and be re-run, but it can never acknowledge a review sight-unseen.
 ///
+/// `abandoned` rows are excluded from the gate subject: they are a dead
+/// pod's debris (finalized by [`finalize_abandoned_runs`]), carry no
+/// verdict anyone is holding on, and must not shadow a live review the way
+/// a stuck `migrating` row otherwise would.
+///
 /// [`NothingToAdvance`]: AdvanceOutcome::NothingToAdvance
 pub async fn advance_deploy(control: &ControlPlane) -> Result<AdvanceOutcome, CloudError> {
-    let Some(latest) = latest_deploy_run(control).await? else {
+    let latest: Option<DeployRun> = sqlx::query_as(
+        "SELECT id, target_version, started_at, finished_at, total, migrated, failed, \
+                deploy_status, advanced_at \
+         FROM deploy_runs WHERE deploy_status <> $1 \
+         ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(DeployStatus::Abandoned.as_str())
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("reading latest actionable deploy run"))?;
+    let Some(latest) = latest else {
         return Ok(AdvanceOutcome::NoRuns);
     };
     match DeployStatus::parse(&latest.deploy_status) {
@@ -417,11 +501,55 @@ impl Readiness {
     }
 }
 
+/// How often the deploy gate's bookkeeping writes retry — the same 5s
+/// cadence as the fleet runner's enumeration retries; the principle is one
+/// and the same (a transient control-plane error at boot must not brick the
+/// pod's gate outright).
+const BOOKKEEPING_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retry `op` every [`BOOKKEEPING_RETRY_INTERVAL`] until it succeeds or
+/// `deadline` passes — the deploy gate's bookkeeping discipline, mirroring
+/// `FleetMigrator::enumerate_until`. `None` means the control plane stayed
+/// unwritable for the whole budget.
+async fn retry_bookkeeping<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    context: &str,
+    mut op: F,
+) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CloudError>>,
+{
+    loop {
+        match op().await {
+            Ok(value) => return Some(value),
+            Err(e) => {
+                tracing::warn!(error = %e, "deploy gate: {context} failed; retrying");
+                let retry_at = tokio::time::Instant::now() + BOOKKEEPING_RETRY_INTERVAL;
+                if retry_at >= deadline {
+                    return None;
+                }
+                tokio::time::sleep_until(retry_at).await;
+            }
+        }
+    }
+}
+
 /// The boot deploy gate: record the run, drive the [`FleetMigrator`], apply
 /// the policy, persist the verdict, and flip (or hold) this process's
 /// [`Readiness`] — logging the flip loudly with every policy input. `serve`
 /// spawns this concurrently with the HTTP server so liveness is up from the
 /// first request (plan step 4).
+///
+/// Both bookkeeping writes (`start_deploy_run`, `finish_deploy_run`) retry
+/// until a wall-clock-limit deadline, exactly like the runner's
+/// enumeration: one transient control-plane blip must not leave the pod
+/// `Migrating` forever with green liveness (a silently stalled rollout the
+/// orchestrator never restarts). When `finish_deploy_run` exhausts its
+/// budget anyway, the pod's **in-memory verdict stays authoritative for
+/// its own `/ready`** — it flips or holds exactly as if the write had
+/// landed; only the control-plane history (and, for `AwaitingReview`, the
+/// `deploy advance` target) is missing, which the error log spells out.
 pub async fn run_fleet_gate(
     control: ControlPlane,
     cluster: ClusterConfig,
@@ -430,32 +558,59 @@ pub async fn run_fleet_gate(
     readiness: Readiness,
 ) {
     let target = crate::fleet_migration::tenant_schema_target();
-    let run_id = match start_deploy_run(&control, target).await {
-        Ok(id) => id,
-        Err(e) => {
-            // No run row means no advance target and no history; the pod
-            // stays in migrating mode (not ready) until restarted. Loud:
-            // this is a control-plane fault at boot, an operator problem.
-            tracing::error!(
-                error = %e,
-                "deploy gate: recording the deploy run failed; this pod will \
-                 stay not-ready until restarted"
-            );
-            return;
-        }
+
+    // Boot housekeeping: dead pods' stuck `migrating` rows must not shadow
+    // `deploy advance` (see finalize_abandoned_runs). Best-effort — a
+    // failure here never blocks the gate.
+    if let Err(e) = finalize_abandoned_runs(&control, abandoned_run_threshold(&config)).await {
+        tracing::warn!(error = %e, "deploy gate: finalizing abandoned runs failed; continuing");
+    }
+
+    let start_deadline = tokio::time::Instant::now() + config.wall_clock_limit;
+    let Some(run_id) = retry_bookkeeping(start_deadline, "recording the deploy run", || {
+        start_deploy_run(&control, target)
+    })
+    .await
+    else {
+        // The control plane stayed unwritable for a full wall-clock budget
+        // of retries: no run row, so no advance target and no history; the
+        // pod stays in migrating mode (not ready) until restarted. Loud:
+        // this is a control-plane outage at boot, an operator problem.
+        tracing::error!(
+            "deploy gate: recording the deploy run failed for the whole \
+             wall-clock budget; this pod will stay not-ready until restarted"
+        );
+        return;
     };
 
-    let outcome = FleetMigrator::new(control.clone(), cluster, config)
+    let outcome = FleetMigrator::new(control.clone(), cluster, config.clone())
         .run()
         .await;
     let status = evaluate_policy(&outcome, &policy);
 
-    if let Err(e) = finish_deploy_run(&control, &run_id, &outcome, status).await {
-        // The verdict couldn't be persisted. Holding verdicts still hold
-        // (locally sound; `deploy advance` won't find this row, but a
-        // restart re-runs the gate), and Ready still flips — refusing
-        // traffic over a bookkeeping write would be the worse failure.
-        tracing::error!(run_id, error = %e, "deploy gate: persisting the run outcome failed");
+    let finish_deadline = tokio::time::Instant::now() + config.wall_clock_limit;
+    if retry_bookkeeping(finish_deadline, "persisting the run outcome", || {
+        finish_deploy_run(&control, &run_id, &outcome, status)
+    })
+    .await
+    .is_none()
+    {
+        // The verdict couldn't be persisted in a full budget of retries.
+        // The in-memory verdict below stays authoritative for this pod's
+        // own /ready: holding verdicts still hold (locally sound — though
+        // `deploy advance` cannot see this run, so an AwaitingReview hold
+        // needs a restart or a redeploy to clear), and Ready still flips —
+        // refusing traffic over a bookkeeping write would be the worse
+        // failure.
+        tracing::error!(
+            run_id,
+            status = status.as_str(),
+            "deploy gate: persisting the run outcome failed for the whole \
+             wall-clock budget; this pod's in-memory verdict governs its \
+             /ready, but the run row still reads 'migrating' — `deploy \
+             advance` cannot acknowledge it, and `deploy status` will \
+             eventually finalize it as 'abandoned'"
+        );
     }
 
     // The loud flip log the plan asks for: every policy input in one line.
@@ -542,6 +697,7 @@ mod tests {
             DeployStatus::RollbackRequired,
             DeployStatus::MigrationTimeout,
             DeployStatus::Advanced,
+            DeployStatus::Abandoned,
         ] {
             assert_eq!(DeployStatus::parse(status.as_str()), Some(status));
         }

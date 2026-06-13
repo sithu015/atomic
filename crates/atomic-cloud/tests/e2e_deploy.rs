@@ -36,6 +36,11 @@
 //!    remedy for that band is redeploying a fixed binary, which the final
 //!    fresh gate run simulates (nothing lags anymore → ready).
 //!
+//! A second simulation (`late_stamped_straggler_heals_without_a_pod_reboot`)
+//! plays the rolling-deploy arc the first one can't: a tenant that becomes
+//! lagging — with no failure state — *after* the new pod's boot run already
+//! enumerated, healed by the reaper's lagging-row arm alone.
+//!
 //! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
 //! conventions and the run command.
 
@@ -529,5 +534,85 @@ async fn full_deploy_simulation() {
 
         pod_b.stop().await;
     })
+    .await;
+}
+
+/// The ownerless-straggler arc: an old-binary pod completes a signup
+/// mid-rolling-deploy and stamps its own *lower* target — strictly after
+/// this (new-binary, already-ready) pod's boot fleet run enumerated. The
+/// boot runner enumerates exactly once per pod lifetime, so under the old
+/// "boot runner owns unattempted rows / reaper owns failure state" split
+/// this tenant had no owner: no failure state for the reaper, no future
+/// enumeration from any pod — CloudAuth 503s (`account_upgrading`) forever.
+/// The reaper's lagging-row arm owns it now: one ordinary pass lifts the
+/// 503 with no operator action and **no pod reboot**.
+#[actix_web::test]
+async fn late_stamped_straggler_heals_without_a_pod_reboot() {
+    with_control_db(
+        "late_stamped_straggler_heals_without_a_pod_reboot",
+        |url| async move {
+            let control = ControlPlane::connect(&url).await.expect("connect control");
+            control.initialize().await.expect("migrate control plane");
+            let cluster = cluster_config();
+            let target = tenant_schema_target();
+
+            // The new binary boots, finds nothing lagging, and goes ready.
+            let readiness = Readiness::new(control.clone());
+            let pod = Pod::spawn(&control, &cluster, readiness.clone()).await;
+            run_fleet_gate(
+                control.clone(),
+                cluster.clone(),
+                sim_config(),
+                DeployPolicy::default(),
+                readiness.clone(),
+            )
+            .await;
+            let (status, _) = pod.ready().await;
+            assert_eq!(status, StatusCode::OK, "clean boot gate goes ready");
+
+            // An old-binary pod, still serving during the rolling deploy,
+            // completes a signup and stamps its own lower target. (The
+            // provision is real — the tenant's schema is genuinely current;
+            // only the control-plane stamp lags, exactly as an old binary
+            // writing its compiled target leaves it.)
+            let gamma = provision(&control, &cluster, "gamma").await;
+            stamp_fleet(&control, target - 1).await;
+
+            // Held per request by the straggler gate; readiness — which was
+            // never the per-tenant safety layer — stays ready.
+            pod.assert_upgrading(&gamma, "late-stamped tenant holds per request")
+                .await;
+            let (status, _) = pod.ready().await;
+            assert_eq!(status, StatusCode::OK);
+
+            // The ownerless shape: lagging with NO failure state at all.
+            let (version, failed_at, error, retry_after, retries) =
+                row_state(&control, &gamma.account_id).await;
+            assert_eq!(version, target - 1);
+            assert!(
+                failed_at.is_none() && error.is_none() && retry_after.is_none() && retries == 0,
+                "no failure state — nothing but the lagging-row arm will ever retry this"
+            );
+
+            // One ordinary reaper pass. No reboot, no redeploy, no operator.
+            let policy = ReaperPolicy {
+                migration_retry: sim_config(),
+                ..ReaperPolicy::default()
+            };
+            let summary =
+                run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
+            assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+            assert_eq!(summary.migrations_recovered, vec![gamma.account_id.clone()]);
+
+            // Healed: stamp current, and the 503 lifts on the same pod.
+            let (version, failed_at, _, _, retries) = row_state(&control, &gamma.account_id).await;
+            assert_eq!(version, target);
+            assert!(failed_at.is_none() && retries == 0);
+            pod.assert_serves(&gamma, "straggler serves again; the pod never rebooted")
+                .await;
+
+            pod.stop().await;
+        },
+    )
     .await;
 }
