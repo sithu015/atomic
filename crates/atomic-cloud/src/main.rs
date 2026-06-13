@@ -1560,7 +1560,10 @@ async fn serve(
     // Spawned over the SAME AccountCache the request path uses, so worker
     // events land on the channels live WebSocket clients subscribe to.
     // No leader election: ledger claims are the cross-pod exclusion, and
-    // run_loop jitters its first tick.
+    // run_loop jitters its first tick. The dispatcher shares the request
+    // path's plan catalogue so its atom-limit gate on atom-creating
+    // background work reads the same limits the data-plane quota guard does.
+    let dispatcher_plan_registry = quota_billing.plan_registry.clone().into_inner();
     match dispatcher_config {
         Some(config) => {
             tracing::info!(
@@ -1568,7 +1571,10 @@ async fn serve(
                 slow_scan_secs = config.slow_scan_interval.as_secs(),
                 "dispatcher enabled; tenant pipeline execution runs in worker pools"
             );
-            let dispatcher = Arc::new(Dispatcher::new(control.clone(), Arc::clone(&cache), config));
+            let dispatcher = Arc::new(
+                Dispatcher::new(control.clone(), Arc::clone(&cache), config)
+                    .with_plan_registry(dispatcher_plan_registry),
+            );
             tokio::spawn(dispatcher.run_loop());
         }
         None => {

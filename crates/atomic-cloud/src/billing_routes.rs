@@ -324,18 +324,37 @@ async fn webhook(
         }
     };
 
-    // Idempotency: claim the event id before applying any side effect. Stripe
-    // redelivers until it sees a 2xx and does not guarantee at-most-once
-    // delivery, so a verbatim replay must collapse to an ack with no repeated
-    // money/quota/audit work (plan: "The webhook is the source of truth").
-    // Only events with a real id participate; a malformed-but-verified event
-    // (no `evt_…` id) falls through to apply, which is itself convergent.
+    // Idempotency, atomic with the side effects. Stripe redelivers until it
+    // sees a 2xx and does not guarantee at-most-once delivery, so a verbatim
+    // replay must collapse to an ack with no repeated money/quota/audit work
+    // (plan: "The webhook is the source of truth"). The claim INSERT and every
+    // apply write run in ONE transaction so a crash between the claim and the
+    // apply's side effects rolls BOTH back — Stripe's retry then re-processes
+    // the event rather than seeing a committed-but-uneffected claim and acking
+    // it as a permanent no-op (the adversarial finding). The `plan_transitions`
+    // audit dedup is preserved: the claim row and the audit rows commit (or
+    // abort) together. Only events with a real id participate in the claim; a
+    // malformed-but-verified event (no `evt_…` id) still applies inside the
+    // transaction (the apply is itself convergent), it just isn't deduped.
     let event_id = event["id"].as_str().unwrap_or_default();
     let event_type = event["type"].as_str().unwrap_or_default();
+
+    let mut tx = match state.control.pool().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, "opening webhook transaction failed");
+            return internal_error();
+        }
+    };
+
     if !event_id.is_empty() {
-        match dunning::claim_webhook_event(&state.control, event_id, event_type).await {
+        match dunning::claim_webhook_event_on_conn(&mut tx, event_id, event_type).await {
             Ok(true) => {}
             Ok(false) => {
+                // Already processed: roll back the (no-op) claim attempt and
+                // ack. Dropping the tx without commit rolls back too; the
+                // explicit rollback is just clarity.
+                let _ = tx.rollback().await;
                 tracing::debug!(
                     event_id,
                     event_type,
@@ -345,22 +364,29 @@ async fn webhook(
             }
             Err(e) => {
                 tracing::error!(error = %e, "claiming Stripe webhook event failed");
+                let _ = tx.rollback().await;
                 return internal_error();
             }
         }
     }
 
-    if let Err(e) = apply(&state, parsed).await {
+    if let Err(e) = apply(&mut tx, parsed).await {
         tracing::error!(error = %e, "applying Stripe webhook failed");
-        // Release the claim so Stripe's retry re-processes this event rather
-        // than being deduped into a permanent no-op — the apply failed, so
-        // the side effects did NOT land. A failed release is logged but can't
-        // change the 500 we owe Stripe (it will retry regardless).
-        if !event_id.is_empty() {
-            if let Err(e) = dunning::release_webhook_event(&state.control, event_id).await {
-                tracing::error!(error = %e, event_id, "releasing failed webhook claim failed");
-            }
+        // Roll the transaction back — the claim and any partial side effects
+        // are discarded, so Stripe's retry re-processes the event from a clean
+        // slate (the side effects did NOT land). A failed rollback is logged
+        // but can't change the 500 we owe Stripe (it will retry regardless).
+        if let Err(e) = tx.rollback().await {
+            tracing::error!(error = %e, event_id, "rolling back failed webhook transaction failed");
         }
+        return internal_error();
+    }
+
+    if let Err(e) = tx.commit().await {
+        // The claim and side effects are still uncommitted (rolled back by the
+        // failed commit), so Stripe's retry re-processes — correct, not a
+        // permanent no-op.
+        tracing::error!(error = %e, event_id, "committing webhook transaction failed");
         return internal_error();
     }
     HttpResponse::Ok().json(serde_json::json!({ "received": true }))
@@ -368,7 +394,13 @@ async fn webhook(
 
 /// Apply a projected webhook event to the control plane, resolving the
 /// account by Stripe customer id (link it first on the upsert path).
-async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::error::CloudError> {
+///
+/// Runs on the webhook's claim+apply transaction (`conn`), so every write here
+/// commits or rolls back atomically with the event-id claim.
+async fn apply(
+    conn: &mut sqlx::PgConnection,
+    event: WebhookEvent,
+) -> Result<(), crate::error::CloudError> {
     match event {
         WebhookEvent::SubscriptionUpserted(sub) => {
             // Resolve (and, on the very first subscription, ESTABLISH) the
@@ -387,14 +419,13 @@ async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::e
             // separate `checkout.session.completed`, keeping the handled-event
             // set exactly as the plan specifies.)
             let account_id =
-                match dunning::account_for_customer(&state.control, &sub.stripe_customer_id).await?
-                {
+                match dunning::account_for_customer_on_conn(conn, &sub.stripe_customer_id).await? {
                     Some(account_id) => Some(account_id),
-                    None => link_from_subdomain(state, &sub).await?,
+                    None => link_from_subdomain(conn, &sub).await?,
                 };
             match account_id {
                 Some(account_id) => {
-                    dunning::apply_subscription_event(&state.control, &account_id, &sub).await
+                    dunning::apply_subscription_event_on_conn(conn, &account_id, &sub).await
                 }
                 None => {
                     tracing::warn!(
@@ -407,22 +438,26 @@ async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::e
             }
         }
         WebhookEvent::SubscriptionDeleted { stripe_customer_id } => {
-            apply_by_customer(state, &stripe_customer_id, |c, id| {
-                Box::pin(dunning::apply_subscription_deleted(c, id))
-            })
-            .await
+            match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
+                Some(account_id) => {
+                    dunning::apply_subscription_deleted_on_conn(conn, &account_id).await
+                }
+                None => unknown_customer(&stripe_customer_id),
+            }
         }
         WebhookEvent::PaymentFailed { stripe_customer_id } => {
-            apply_by_customer(state, &stripe_customer_id, |c, id| {
-                Box::pin(dunning::apply_payment_failed(c, id))
-            })
-            .await
+            match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
+                Some(account_id) => dunning::apply_payment_failed_on_conn(conn, &account_id).await,
+                None => unknown_customer(&stripe_customer_id),
+            }
         }
         WebhookEvent::PaymentSucceeded { stripe_customer_id } => {
-            apply_by_customer(state, &stripe_customer_id, |c, id| {
-                Box::pin(dunning::apply_payment_succeeded(c, id))
-            })
-            .await
+            match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
+                Some(account_id) => {
+                    dunning::apply_payment_succeeded_on_conn(conn, &account_id).await
+                }
+                None => unknown_customer(&stripe_customer_id),
+            }
         }
         WebhookEvent::Ignored { event_type } => {
             tracing::debug!(event_type, "ignoring unhandled Stripe event");
@@ -431,22 +466,43 @@ async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::e
     }
 }
 
+/// Log-and-ignore a billing event whose Stripe customer maps to no known
+/// account (a customer created out-of-band) — a verified-but-irrelevant event.
+fn unknown_customer(stripe_customer_id: &str) -> Result<(), crate::error::CloudError> {
+    tracing::warn!(
+        customer = stripe_customer_id,
+        "billing event for an unknown Stripe customer; ignoring"
+    );
+    Ok(())
+}
+
 /// Establish the `stripe_customers` linkage for a brand-new subscription by
 /// resolving its `metadata.subdomain` to an account, then return that account
 /// id. `None` when the subscription carries no subdomain (out-of-band) or the
 /// subdomain matches no account (a stale/forged subdomain — the verified
 /// signature guarantees the event is from Stripe, but the metadata is
 /// caller-supplied at checkout, so a mismatch is logged and ignored rather
-/// than trusted). Linking is idempotent ([`dunning::link_stripe_customer`]
+/// than trusted). Linking is idempotent ([`dunning::link_stripe_customer_on_conn`]
 /// upserts), so a retry after a transient apply failure re-links harmlessly.
+///
+/// The subdomain lookup and the link both run on the webhook's transaction
+/// (`conn`) so they share the claim's atomicity.
 async fn link_from_subdomain(
-    state: &BillingState,
+    conn: &mut sqlx::PgConnection,
     sub: &billing::SubscriptionState,
 ) -> Result<Option<String>, crate::error::CloudError> {
     let Some(subdomain) = sub.subdomain.as_deref() else {
         return Ok(None);
     };
-    let Some(account_id) = state.control.account_id_by_subdomain(subdomain).await? else {
+    let account_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE subdomain = $1")
+            .bind(subdomain)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(crate::error::CloudError::db(
+                "looking up account by subdomain",
+            ))?;
+    let Some(account_id) = account_id else {
         tracing::warn!(
             customer = sub.stripe_customer_id,
             subdomain,
@@ -454,7 +510,7 @@ async fn link_from_subdomain(
         );
         return Ok(None);
     };
-    dunning::link_stripe_customer(&state.control, &account_id, &sub.stripe_customer_id).await?;
+    dunning::link_stripe_customer_on_conn(conn, &account_id, &sub.stripe_customer_id).await?;
     tracing::info!(
         customer = sub.stripe_customer_id,
         account_id,
@@ -462,33 +518,6 @@ async fn link_from_subdomain(
         "linked Stripe customer to account from checkout subscription metadata"
     );
     Ok(Some(account_id))
-}
-
-/// Resolve the account for a Stripe customer and run `f` against it; a no-op
-/// (logged) when the customer maps to no known account.
-async fn apply_by_customer<F>(
-    state: &BillingState,
-    stripe_customer_id: &str,
-    f: F,
-) -> Result<(), crate::error::CloudError>
-where
-    F: for<'a> FnOnce(
-        &'a ControlPlane,
-        &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::error::CloudError>> + 'a>,
-    >,
-{
-    match dunning::account_for_customer(&state.control, stripe_customer_id).await? {
-        Some(account_id) => f(&state.control, &account_id).await,
-        None => {
-            tracing::warn!(
-                customer = stripe_customer_id,
-                "billing event for an unknown Stripe customer; ignoring"
-            );
-            Ok(())
-        }
-    }
 }
 
 /// Resolve the request's account id, requiring an **account-scope** credential

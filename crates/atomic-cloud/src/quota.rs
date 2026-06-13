@@ -13,23 +13,45 @@
 //!
 //! | Route                                   | Limit       | Count source                        |
 //! |-----------------------------------------|-------------|-------------------------------------|
-//! | `POST /api/atoms`                       | `atom_limit`| `AtomicCore::count_atoms()` (live)  |
-//! | `POST /api/atoms/bulk`                  | `atom_limit`| live count + the request's batch    |
-//! | `POST /api/ingest/url`                  | `atom_limit`| live count + 1                      |
-//! | `POST /api/ingest/urls`                 | `atom_limit`| live count + the request's batch    |
+//! | `POST /api/atoms`                       | `atom_limit`| account-wide live atom sum          |
+//! | `POST /api/atoms/bulk`                  | `atom_limit`| account-wide sum + the request batch|
+//! | `POST /api/ingest/url`                  | `atom_limit`| account-wide sum + 1                |
+//! | `POST /api/ingest/urls`                 | `atom_limit`| account-wide sum + the request batch|
+//! | `POST /api/import/obsidian`             | `atom_limit`| account-wide sum + 1 (per-note delta)|
 //! | `POST /api/databases`                   | `kb_limit`  | `DatabaseManager::list_databases()` |
 //!
-//! URL ingestion creates atoms exactly like the `/api/atoms` routes, so it
-//! counts against `atom_limit` too — an account at its ceiling can't slip
-//! past the gate by ingesting instead of creating (the plan's enforcement
-//! table lists "Atom create" generically; both surfaces grow the atom count).
+//! URL ingestion and Obsidian import create atoms exactly like the
+//! `/api/atoms` routes, so they count against `atom_limit` too — an account at
+//! its ceiling can't slip past the gate by ingesting or importing instead of
+//! creating (the plan's enforcement table lists "Atom create" generically; all
+//! these surfaces grow the atom count).
+//!
+//! The atom count is **account-wide**: it sums `count_atoms()` across every
+//! knowledge base in the tenant, not just the one a request targets, because
+//! the limit is an account ceiling (plan). Counting only the targeted KB would
+//! let a tenant on a finite-atom plan with `kb_limit > 1` evade the ceiling by
+//! spreading atoms across KBs. This matches
+//! [`account_over_plan_limits`]' semantics; the KB list is small, so it stays
+//! cheap. The KB count is `DatabaseManager::list_databases()` length.
 //!
 //! Both counts are read **live** from the tenant database at enforcement
-//! time — cheap, single-statement, strongly consistent. There is no stored
-//! atom/KB counter to drift (the `quota_usage` table is for metrics that
-//! can't be counted cheaply live; see [`crate::plans`]). A `NULL` limit
+//! time — cheap, single-statement per KB, strongly consistent. There is no
+//! stored atom/KB counter to drift (the `quota_usage` table is for metrics
+//! that can't be counted cheaply live; see [`crate::plans`]). A `NULL` limit
 //! means unlimited and the guard passes the request straight through —
 //! the count is never even read.
+//!
+//! # Cost bound on the create hot path
+//!
+//! The atom gate adds tenant-database round-trips before the handler runs
+//! (one `count_atoms()` per knowledge base). These ride the tenant pool's
+//! connection acquire, which is bounded by the pool's `acquire_timeout`
+//! (10s; see [`crate::account_cache`] / the cluster pool config) — there is
+//! no statement-level timeout on the count itself, as that would require an
+//! atomic-core change (the one-way dependency rule forbids teaching core
+//! about cloud), and the count is a trivially-indexed aggregate. The acquire
+//! timeout is the operative upper bound on how long the gate can delay a
+//! create before failing it with an operational error.
 //!
 //! # The live-count gate is a soft ceiling, not a reservation
 //!
@@ -113,7 +135,16 @@ fn quota_target(method: &Method, path: &str) -> Option<QuotaTarget> {
         return None;
     }
     match path {
-        "/api/atoms" | "/api/ingest/url" => Some(QuotaTarget::Atom),
+        // `/api/import/obsidian` creates one atom per vault note. Its batch
+        // size lives on the server-side filesystem (`vault_path`), not in the
+        // request body, so it can't be counted ahead of time the way the bulk
+        // routes are — it rides the single-atom delta (admits only while the
+        // tenant is at least one atom under the ceiling). Practical cloud
+        // impact is currently low (the vault path is server-side and not a
+        // surface a hosted tenant can drive a large vault through), but it is
+        // a real atom-creating route and a bypass alias for `/api/atoms`, so
+        // it is gated rather than left fallback-unbound.
+        "/api/atoms" | "/api/ingest/url" | "/api/import/obsidian" => Some(QuotaTarget::Atom),
         "/api/atoms/bulk" => Some(QuotaTarget::AtomBulk),
         "/api/ingest/urls" => Some(QuotaTarget::IngestUrls),
         "/api/databases" => Some(QuotaTarget::Kb),
@@ -214,31 +245,60 @@ pub async fn account_over_plan_limits(
         if kbs.len() as i64 > i64::from(kb_limit) {
             return Ok(true);
         }
-        if let Some(atom_limit) = plan.atom_limit {
-            let mut total: i64 = 0;
-            for db in kbs {
-                let core = manager.get_core(&db.id).await?;
-                total += i64::from(core.count_atoms().await?);
-                if total > i64::from(atom_limit) {
-                    return Ok(true);
-                }
-            }
-        }
+    }
+    account_over_atom_limit(plan, manager).await
+}
+
+/// Whether the account is over `plan`'s **atom** ceiling alone, summed across
+/// every knowledge base — the atom axis of [`account_over_plan_limits`],
+/// pulled out so the background dispatcher can gate atom-creating work without
+/// re-checking the KB count (background work never creates a KB). A `NULL`
+/// `atom_limit` is unlimited and never over. The limit is account-wide, so
+/// the count is the sum over all KBs.
+pub async fn account_over_atom_limit(
+    plan: &Plan,
+    manager: &DatabaseManager,
+) -> Result<bool, atomic_core::AtomicCoreError> {
+    let Some(atom_limit) = plan.atom_limit else {
         return Ok(false);
+    };
+    Ok(count_account_atoms(manager).await? > i64::from(atom_limit))
+}
+
+/// Whether the account has **no room for another atom** under `plan` — its
+/// account-wide atom count is at or above the ceiling (`count >= limit`), so a
+/// single new atom would overshoot. A `NULL` `atom_limit` is unlimited and
+/// always has room.
+///
+/// This is the *background-dispatch* gate (distinct from
+/// [`account_over_atom_limit`]'s strictly-over "already exceeds" semantics,
+/// which drives the downgrade read-only decision): the dispatcher must defer
+/// atom-creating work the moment the next atom would breach the ceiling, the
+/// same boundary the request-time guard enforces with `current + 1 <= limit`.
+pub async fn account_atom_limit_reached(
+    plan: &Plan,
+    manager: &DatabaseManager,
+) -> Result<bool, atomic_core::AtomicCoreError> {
+    let Some(atom_limit) = plan.atom_limit else {
+        return Ok(false);
+    };
+    Ok(count_account_atoms(manager).await? >= i64::from(atom_limit))
+}
+
+/// Sum the live atom count across every knowledge base in the tenant — the
+/// account-wide atom total both the request-time gate and the sweep/dispatcher
+/// over-limit checks denominate against. Strongly consistent (each KB count is
+/// a single live statement); the KB list is small.
+async fn count_account_atoms(
+    manager: &DatabaseManager,
+) -> Result<i64, atomic_core::AtomicCoreError> {
+    let kbs = manager.list_databases().await?.0;
+    let mut total: i64 = 0;
+    for db in kbs {
+        let core = manager.get_core(&db.id).await?;
+        total += i64::from(core.count_atoms().await?);
     }
-    // No KB limit: still enforce the atom ceiling account-wide.
-    if let Some(atom_limit) = plan.atom_limit {
-        let kbs = manager.list_databases().await?.0;
-        let mut total: i64 = 0;
-        for db in kbs {
-            let core = manager.get_core(&db.id).await?;
-            total += i64::from(core.count_atoms().await?);
-            if total > i64::from(atom_limit) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    Ok(total)
 }
 
 /// Run the resource check for `target`. `Ok(None)` admits; `Ok(Some(resp))`
@@ -264,10 +324,15 @@ async fn check_resource(
 
     let current: i64 = match target {
         QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls => {
-            // Count atoms in the SAME knowledge base the create will target,
-            // resolved exactly as atomic-server's handler will resolve it.
-            let core = resolve_core(manager, req).await?;
-            i64::from(core.count_atoms().await?)
+            // The atom limit is an account-wide ceiling, so the gate sums
+            // atoms across EVERY knowledge base — not just the one this
+            // request targets. Counting a single KB would let a tenant on a
+            // finite-atom plan with `kb_limit > 1` evade the ceiling by
+            // spreading atoms across KBs (each KB stays under, the account
+            // doesn't). This matches [`account_over_plan_limits`]' semantics;
+            // the account's KB list is small, so it's the same cheap work the
+            // trial/downgrade sweep does.
+            count_account_atoms(manager).await?
         }
         QuotaTarget::Kb => manager.list_databases().await?.0.len() as i64,
     };
@@ -279,35 +344,6 @@ async fn check_resource(
         return Ok(Some(quota_exceeded(metric, current, limit, req)));
     }
     Ok(None)
-}
-
-/// Resolve which knowledge-base core the request addresses within `manager`,
-/// mirroring atomic-server's `resolve_core` selection (X-Atomic-Database
-/// header → `?db=` → active) so the count is read against the exact KB the
-/// handler will create into. CloudAuth injects the header for database-scoped
-/// credentials, so this honors that pinning too.
-async fn resolve_core(
-    manager: &DatabaseManager,
-    req: &ServiceRequest,
-) -> Result<atomic_core::AtomicCore, atomic_core::AtomicCoreError> {
-    if let Some(db_id) = req
-        .headers()
-        .get("x-atomic-database")
-        .and_then(|v| v.to_str().ok())
-    {
-        return manager.get_core(db_id).await;
-    }
-    if let Some(db_id) = req.query_string().split('&').find_map(|pair| {
-        let mut parts = pair.splitn(2, '=');
-        if parts.next()? == "db" {
-            parts.next()
-        } else {
-            None
-        }
-    }) {
-        return manager.get_core(db_id).await;
-    }
-    manager.active_core().await
 }
 
 /// Buffer the request body, count the batch's elements, and **re-inject the
@@ -406,6 +442,12 @@ mod tests {
         // URL ingestion creates atoms too — counts against atom_limit.
         assert_eq!(
             quota_target(&post, "/api/ingest/url"),
+            Some(QuotaTarget::Atom)
+        );
+        // Obsidian import creates one atom per note — a bypass alias for
+        // /api/atoms, gated on the single-atom delta.
+        assert_eq!(
+            quota_target(&post, "/api/import/obsidian"),
             Some(QuotaTarget::Atom)
         );
         assert_eq!(

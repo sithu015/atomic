@@ -147,7 +147,9 @@ use crate::dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint,
 };
 use crate::error::CloudError;
+use crate::plans::PlanRegistry;
 use crate::pools::{WorkClass, WorkTypeCap, WorkerPools, WorkerPoolsConfig};
+use crate::quota::account_atom_limit_reached;
 
 pub use crate::backpressure::RATE_LIMIT_REQUEUE_DELAY;
 
@@ -282,6 +284,26 @@ impl WorkItem {
             | WorkItem::WikiRegen { .. }
             | WorkItem::Report { .. } => true,
             WorkItem::SystemTask { .. } | WorkItem::FeedPoll { .. } => false,
+        }
+    }
+
+    /// Whether executing this item *adds atoms* to the tenant — the gate on
+    /// the plan's account-wide `atom_limit` for background work (the
+    /// adversarial finding: the data-plane quota guard only covers the
+    /// synchronous create routes, so out-of-band atom creation here must
+    /// honor the same ceiling). A feed poll ingests one atom per new entry; a
+    /// report run writes a finding atom. The other work-types never grow the
+    /// atom count — embedding/tagging batches mutate existing atoms, wiki
+    /// regen writes a wiki article (not an atom), maintenance is housekeeping
+    /// — so they run regardless of the limit (the plan: "Do NOT skip non-atom-
+    /// creating work"). When a tenant is at its atom ceiling, only the
+    /// atom-creating items are deferred; the rest still drain.
+    pub fn creates_atoms(&self) -> bool {
+        match self {
+            WorkItem::FeedPoll { .. } | WorkItem::Report { .. } => true,
+            WorkItem::PipelineBatch { .. }
+            | WorkItem::SystemTask { .. }
+            | WorkItem::WikiRegen { .. } => false,
         }
     }
 }
@@ -728,6 +750,11 @@ pub struct Dispatcher {
     cache: Arc<AccountCache>,
     pools: Arc<WorkerPools>,
     executor: Arc<dyn WorkExecutor>,
+    /// The plan catalogue, for the per-tick atom-limit gate on atom-creating
+    /// background work ([`WorkItem::creates_atoms`]). `None` disables the
+    /// gate (test dispatchers that aren't exercising quota enforcement);
+    /// production always supplies it via [`Dispatcher::new`].
+    plan_registry: Option<Arc<PlanRegistry>>,
     config: DispatcherConfig,
     last_slow_scan: Mutex<Option<Instant>>,
 }
@@ -737,6 +764,13 @@ impl Dispatcher {
     /// the serving stack uses (so workers publish into the channels live
     /// WebSocket clients hold), feeding a [`ProviderBreaker`] over the same
     /// control plane the pause gate reads.
+    ///
+    /// The atom-limit gate on atom-creating background work
+    /// ([`WorkItem::creates_atoms`]) is opt-in via
+    /// [`Dispatcher::with_plan_registry`] — `serve` calls it with the request
+    /// path's same in-memory plan catalogue. Without it the gate is inert
+    /// (the synchronous data-plane quota guard remains the request-path
+    /// ceiling); tests that don't exercise the gate skip it.
     pub fn new(control: ControlPlane, cache: Arc<AccountCache>, config: DispatcherConfig) -> Self {
         let breaker = Arc::new(ProviderBreaker::new(
             control.clone(),
@@ -762,9 +796,20 @@ impl Dispatcher {
             cache,
             pools: Arc::new(WorkerPools::new(config.pools)),
             executor,
+            plan_registry: None,
             config,
             last_slow_scan: Mutex::new(None),
         }
+    }
+
+    /// Install the plan catalogue that drives the atom-limit gate on
+    /// atom-creating background work (feed polls, report runs). `serve` calls
+    /// this with the shared registry so the dispatcher reads the same limits
+    /// the data-plane quota guard does; the quota-gate test installs a
+    /// finite-limit registry to exercise the defer behavior.
+    pub fn with_plan_registry(mut self, plan_registry: Arc<PlanRegistry>) -> Self {
+        self.plan_registry = Some(plan_registry);
+        self
     }
 
     /// The pools, for instrumentation in tests and metrics.
@@ -854,6 +899,32 @@ impl Dispatcher {
                     continue;
                 }
             };
+
+            // Atom-limit gate (plan: "Background jobs that hit a limit block,
+            // sit in the ledger"): when the tenant is at/over its account-wide
+            // atom ceiling, DEFER the atom-creating work this tick (feed polls
+            // ingest atoms, report runs write findings) rather than create
+            // atoms uncounted past the quota guard's data-plane reach. The
+            // durable ledger rows are untouched — the feed/report stays
+            // pending and re-derives next tick, proceeding once the user
+            // deletes data or upgrades (mirroring the provider-pause hold).
+            // Non-atom-creating work (embedding, wiki, maintenance) is never
+            // skipped: it doesn't grow the count, and stalling it would strand
+            // the very pipeline that lets a user get back under the limit.
+            let mut poll = poll;
+            if poll.items.iter().any(WorkItem::creates_atoms)
+                && self.over_atom_limit(&account_id).await
+            {
+                let before = poll.items.len();
+                poll.items.retain(|item| !item.creates_atoms());
+                let deferred = before - poll.items.len();
+                tracing::info!(
+                    account_id,
+                    deferred,
+                    "[dispatcher] tenant at atom limit; deferring atom-creating background work \
+                     (feed polls / report runs) this tick"
+                );
+            }
 
             let has_work = !poll.items.is_empty() || poll.ledger_active;
             match (has_work, hint_stamp) {
@@ -1074,6 +1145,52 @@ impl Dispatcher {
             Err(e) => {
                 tracing::warn!(error = %e, "[dispatcher] dispatch-hold lookup failed; assuming none held");
                 HashSet::new()
+            }
+        }
+    }
+
+    /// Whether the tenant has no room for another atom under its plan — the
+    /// gate that defers atom-creating background work for the tick (feed
+    /// polls, report runs). Resolves the plan from the registry and sums the
+    /// live atom count across the tenant's knowledge bases, deferring the
+    /// moment a new atom would breach the ceiling (`count >= limit`), the same
+    /// boundary the request-time guard enforces (via
+    /// [`account_atom_limit_reached`]).
+    ///
+    /// **Fails open** (returns `false`) when the registry is absent, the plan
+    /// can't be resolved, or the count read errors — exactly like the
+    /// dispatcher's other dispatch holds ([`Self::held_accounts`]): an
+    /// operational fault reading a quota must not wedge a tenant's background
+    /// work fleet-wide. The synchronous data-plane quota guard remains the
+    /// authoritative ceiling on the request path; this is the background
+    /// backstop. The handle is a cache hit (the poll just loaded it).
+    async fn over_atom_limit(&self, account_id: &str) -> bool {
+        let Some(registry) = self.plan_registry.as_ref() else {
+            return false;
+        };
+        let plan = match registry.for_account(account_id).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!(account_id, error = %e, "[dispatcher] plan resolve for atom-limit gate failed; not deferring");
+                return false;
+            }
+        };
+        // Unlimited plans never read the count.
+        if plan.atom_limit.is_none() {
+            return false;
+        }
+        let handle = match self.cache.get_or_load(account_id).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::warn!(account_id, error = %e, "[dispatcher] tenant load for atom-limit gate failed; not deferring");
+                return false;
+            }
+        };
+        match account_atom_limit_reached(&plan, &handle.manager).await {
+            Ok(reached) => reached,
+            Err(e) => {
+                tracing::warn!(account_id, error = %e, "[dispatcher] atom count for limit gate failed; not deferring");
+                false
             }
         }
     }

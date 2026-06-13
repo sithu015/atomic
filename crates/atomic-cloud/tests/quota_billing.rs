@@ -26,8 +26,9 @@ use std::time::Duration;
 use actix_web::{web, App, HttpServer};
 use atomic_cloud::{
     advance_dunning, advance_expired_trials, apply_payment_failed, apply_payment_succeeded,
-    apply_subscription_deleted, apply_subscription_event, claim_webhook_event, configure_cloud_app,
-    expired_trials, finish_expired_trial, issue_token, link_stripe_customer, provision_account,
+    apply_subscription_deleted, apply_subscription_event, apply_subscription_event_on_conn,
+    claim_webhook_event, claim_webhook_event_on_conn, configure_cloud_app, expired_trials,
+    finish_expired_trial, issue_token, link_stripe_customer, provision_account,
     release_webhook_event, start_trial, AccountCache, AccountCacheConfig, AccountPlane,
     AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
     DataPlaneRateLimiter, DataPlaneRateLimits, FallbackAppState, ManagedKeys, NewAccount,
@@ -479,6 +480,94 @@ async fn kb_limit_blocks_database_create() {
 }
 
 #[actix_web::test]
+async fn atom_limit_is_account_wide_across_knowledge_bases() {
+    // The atom ceiling is an ACCOUNT limit, not per-KB: a tenant on a finite
+    // atom plan with kb_limit > 1 must not evade it by spreading atoms across
+    // knowledge bases (each KB under, the account over). The request-time gate
+    // sums count_atoms across every KB, matching the sweep's semantics.
+    with_control_db("atom_limit_account_wide", |url| async move {
+        // Free = 3 atoms account-wide, up to 3 KBs.
+        set_free_limits(&url, Some(3), Some(3)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // Two atoms in the default KB (account total 2).
+        for i in 0..2 {
+            assert_eq!(
+                harness
+                    .create_atom(&tenant, &format!("default {i}"))
+                    .await
+                    .status(),
+                StatusCode::CREATED,
+                "default-KB create {i}"
+            );
+        }
+
+        // Create a second KB and grab its id.
+        let kb: Value = harness
+            .api(Method::POST, &tenant.subdomain, "/api/databases")
+            .bearer_auth(&tenant.token)
+            .json(&json!({ "name": "Second KB" }))
+            .send()
+            .await
+            .expect("create second kb")
+            .json()
+            .await
+            .expect("kb body");
+        let kb_id = kb["id"].as_str().expect("second kb id").to_string();
+
+        // One atom in the second KB lands the ACCOUNT total at exactly the
+        // limit (2 + 1 = 3). Targeted via the X-Atomic-Database header, exactly
+        // as the handler resolves the KB.
+        let in_kb2 = harness
+            .api(Method::POST, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .header("X-Atomic-Database", &kb_id)
+            .json(&json!({ "content": "kb2 atom" }))
+            .send()
+            .await
+            .expect("create in kb2");
+        assert_eq!(
+            in_kb2.status(),
+            StatusCode::CREATED,
+            "third atom (in KB2) reaches the account-wide limit"
+        );
+
+        // A fourth atom in the SECOND KB would land the account at 4 > 3 — even
+        // though KB2 holds only 1 atom. Per-KB counting would wrongly admit it;
+        // account-wide counting blocks it.
+        let over_in_kb2 = harness
+            .api(Method::POST, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .header("X-Atomic-Database", &kb_id)
+            .json(&json!({ "content": "kb2 over" }))
+            .send()
+            .await
+            .expect("create over in kb2");
+        assert_eq!(
+            over_in_kb2.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "the account-wide ceiling blocks a spread-across-KB create"
+        );
+        let body: Value = over_in_kb2.json().await.expect("quota body");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["metric"], "atoms");
+        assert_eq!(body["current"], 3, "account-wide sum across both KBs");
+        assert_eq!(body["limit"], 3);
+
+        // And the default KB is equally blocked (same account-wide count).
+        assert_eq!(
+            harness.create_atom(&tenant, "default over").await.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "the default KB sees the same account-wide ceiling"
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
 async fn atom_limit_is_isolated_across_tenants() {
     with_control_db("atom_limit_isolated", |url| async move {
         set_free_limits(&url, Some(1), Some(5)).await;
@@ -905,6 +994,114 @@ async fn replayed_subscription_event_does_not_duplicate_the_audit_row() {
         assert_eq!(
             transitions, 1,
             "the redelivered event is deduped — exactly one audit row"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn webhook_claim_rolls_back_with_a_failed_apply() {
+    // The claim and the apply share ONE transaction, so a crash/error after
+    // the claim but before commit must roll the claim back — otherwise a
+    // committed-but-uneffected claim would dedupe Stripe's redelivery into a
+    // permanent no-op and silently drop the event's billing effects (the
+    // adversarial finding). This drives the exact tx shape the webhook handler
+    // uses: claim_on_conn → apply_on_conn, then deliberately abort.
+    with_control_db("webhook_claim_rollback", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+        link_stripe_customer(&control, &account_id, "cus_1")
+            .await
+            .expect("link customer");
+
+        let sub = SubscriptionState {
+            stripe_customer_id: "cus_1".into(),
+            stripe_subscription_id: "sub_1".into(),
+            plan_id: "pro".into(),
+            status: "active".into(),
+            current_period_start: chrono::Utc::now(),
+            current_period_end: chrono::Utc::now() + chrono::Duration::days(30),
+            cancel_at_period_end: false,
+            subdomain: Some("alpha".into()),
+        };
+
+        // Delivery 1: claim + apply in a transaction, then ROLL BACK (simulating
+        // a crash between the claim commit and the apply's side effects landing
+        // in the old claim-before-apply design).
+        {
+            let mut tx = control.pool().begin().await.expect("begin");
+            assert!(
+                claim_webhook_event_on_conn(&mut tx, "evt_x", "customer.subscription.updated")
+                    .await
+                    .expect("claim in tx"),
+                "first delivery claims the event"
+            );
+            apply_subscription_event_on_conn(&mut tx, &account_id, &sub)
+                .await
+                .expect("apply in tx");
+            tx.rollback().await.expect("rollback");
+        }
+
+        // The claim was rolled back with the apply: the plan did NOT change and
+        // no audit row exists — nothing committed.
+        assert_eq!(
+            plan_id(&control, &account_id).await.as_deref(),
+            Some("free"),
+            "the rolled-back apply left the plan unchanged"
+        );
+        let transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_transitions WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_one(control.pool())
+                .await
+                .expect("count transitions");
+        assert_eq!(transitions, 0, "no audit row survived the rollback");
+
+        // Stripe's redelivery of the SAME event id is therefore re-processed,
+        // not deduped into a no-op: the claim is available again and this time
+        // we commit.
+        {
+            let mut tx = control.pool().begin().await.expect("begin");
+            assert!(
+                claim_webhook_event_on_conn(&mut tx, "evt_x", "customer.subscription.updated")
+                    .await
+                    .expect("re-claim in tx"),
+                "the rolled-back claim is available to the redelivery"
+            );
+            apply_subscription_event_on_conn(&mut tx, &account_id, &sub)
+                .await
+                .expect("apply in tx");
+            tx.commit().await.expect("commit");
+        }
+        assert_eq!(
+            plan_id(&control, &account_id).await.as_deref(),
+            Some("pro"),
+            "the redelivery applied the subscription"
+        );
+
+        // And a genuine redelivery AFTER a successful commit is deduped — the
+        // claim is now committed, so a third delivery wins no claim and skips
+        // apply (the audit row count stays at exactly one).
+        {
+            let mut tx = control.pool().begin().await.expect("begin");
+            assert!(
+                !claim_webhook_event_on_conn(&mut tx, "evt_x", "customer.subscription.updated")
+                    .await
+                    .expect("dup claim in tx"),
+                "a committed claim dedupes the genuine redelivery"
+            );
+            tx.rollback().await.expect("rollback no-op");
+        }
+        let transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_transitions WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_one(control.pool())
+                .await
+                .expect("count transitions");
+        assert_eq!(
+            transitions, 1,
+            "exactly one audit row: the committed delivery, deduped thereafter"
         );
     })
     .await;

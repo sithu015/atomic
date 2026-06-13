@@ -33,6 +33,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sqlx::PgConnection;
 
 use crate::billing::SubscriptionState;
 use crate::control_plane::ControlPlane;
@@ -150,8 +151,12 @@ pub fn billing_state_from_column(value: &str) -> BillingState {
 /// callers thread the trigger and an optional detail. A foreign-key
 /// violation (the account vanished) is success — there is nothing to audit
 /// for a deleted account.
+///
+/// Runs on whatever connection the caller threads — the webhook's apply path
+/// passes the same transaction the claim rode, so the audit row commits (or
+/// rolls back) atomically with the rest of the event's effects.
 async fn record_transition(
-    control: &ControlPlane,
+    conn: &mut PgConnection,
     account_id: &str,
     from_plan: Option<&str>,
     to_plan: Option<&str>,
@@ -168,7 +173,7 @@ async fn record_transition(
     .bind(to_plan)
     .bind(trigger)
     .bind(detail)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await;
     match result {
         Ok(_) => Ok(()),
@@ -177,19 +182,28 @@ async fn record_transition(
     }
 }
 
-/// Claim a Stripe webhook event id for one-time processing. Inserts the id
-/// into `processed_webhook_events`; returns `true` when THIS call won the
-/// insert (a first delivery, so the caller should apply the event) and
-/// `false` when the id was already present (a redelivery — Stripe retries
-/// until it sees a 2xx and does not guarantee at-most-once delivery, so the
-/// caller acks without re-running the side effects).
+/// Claim a Stripe webhook event id for one-time processing on the caller's
+/// connection. Inserts the id into `processed_webhook_events`; returns `true`
+/// when THIS call won the insert (a first delivery, so the caller should apply
+/// the event) and `false` when the id was already present (a redelivery —
+/// Stripe retries until it sees a 2xx and does not guarantee at-most-once
+/// delivery, so the caller acks without re-running the side effects).
 ///
 /// This is the idempotency boundary: claiming before applying collapses every
 /// redelivery of the same event to a no-op, including the unconditional
 /// `checkout`-arm audit row that would otherwise duplicate in
 /// `plan_transitions` (plan: "The webhook is the source of truth").
-pub async fn claim_webhook_event(
-    control: &ControlPlane,
+///
+/// **Atomicity with apply.** The webhook claims and applies inside ONE
+/// transaction (see [`crate::billing_routes`]): the claim INSERT and every
+/// apply write share a connection, so a crash between the claim and the
+/// apply's side effects rolls back the claim too — Stripe's redelivery then
+/// re-processes the event instead of seeing a committed-but-uneffected claim
+/// and acking it as a permanent no-op (the adversarial finding this closes).
+/// The in-transaction dedup of the audit row is preserved because the claim
+/// row and the `plan_transitions` row commit together.
+pub async fn claim_webhook_event_on_conn(
+    conn: &mut PgConnection,
     event_id: &str,
     event_type: &str,
 ) -> Result<bool, CloudError> {
@@ -199,11 +213,25 @@ pub async fn claim_webhook_event(
     )
     .bind(event_id)
     .bind(event_type)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("claiming webhook event"))?
     .rows_affected();
     Ok(inserted > 0)
+}
+
+/// [`claim_webhook_event_on_conn`] against a pooled connection — the direct
+/// (non-transactional) form the tests drive. The webhook itself uses the
+/// `_on_conn` form inside its transaction.
+pub async fn claim_webhook_event(
+    control: &ControlPlane,
+    event_id: &str,
+    event_type: &str,
+) -> Result<bool, CloudError> {
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to claim webhook event",
+    ))?;
+    claim_webhook_event_on_conn(&mut conn, event_id, event_type).await
 }
 
 /// Release a previously-[`claim_webhook_event`]ed id, deleting its row. Called
@@ -223,24 +251,36 @@ pub async fn release_webhook_event(
 }
 
 /// Resolve the account id a webhook event pertains to, via its Stripe
-/// customer id. `None` when no `stripe_customers` row maps it (an event for
-/// an account we don't know — e.g. a customer created out-of-band).
-pub async fn account_for_customer(
-    control: &ControlPlane,
+/// customer id, on the caller's connection. `None` when no `stripe_customers`
+/// row maps it (an event for an account we don't know — e.g. a customer
+/// created out-of-band).
+pub async fn account_for_customer_on_conn(
+    conn: &mut PgConnection,
     stripe_customer_id: &str,
 ) -> Result<Option<String>, CloudError> {
     sqlx::query_scalar("SELECT account_id FROM stripe_customers WHERE stripe_customer_id = $1")
         .bind(stripe_customer_id)
-        .fetch_optional(control.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(CloudError::db("looking up account by Stripe customer"))
 }
 
-/// UPSERT the `stripe_customers` linkage. Called when a checkout completes (the
-/// first time we learn an account's Stripe customer id) and idempotent on
-/// retry.
-pub async fn link_stripe_customer(
+/// [`account_for_customer_on_conn`] against a pooled connection.
+pub async fn account_for_customer(
     control: &ControlPlane,
+    stripe_customer_id: &str,
+) -> Result<Option<String>, CloudError> {
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to resolve Stripe customer",
+    ))?;
+    account_for_customer_on_conn(&mut conn, stripe_customer_id).await
+}
+
+/// UPSERT the `stripe_customers` linkage on the caller's connection. Called
+/// when a checkout completes (the first time we learn an account's Stripe
+/// customer id) and idempotent on retry.
+pub async fn link_stripe_customer_on_conn(
+    conn: &mut PgConnection,
     account_id: &str,
     stripe_customer_id: &str,
 ) -> Result<(), CloudError> {
@@ -251,10 +291,23 @@ pub async fn link_stripe_customer(
     )
     .bind(account_id)
     .bind(stripe_customer_id)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("linking Stripe customer"))?;
     Ok(())
+}
+
+/// [`link_stripe_customer_on_conn`] against a pooled connection — the form the
+/// tests drive directly.
+pub async fn link_stripe_customer(
+    control: &ControlPlane,
+    account_id: &str,
+    stripe_customer_id: &str,
+) -> Result<(), CloudError> {
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to link Stripe customer",
+    ))?;
+    link_stripe_customer_on_conn(&mut conn, account_id, stripe_customer_id).await
 }
 
 /// Apply a `customer.subscription.{created,updated,deleted}` projection to an
@@ -291,6 +344,19 @@ pub async fn apply_subscription_event(
     account_id: &str,
     state: &SubscriptionState,
 ) -> Result<(), CloudError> {
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to apply subscription event",
+    ))?;
+    apply_subscription_event_on_conn(&mut conn, account_id, state).await
+}
+
+/// [`apply_subscription_event`] on the caller's connection — the form the
+/// webhook calls inside its claim+apply transaction.
+pub async fn apply_subscription_event_on_conn(
+    conn: &mut PgConnection,
+    account_id: &str,
+    state: &SubscriptionState,
+) -> Result<(), CloudError> {
     // Persist the subscription projection.
     sqlx::query(
         "INSERT INTO stripe_subscriptions \
@@ -313,19 +379,19 @@ pub async fn apply_subscription_event(
     .bind(state.current_period_start)
     .bind(state.current_period_end)
     .bind(state.cancel_at_period_end)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("persisting Stripe subscription"))?;
 
-    let from_plan = current_plan(control, account_id).await?;
+    let from_plan = current_plan(conn, account_id).await?;
 
     match state.status.as_str() {
         // A live subscription: stamp the plan, clear any dunning.
         "active" | "trialing" => {
-            set_plan(control, account_id, &state.plan_id).await?;
-            clear_billing_state(control, account_id).await?;
+            set_plan(conn, account_id, &state.plan_id).await?;
+            clear_billing_state(conn, account_id).await?;
             record_transition(
-                control,
+                conn,
                 account_id,
                 from_plan.as_deref(),
                 Some(&state.plan_id),
@@ -337,9 +403,9 @@ pub async fn apply_subscription_event(
         // Stripe is dunning this subscription: enter past_due (idempotent —
         // only stamps past_due_since on the first transition into it).
         "past_due" | "unpaid" => {
-            enter_past_due(control, account_id).await?;
+            enter_past_due(conn, account_id).await?;
             record_transition(
-                control,
+                conn,
                 account_id,
                 from_plan.as_deref(),
                 from_plan.as_deref(),
@@ -350,7 +416,7 @@ pub async fn apply_subscription_event(
         }
         // Canceled subscription: drop to free, keep data.
         "canceled" | "incomplete_expired" => {
-            apply_subscription_deleted(control, account_id).await?;
+            apply_subscription_deleted_on_conn(conn, account_id).await?;
         }
         // Any other Stripe status (incomplete, paused, …): persist the row
         // (done above) but make no serving-state change — the next
@@ -369,16 +435,28 @@ pub async fn apply_subscription_deleted(
     control: &ControlPlane,
     account_id: &str,
 ) -> Result<(), CloudError> {
-    let from_plan = current_plan(control, account_id).await?;
-    set_plan(control, account_id, DEFAULT_PLAN_ID).await?;
-    clear_billing_state(control, account_id).await?;
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to apply subscription deletion",
+    ))?;
+    apply_subscription_deleted_on_conn(&mut conn, account_id).await
+}
+
+/// [`apply_subscription_deleted`] on the caller's connection — the form the
+/// webhook calls inside its claim+apply transaction.
+pub async fn apply_subscription_deleted_on_conn(
+    conn: &mut PgConnection,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    let from_plan = current_plan(conn, account_id).await?;
+    set_plan(conn, account_id, DEFAULT_PLAN_ID).await?;
+    clear_billing_state(conn, account_id).await?;
     sqlx::query("DELETE FROM stripe_subscriptions WHERE account_id = $1")
         .bind(account_id)
-        .execute(control.pool())
+        .execute(&mut *conn)
         .await
         .map_err(CloudError::db("clearing deleted subscription"))?;
     record_transition(
-        control,
+        conn,
         account_id,
         from_plan.as_deref(),
         Some(DEFAULT_PLAN_ID),
@@ -396,11 +474,23 @@ pub async fn apply_payment_succeeded(
     control: &ControlPlane,
     account_id: &str,
 ) -> Result<(), CloudError> {
-    let changed = clear_billing_state(control, account_id).await?;
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to apply payment success",
+    ))?;
+    apply_payment_succeeded_on_conn(&mut conn, account_id).await
+}
+
+/// [`apply_payment_succeeded`] on the caller's connection — the form the
+/// webhook calls inside its claim+apply transaction.
+pub async fn apply_payment_succeeded_on_conn(
+    conn: &mut PgConnection,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    let changed = clear_billing_state(conn, account_id).await?;
     if changed {
-        let plan = current_plan(control, account_id).await?;
+        let plan = current_plan(conn, account_id).await?;
         record_transition(
-            control,
+            conn,
             account_id,
             plan.as_deref(),
             plan.as_deref(),
@@ -420,11 +510,23 @@ pub async fn apply_payment_failed(
     control: &ControlPlane,
     account_id: &str,
 ) -> Result<(), CloudError> {
-    let changed = enter_past_due(control, account_id).await?;
+    let mut conn = control.pool().acquire().await.map_err(CloudError::db(
+        "acquiring connection to apply payment failure",
+    ))?;
+    apply_payment_failed_on_conn(&mut conn, account_id).await
+}
+
+/// [`apply_payment_failed`] on the caller's connection — the form the webhook
+/// calls inside its claim+apply transaction.
+pub async fn apply_payment_failed_on_conn(
+    conn: &mut PgConnection,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    let changed = enter_past_due(conn, account_id).await?;
     if changed {
-        let plan = current_plan(control, account_id).await?;
+        let plan = current_plan(conn, account_id).await?;
         record_transition(
-            control,
+            conn,
             account_id,
             plan.as_deref(),
             plan.as_deref(),
@@ -438,14 +540,14 @@ pub async fn apply_payment_failed(
 
 /// Set `accounts.plan_id`. Used by the subscription/checkout arms.
 async fn set_plan(
-    control: &ControlPlane,
+    conn: &mut PgConnection,
     account_id: &str,
     plan_id: &str,
 ) -> Result<(), CloudError> {
     sqlx::query("UPDATE accounts SET plan_id = $2 WHERE id = $1")
         .bind(account_id)
         .bind(plan_id)
-        .execute(control.pool())
+        .execute(&mut *conn)
         .await
         .map_err(CloudError::db("setting account plan"))?;
     Ok(())
@@ -453,12 +555,12 @@ async fn set_plan(
 
 /// The account's current `plan_id`, for the audit-log `from_plan` field.
 async fn current_plan(
-    control: &ControlPlane,
+    conn: &mut PgConnection,
     account_id: &str,
 ) -> Result<Option<String>, CloudError> {
     sqlx::query_scalar("SELECT plan_id FROM accounts WHERE id = $1")
         .bind(account_id)
-        .fetch_optional(control.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map(Option::flatten)
         .map_err(CloudError::db("reading current plan"))
@@ -468,14 +570,14 @@ async fn current_plan(
 /// transition into a past-due-family state — re-running while already
 /// past_due/read_only/suspended must not reset the dunning clock and rescue
 /// the account. Returns whether the state actually changed.
-async fn enter_past_due(control: &ControlPlane, account_id: &str) -> Result<bool, CloudError> {
+async fn enter_past_due(conn: &mut PgConnection, account_id: &str) -> Result<bool, CloudError> {
     let updated = sqlx::query(
         "UPDATE accounts \
             SET billing_state = 'past_due', past_due_since = NOW() \
           WHERE id = $1 AND billing_state = 'active'",
     )
     .bind(account_id)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("entering past_due"))?
     .rows_affected();
@@ -485,14 +587,17 @@ async fn enter_past_due(control: &ControlPlane, account_id: &str) -> Result<bool
 /// Clear back to `active`, wiping `past_due_since`. Returns whether the state
 /// changed (so a payment-succeeded webhook that arrives while already active
 /// records no spurious transition).
-async fn clear_billing_state(control: &ControlPlane, account_id: &str) -> Result<bool, CloudError> {
+async fn clear_billing_state(
+    conn: &mut PgConnection,
+    account_id: &str,
+) -> Result<bool, CloudError> {
     let updated = sqlx::query(
         "UPDATE accounts \
             SET billing_state = 'active', past_due_since = NULL \
           WHERE id = $1 AND billing_state <> 'active'",
     )
     .bind(account_id)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("clearing billing state"))?
     .rows_affected();
@@ -610,7 +715,12 @@ pub async fn start_trial(
     trial_plan_id: &str,
     duration: chrono::Duration,
 ) -> Result<bool, CloudError> {
-    let from_plan = current_plan(control, account_id).await?;
+    let mut conn = control
+        .pool()
+        .acquire()
+        .await
+        .map_err(CloudError::db("acquiring connection to start trial"))?;
+    let from_plan = current_plan(&mut conn, account_id).await?;
     let started = sqlx::query(
         "UPDATE accounts \
             SET billing_state = 'trialing', \
@@ -625,13 +735,13 @@ pub async fn start_trial(
     .bind(duration)
     .bind(trial_plan_id)
     .bind(DEFAULT_PLAN_ID)
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("starting trial"))?
     .rows_affected();
     if started > 0 {
         record_transition(
-            control,
+            &mut conn,
             account_id,
             from_plan.as_deref(),
             Some(trial_plan_id),
@@ -689,7 +799,12 @@ pub async fn finish_expired_trial(
     } else {
         BillingState::Active
     };
-    let from_plan = current_plan(control, account_id).await?;
+    let mut conn = control
+        .pool()
+        .acquire()
+        .await
+        .map_err(CloudError::db("acquiring connection to finish trial"))?;
+    let from_plan = current_plan(&mut conn, account_id).await?;
     let downgraded = sqlx::query(
         "UPDATE accounts \
             SET plan_id = $2, \
@@ -700,13 +815,13 @@ pub async fn finish_expired_trial(
     .bind(account_id)
     .bind(DEFAULT_PLAN_ID)
     .bind(target_state.as_str())
-    .execute(control.pool())
+    .execute(&mut *conn)
     .await
     .map_err(CloudError::db("finishing expired trial"))?
     .rows_affected();
     if downgraded > 0 {
         record_transition(
-            control,
+            &mut conn,
             account_id,
             from_plan.as_deref(),
             Some(DEFAULT_PLAN_ID),

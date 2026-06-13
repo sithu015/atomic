@@ -28,8 +28,8 @@ use atomic_cloud::{
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, BreakerConfig, ChatStreamLimiter,
     CloudAuth, CloudError, ClusterConfig, ControlPlane, CoreExecutor, CredentialOrigin, Dispatcher,
     DispatcherConfig, ExecOutcome, FallbackAppState, ManagedKeys, NewAccount, NewCredentials,
-    PoolCaps, Provider, ProviderBreaker, QuotaBilling, Readiness, SecretKey, TenantPlane,
-    TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
+    PlanRegistry, PoolCaps, Provider, ProviderBreaker, QuotaBilling, Readiness, SecretKey,
+    TenantPlane, TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
     DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use atomic_core::models::{TaskRunState, TaskRunTrigger};
@@ -1090,6 +1090,221 @@ async fn unmigrated_tenant_is_skipped_until_stamped_current() {
             );
         },
     )
+    .await;
+}
+
+/// The atom-limit gate on atom-creating background work (the adversarial
+/// finding: the data-plane quota guard only covers the synchronous create
+/// routes, so a feed poll / report run could mint atoms past the ceiling
+/// out of band). With a finite `atom_limit` registry installed and the tenant
+/// already AT the limit, a due report (atom-creating) is DEFERRED — it never
+/// dispatches — while the tenant's non-atom-creating pipeline work still runs.
+/// Raising the limit lets the deferred report proceed on the next tick.
+#[tokio::test]
+async fn atom_limit_defers_atom_creating_background_work() {
+    with_control_db("atom_limit_defers_background_work", |url| async move {
+        let control = connect_control(&url).await;
+        // Shrink the free plan to a tiny atom ceiling BEFORE loading the
+        // registry the dispatcher will read.
+        sqlx::query("UPDATE plans SET atom_limit = 2, kb_limit = 1 WHERE id = 'free'")
+            .execute(control.pool())
+            .await
+            .expect("shrink free plan");
+        let registry = Arc::new(
+            PlanRegistry::load(control.clone())
+                .await
+                .expect("load plan registry"),
+        );
+
+        let tenant = provision_tenant(&control, None, "alpha").await;
+        disable_system_tasks(&tenant).await;
+
+        // Fill the tenant to its atom ceiling (2 atoms) via the core.
+        let cache = dispatch_cache(&control);
+        let core = cache
+            .get_or_load(&tenant.account_id)
+            .await
+            .expect("load tenant")
+            .manager
+            .active_core()
+            .await
+            .expect("active core");
+        for i in 0..2 {
+            core.create_atom(
+                atomic_core::CreateAtomRequest {
+                    content: format!("atom {i} at the ceiling"),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect("create atom")
+            .expect("atom inserted");
+        }
+        assert_eq!(core.count_atoms().await.expect("count"), 2);
+
+        // An enabled, every-minute report; backdate created_at so it is
+        // already due (anchored on created_at when never run).
+        let report = core
+            .create_report(atomic_core::models::CreateReportRequest {
+                name: "Due report".to_string(),
+                research_prompt: "investigate".to_string(),
+                schedule: "0 * * * * *".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create report");
+        let tenant_url = cluster_config()
+            .tenant_db_url(&tenant.db_name)
+            .expect("tenant url");
+        let mut conn = PgConnection::connect(&tenant_url)
+            .await
+            .expect("connect tenant db");
+        sqlx::query("UPDATE reports SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = $1")
+            .bind(&report.id)
+            .execute(&mut conn)
+            .await
+            .expect("backdate report");
+        conn.close().await.expect("close");
+
+        let recorder = RecordingExecutor::new(Duration::ZERO);
+        let dispatcher = Dispatcher::with_executor(
+            control.clone(),
+            Arc::clone(&cache),
+            test_config(WorkerPoolsConfig::default()),
+            recorder.clone(),
+        )
+        .with_plan_registry(Arc::clone(&registry));
+
+        // Over-limit tick: the report (atom-creating) is deferred; nothing
+        // mints atoms out of band. The atom count stays pinned at the limit
+        // across the tick.
+        let outcome = dispatcher.tick().await;
+        for handle in outcome.handles {
+            handle.await.expect("worker task");
+        }
+        assert!(
+            !recorder
+                .completions()
+                .iter()
+                .any(|(_, kind)| kind == "report"),
+            "the due report must be deferred while the tenant is at its atom limit: {:?}",
+            recorder.completions()
+        );
+        assert_eq!(
+            core.count_atoms().await.expect("count"),
+            2,
+            "no atoms created out of band while over the limit"
+        );
+        // The report row is untouched — it sits in the ledger for a later
+        // tick, exactly the credits-pause hold shape.
+        assert!(
+            core.list_enabled_reports()
+                .await
+                .expect("list reports")
+                .iter()
+                .any(|r| r.id == report.id),
+            "the deferred report stays pending"
+        );
+
+        // Raise the ceiling (an upgrade / downgrade-clearing) and refresh
+        // the registry: the deferred report now proceeds.
+        sqlx::query("UPDATE plans SET atom_limit = 100 WHERE id = 'free'")
+            .execute(control.pool())
+            .await
+            .expect("raise limit");
+        registry.refresh().await.expect("refresh registry");
+
+        let outcome = dispatcher.tick().await;
+        for handle in outcome.handles {
+            handle.await.expect("worker task");
+        }
+        assert!(
+            recorder
+                .completions()
+                .iter()
+                .any(|(_, kind)| kind == "report"),
+            "once under the limit, the report dispatches: {:?}",
+            recorder.completions()
+        );
+    })
+    .await;
+}
+
+/// The companion to the defer test: a tenant UNDER its atom limit dispatches
+/// atom-creating background work normally — the gate only bites at/over the
+/// ceiling.
+#[tokio::test]
+async fn under_atom_limit_dispatches_background_work_normally() {
+    with_control_db("under_atom_limit_dispatches_normally", |url| async move {
+        let control = connect_control(&url).await;
+        // A generous ceiling; the tenant will be well under it.
+        sqlx::query("UPDATE plans SET atom_limit = 100, kb_limit = 1 WHERE id = 'free'")
+            .execute(control.pool())
+            .await
+            .expect("set free plan");
+        let registry = Arc::new(
+            PlanRegistry::load(control.clone())
+                .await
+                .expect("load plan registry"),
+        );
+
+        let tenant = provision_tenant(&control, None, "alpha").await;
+        disable_system_tasks(&tenant).await;
+
+        let cache = dispatch_cache(&control);
+        let core = cache
+            .get_or_load(&tenant.account_id)
+            .await
+            .expect("load tenant")
+            .manager
+            .active_core()
+            .await
+            .expect("active core");
+        let report = core
+            .create_report(atomic_core::models::CreateReportRequest {
+                name: "Due report".to_string(),
+                research_prompt: "investigate".to_string(),
+                schedule: "0 * * * * *".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create report");
+        let tenant_url = cluster_config()
+            .tenant_db_url(&tenant.db_name)
+            .expect("tenant url");
+        let mut conn = PgConnection::connect(&tenant_url)
+            .await
+            .expect("connect tenant db");
+        sqlx::query("UPDATE reports SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = $1")
+            .bind(&report.id)
+            .execute(&mut conn)
+            .await
+            .expect("backdate report");
+        conn.close().await.expect("close");
+
+        let recorder = RecordingExecutor::new(Duration::ZERO);
+        let dispatcher = Dispatcher::with_executor(
+            control.clone(),
+            Arc::clone(&cache),
+            test_config(WorkerPoolsConfig::default()),
+            recorder.clone(),
+        )
+        .with_plan_registry(registry);
+
+        let outcome = dispatcher.tick().await;
+        for handle in outcome.handles {
+            handle.await.expect("worker task");
+        }
+        assert!(
+            recorder
+                .completions()
+                .iter()
+                .any(|(_, kind)| kind == "report"),
+            "an under-limit tenant dispatches its due report: {:?}",
+            recorder.completions()
+        );
+    })
     .await;
 }
 

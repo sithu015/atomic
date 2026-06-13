@@ -69,11 +69,13 @@ pub use backpressure::{
 };
 pub use billing::dunning::{
     advance_dunning, advance_dunning_with, advance_expired_trials, apply_payment_failed,
-    apply_payment_succeeded, apply_subscription_deleted, apply_subscription_event,
-    billing_state_from_column, claim_webhook_event, expired_trials, finish_expired_trial,
-    link_stripe_customer, release_webhook_event, start_trial, BillingState, DunningAdvance,
-    DunningThresholds, TrialAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS,
-    READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
+    apply_payment_failed_on_conn, apply_payment_succeeded, apply_payment_succeeded_on_conn,
+    apply_subscription_deleted, apply_subscription_deleted_on_conn, apply_subscription_event,
+    apply_subscription_event_on_conn, billing_state_from_column, claim_webhook_event,
+    claim_webhook_event_on_conn, expired_trials, finish_expired_trial, link_stripe_customer,
+    release_webhook_event, start_trial, BillingState, DunningAdvance, DunningThresholds,
+    TrialAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS, READ_ONLY_AFTER_DAYS,
+    SUSPENDED_AFTER_DAYS,
 };
 pub use billing::{
     now_unix, parse_event, verify_webhook, BillingProvider, StripeClient, StripeSession,
