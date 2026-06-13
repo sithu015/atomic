@@ -182,6 +182,30 @@ pub enum CloudError {
     /// a user error.
     #[error("control-plane invariant violated: {0}")]
     Invariant(String),
+
+    /// A Stripe API call (checkout/portal/subscription/customer) failed:
+    /// transport error, non-success status, or an unparseable response.
+    /// `context` says which operation; `message` carries the status and a
+    /// bounded slice of Stripe's error body — never the Stripe secret key.
+    #[error("Stripe API: {context}: {message}")]
+    Stripe { context: String, message: String },
+
+    /// A Stripe webhook failed verification: a malformed `Stripe-Signature`
+    /// header, a timestamp outside the tolerance window (replay defense), or
+    /// a signature that didn't match the signing secret. The message names
+    /// the failure mode; it never contains the signing secret or a valid
+    /// signature. Maps to a 400 — a genuine Stripe delivery never produces
+    /// it, so the only sender that sees it is a forger.
+    #[error("Stripe webhook verification failed: {0}")]
+    WebhookVerification(String),
+
+    /// The Stripe configuration (secret key, webhook secret, or a plan's
+    /// `stripe_price_id`) is missing or empty. Raised at client construction
+    /// — i.e. at boot — or when a billing route runs without Stripe
+    /// configured. The message names what's missing; it never contains key
+    /// material.
+    #[error("invalid Stripe configuration: {0}")]
+    InvalidStripeConfig(String),
 }
 
 impl CloudError {

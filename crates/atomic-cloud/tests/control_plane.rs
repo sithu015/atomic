@@ -9,8 +9,9 @@ use atomic_cloud::reserved_subdomains::is_reserved;
 use atomic_cloud::ControlPlane;
 use support::with_control_db;
 
-/// Every table the control-plane migrations create (001-008; 005, 007 and
-/// 008 only add columns).
+/// Every table the control-plane migrations create (001-010; 005, 007 and
+/// 008 only add columns, and 010 also adds `accounts.plan_id` /
+/// `billing_state` / `past_due_since` alongside its new tables).
 const CONTROL_TABLES: &[&str] = &[
     "accounts",
     "account_databases",
@@ -20,6 +21,14 @@ const CONTROL_TABLES: &[&str] = &[
     "magic_links",
     "provider_credentials",
     "dispatch_hints",
+    // Migration 009 — deploy-run history.
+    "deploy_runs",
+    // Migration 010 — plans, quotas, billing.
+    "plans",
+    "quota_usage",
+    "stripe_customers",
+    "stripe_subscriptions",
+    "plan_transitions",
 ];
 
 /// The migration-tracking columns 008 adds to `account_databases` (plan:

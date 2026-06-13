@@ -150,6 +150,14 @@ pub struct ResolvedTenant {
     /// `credits` kind affects request handling (the `out_of_ai_credits`
     /// guard); `rate_limit` pauses govern background dispatch alone.
     pub provider_pause: Option<crate::backpressure::ProviderPause>,
+    /// The account's billing serving state, read off the same accounts row
+    /// the auth lookup already pays for (plan: "Billing" → dunning). A
+    /// `suspended` account is blocked before this struct is ever built (the
+    /// gate in [`authenticate`]); `read_only` rides here so the data-plane
+    /// write-guard ([`crate::billing_guard::billing_write_guard`]) can 402
+    /// mutations while still serving reads. `active`/`past_due` impose no
+    /// restriction.
+    pub billing_state: crate::billing::dunning::BillingState,
 }
 
 /// Everything a request needs to be authenticated, shared across workers.
@@ -267,10 +275,12 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         i64,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
+        String,
         Option<i32>,
     );
     let account: Option<AccountRow> = sqlx::query_as(
         "SELECT id, status, provider_generation, provider_paused_until, provider_pause_kind, \
+                billing_state, \
                 (SELECT MIN(last_migrated_version) FROM account_databases \
                  WHERE account_id = accounts.id AND status = 'active') \
          FROM accounts WHERE subdomain = $1",
@@ -282,10 +292,18 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         tracing::error!(error = %e, "account lookup failed");
         internal_error()
     })?;
-    let (account_id, status, provider_generation, paused_until, pause_kind, migrated_version) =
-        account.ok_or_else(not_found)?;
+    let (
+        account_id,
+        status,
+        provider_generation,
+        paused_until,
+        pause_kind,
+        billing_state_raw,
+        migrated_version,
+    ) = account.ok_or_else(not_found)?;
     let provider_pause =
         crate::backpressure::ProviderPause::from_columns(paused_until, pause_kind.as_deref());
+    let billing_state = crate::billing::dunning::billing_state_from_column(&billing_state_raw);
     match status.as_str() {
         "active" => {}
         "provisioning" => return Err(account_provisioning()),
@@ -294,6 +312,17 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         // 'provisioning'/'active' exists today — failed provisions are
         // hard-deleted by the reaper, never tombstoned.)
         _ => return Err(not_found()),
+    }
+
+    // Billing gate (plan: "Billing" → dunning): a suspended account is
+    // blocked before credentials are even read — login and serving both stop
+    // (data is retained, never deleted). read_only and past_due still serve;
+    // read_only's write block is enforced later by the data-plane
+    // write-guard (it needs the request method/path, which this pre-auth gate
+    // doesn't gate on). The structured 402 carries the upgrade link so the
+    // frontend can route the user to billing.
+    if billing_state.blocks_serving() {
+        return Err(account_suspended(request_host(req).unwrap_or_default()));
     }
 
     // 2½ — the straggler gate (module docs): an otherwise-serveable account
@@ -372,6 +401,7 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         principal,
         subdomain,
         provider_pause,
+        billing_state,
     });
     Ok(())
 }
@@ -495,6 +525,28 @@ fn account_upgrading() -> HttpResponse {
             "message": "Your account is being upgraded. Try again shortly.",
             "retry_after_seconds": 60,
         }))
+}
+
+/// The account is `billing_state = 'suspended'` (14+ days past_due): serving
+/// and login are blocked, data is retained (plan: "Billing" → dunning, "Never
+/// auto-delete"). A structured 402 with the upgrade link so the frontend can
+/// route to billing; the user clears it by paying (which lifts the dunning
+/// state) — nothing in their account is deleted.
+fn account_suspended(host: &str) -> HttpResponse {
+    HttpResponse::PaymentRequired().json(serde_json::json!({
+        "error": "account_suspended",
+        "message": "This account is suspended for non-payment. Your data is \
+                    retained; update your billing to restore access.",
+        "upgrade_url": app_billing_url(host),
+    }))
+}
+
+/// `<sub>.<base>` → `https://app.<base>/billing` (plan: `upgrade_url`). Same
+/// derivation the out-of-credits and quota guards use.
+fn app_billing_url(host: &str) -> String {
+    let host = host.split(':').next().unwrap_or(host);
+    let base = host.split_once('.').map(|(_, base)| base).unwrap_or(host);
+    format!("https://app.{base}/billing")
 }
 
 /// The account exists and the credential verified, but its tenant database

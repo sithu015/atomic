@@ -1,0 +1,790 @@
+//! Plan-tier quota enforcement, the data-plane rate-limit rows, and the
+//! dunning state machine — driven against the real composed cloud server
+//! (plan: "Observability, quotas, billing" → "Quotas", "Billing").
+//!
+//! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
+//! conventions and the run command. Run single-threaded:
+//!
+//! ```sh
+//! CARGO_INCREMENTAL=0 \
+//! ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic_test@localhost:5433/atomic_test \
+//!   cargo test -p atomic-cloud --test quota_billing -- --test-threads=1
+//! ```
+//!
+//! The plan-limit tests shrink the seeded `free` plan to a tiny limit (via
+//! SQL, before the plan registry loads) so a handful of creates exercises
+//! the boundary without minting a hundred atoms. The dunning tests drive the
+//! time-machine by manufacturing a past `past_due_since` via SQL and calling
+//! [`advance_dunning`] with the real clock — no real waits.
+
+mod support;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use actix_web::{web, App, HttpServer};
+use atomic_cloud::{
+    advance_dunning, apply_payment_failed, apply_payment_succeeded, apply_subscription_deleted,
+    apply_subscription_event, configure_cloud_app, issue_token, link_stripe_customer,
+    provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
+    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
+    DataPlaneRateLimits, FallbackAppState, ManagedKeys, NewAccount, PlanRegistry, QuotaBilling,
+    Readiness, SubscriptionState, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+};
+use reqwest::header::HOST;
+use reqwest::{Method, StatusCode};
+use serde_json::{json, Value};
+use support::with_control_db;
+
+const BASE_DOMAIN: &str = "cloudtest.local";
+
+/// A provisioned tenant on the harness.
+struct Tenant {
+    account_id: String,
+    subdomain: String,
+    token: String,
+}
+
+/// The composed cloud server, parameterized so a test can shrink the `free`
+/// plan's limits and the data-plane rate limits before the registry/limiter
+/// are built.
+struct Harness {
+    control: ControlPlane,
+    cluster: ClusterConfig,
+    client: reqwest::Client,
+    base_url: String,
+    handle: actix_web::dev::ServerHandle,
+    _fallback: FallbackAppState,
+}
+
+impl Harness {
+    async fn spawn(control_url: &str, rate_limits: DataPlaneRateLimits) -> Self {
+        let control = ControlPlane::connect(control_url)
+            .await
+            .expect("connect control plane");
+        control.initialize().await.expect("migrate control plane");
+        let cluster = ClusterConfig {
+            cluster_id: "test-cluster-1".to_string(),
+            cluster_url: std::env::var("ATOMIC_TEST_DATABASE_URL")
+                .expect("with_control_db verified ATOMIC_TEST_DATABASE_URL"),
+        };
+
+        // Build the plan registry AFTER any plan-limit mutation a test made
+        // (tests mutate via `set_free_limits` before calling spawn).
+        let plan_registry = web::Data::new(
+            PlanRegistry::load(control.clone())
+                .await
+                .expect("load plans"),
+        );
+
+        let cache = Arc::new(AccountCache::new(
+            control.clone(),
+            cluster.clone(),
+            support::test_vault(),
+            AccountCacheConfig::default(),
+        ));
+        let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
+        let account_plane = AccountPlane::new(
+            control.clone(),
+            cluster.clone(),
+            ManagedKeys::Disabled,
+            Arc::new(support::CapturingSender::default()),
+            AccountPlaneConfig::new(BASE_DOMAIN),
+        )
+        .expect("build account plane");
+        let tenant_plane = TenantPlane::new(
+            control.clone(),
+            cluster.clone(),
+            ManagedKeys::Disabled,
+            support::test_vault(),
+            Arc::clone(&cache),
+        );
+        let fallback = FallbackAppState::build().expect("build fallback state");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        let state = fallback.data();
+        let control_for_app = control.clone();
+        let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        let readiness = Readiness::ready(control.clone());
+        let quota_billing = QuotaBilling {
+            plan_registry,
+            rate_limiter: DataPlaneRateLimiter::new(rate_limits),
+            billing: atomic_cloud::Billing::with_provider(
+                control.clone(),
+                None,
+                "",
+                HashMap::new(),
+                format!("https://app.{BASE_DOMAIN}"),
+                BASE_DOMAIN,
+            ),
+        };
+        let server = HttpServer::new(move || {
+            App::new().configure(configure_cloud_app(
+                state.clone(),
+                auth.clone(),
+                account_plane.clone(),
+                tenant_plane.clone(),
+                control_for_app.clone(),
+                chat_streams.clone(),
+                readiness.clone(),
+                quota_billing.clone(),
+            ))
+        })
+        .workers(1)
+        .listen(listener)
+        .expect("attach listener")
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        Harness {
+            control,
+            cluster,
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            handle,
+            _fallback: fallback,
+        }
+    }
+
+    async fn stop(self) {
+        self.handle.stop(false).await;
+    }
+
+    async fn provision(&self, subdomain: &str) -> Tenant {
+        let account = provision_account(
+            &self.control,
+            &self.cluster,
+            &ManagedKeys::Disabled,
+            NewAccount {
+                email: format!("{subdomain}@example.com"),
+                subdomain: subdomain.to_string(),
+            },
+        )
+        .await
+        .expect("provision account");
+        let token = issue_token(
+            &self.control,
+            &account.account_id,
+            TokenScope::Account,
+            None,
+            "quota-e2e",
+        )
+        .await
+        .expect("issue token");
+        Tenant {
+            account_id: account.account_id,
+            subdomain: subdomain.to_string(),
+            token,
+        }
+    }
+
+    fn api(&self, method: Method, subdomain: &str, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, format!("{}{path}", self.base_url))
+            .header(HOST, format!("{subdomain}.{BASE_DOMAIN}"))
+    }
+
+    /// POST a single atom; returns the full response so the caller can assert
+    /// status and body.
+    async fn create_atom(&self, tenant: &Tenant, content: &str) -> reqwest::Response {
+        self.api(Method::POST, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .json(&json!({ "content": content }))
+            .send()
+            .await
+            .expect("send create atom")
+    }
+}
+
+/// Shrink the seeded `free` plan's limits in this test's control database,
+/// BEFORE the harness loads its plan registry. Per-test control DB, so this
+/// only ever touches test data.
+async fn set_free_limits(control_url: &str, atom_limit: Option<i32>, kb_limit: Option<i32>) {
+    let control = ControlPlane::connect(control_url).await.expect("connect");
+    control.initialize().await.expect("migrate");
+    sqlx::query("UPDATE plans SET atom_limit = $1, kb_limit = $2 WHERE id = 'free'")
+        .bind(atom_limit)
+        .bind(kb_limit)
+        .execute(control.pool())
+        .await
+        .expect("set free limits");
+}
+
+#[tokio::test]
+async fn plans_are_seeded_and_account_plan_id_is_an_fk() {
+    with_control_db("plans_seeded_and_fk", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+
+        // Migration 010 seeds at least 'free' and 'pro'.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans")
+            .fetch_one(control.pool())
+            .await
+            .expect("count plans");
+        assert!(count >= 2, "expected seeded free+pro plans, got {count}");
+
+        let free: (Option<i32>, i32, Option<i32>) = sqlx::query_as(
+            "SELECT atom_limit, ai_credits_monthly_cents, kb_limit FROM plans WHERE id = 'free'",
+        )
+        .fetch_one(control.pool())
+        .await
+        .expect("free plan row");
+        assert_eq!(free, (Some(100), 50, Some(1)), "free-tier defaults");
+
+        // The FK is real: an account can't reference a non-existent plan.
+        let bad = sqlx::query(
+            "INSERT INTO accounts (id, subdomain, email, status, plan, plan_id) \
+             VALUES ('a-bad', 'fk-test', 'k@example.com', 'active', 'free', 'nonexistent')",
+        )
+        .execute(control.pool())
+        .await;
+        assert!(bad.is_err(), "plan_id FK must reject an unknown plan");
+
+        // The registry loads and resolves the free plan.
+        let registry = PlanRegistry::load(control.clone()).await.expect("load");
+        let free = registry.get("free").expect("free plan present");
+        assert_eq!(free.atom_limit, Some(100));
+        assert_eq!(free.kb_limit, Some(1));
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn provision_stamps_plan_id_free() {
+    with_control_db("provision_stamps_free", |url| async move {
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        let plan_id =
+            sqlx::query_scalar::<_, Option<String>>("SELECT plan_id FROM accounts WHERE id = $1")
+                .bind(&tenant.account_id)
+                .fetch_one(harness.control.pool())
+                .await
+                .expect("read plan_id");
+        assert_eq!(plan_id.as_deref(), Some("free"), "provision stamps free");
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn atom_limit_blocks_with_exact_quota_body() {
+    with_control_db("atom_limit_enforced", |url| async move {
+        // Shrink free to 2 atoms BEFORE the registry loads.
+        set_free_limits(&url, Some(2), Some(1)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // First two creates succeed (count 0→1, 1→2).
+        for i in 0..2 {
+            let resp = harness.create_atom(&tenant, &format!("atom {i}")).await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "create {i}");
+        }
+
+        // The third would land on count 3 > limit 2 → 402 with the exact
+        // plan-specified body shape.
+        let resp = harness.create_atom(&tenant, "atom 2").await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "over limit");
+        let body: Value = resp.json().await.expect("quota body");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["metric"], "atoms");
+        assert_eq!(body["current"], 2);
+        assert_eq!(body["limit"], 2);
+        assert!(body["resets_at"].is_null(), "resource limits don't reset");
+        assert_eq!(
+            body["upgrade_url"],
+            format!("https://app.{BASE_DOMAIN}/billing")
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn unlimited_plan_never_blocks_atoms() {
+    with_control_db("atom_limit_unlimited", |url| async move {
+        // NULL atom_limit = unlimited.
+        set_free_limits(&url, None, Some(1)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // Many creates, none blocked (a finite limit would block well before).
+        for i in 0..5 {
+            let resp = harness.create_atom(&tenant, &format!("atom {i}")).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "unlimited plan never blocks ({i})"
+            );
+        }
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn bulk_create_respects_the_batch_delta() {
+    with_control_db("bulk_batch_delta", |url| async move {
+        // Free = 3 atoms.
+        set_free_limits(&url, Some(3), Some(1)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // A bulk of 5 against an empty (0) tenant: 0 + 5 > 3 → blocked as one
+        // 402, no partial creation (the guard runs before the handler).
+        let resp = harness
+            .api(Method::POST, &tenant.subdomain, "/api/atoms/bulk")
+            .bearer_auth(&tenant.token)
+            .json(&json!([
+                { "content": "a" }, { "content": "b" }, { "content": "c" },
+                { "content": "d" }, { "content": "e" }
+            ]))
+            .send()
+            .await
+            .expect("send bulk");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "bulk over limit"
+        );
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["metric"], "atoms");
+        assert_eq!(body["current"], 0);
+
+        // Nothing was created — a within-limit bulk of 2 now succeeds.
+        let ok = harness
+            .api(Method::POST, &tenant.subdomain, "/api/atoms/bulk")
+            .bearer_auth(&tenant.token)
+            .json(&json!([{ "content": "a" }, { "content": "b" }]))
+            .send()
+            .await
+            .expect("send bulk 2");
+        // The bulk handler returns 201 Created on success; the key assertion
+        // is that the within-limit batch is NOT a 402 quota denial.
+        assert!(
+            ok.status().is_success(),
+            "within-limit bulk succeeds, got {}",
+            ok.status()
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn kb_limit_blocks_database_create() {
+    with_control_db("kb_limit_enforced", |url| async move {
+        // Free = 1 KB (the default seed); a fresh tenant already has its
+        // default KB, so any create is over the limit.
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        let resp = harness
+            .api(Method::POST, &tenant.subdomain, "/api/databases")
+            .bearer_auth(&tenant.token)
+            .json(&json!({ "name": "Second KB" }))
+            .send()
+            .await
+            .expect("send create db");
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "kb over limit");
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["metric"], "knowledge_bases");
+        assert_eq!(body["current"], 1);
+        assert_eq!(body["limit"], 1);
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn atom_limit_is_isolated_across_tenants() {
+    with_control_db("atom_limit_isolated", |url| async move {
+        set_free_limits(&url, Some(1), Some(5)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let alpha = harness.provision("alpha").await;
+        let other = harness.provision("tenanttwo").await;
+
+        // alpha fills its single-atom budget.
+        assert_eq!(
+            harness.create_atom(&alpha, "a").await.status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            harness.create_atom(&alpha, "a2").await.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "alpha at its limit"
+        );
+
+        // the other tenant is unaffected — its own count is 0.
+        assert_eq!(
+            harness.create_atom(&other, "b").await.status(),
+            StatusCode::CREATED,
+            "the other tenant's gate is independent of alpha's count"
+        );
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn atom_create_rate_limit_is_per_account_and_resets() {
+    with_control_db("rate_limit_atom_creates", |url| async move {
+        // Tiny atom-create limit, generous everything else, short window so
+        // the reset is observable without a long wait.
+        let harness = Harness::spawn(
+            &url,
+            DataPlaneRateLimits {
+                requests: 1000,
+                atom_creates: 2,
+                url_ingestion: 30,
+                window: Duration::from_secs(1),
+            },
+        )
+        .await;
+        let alpha = harness.provision("alpha").await;
+        let other = harness.provision("tenanttwo").await;
+
+        // Two creates admit, the third 429s as the atom-create limit.
+        assert_eq!(
+            harness.create_atom(&alpha, "1").await.status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            harness.create_atom(&alpha, "2").await.status(),
+            StatusCode::CREATED
+        );
+        let limited = harness.create_atom(&alpha, "3").await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            limited.headers().get("retry-after").is_some(),
+            "429 carries Retry-After"
+        );
+        let body: Value = limited.json().await.expect("429 body");
+        assert_eq!(body["error"], "rate_limited");
+        assert_eq!(body["limit"], "atom_creates");
+
+        // Another account is unaffected (per-account windows).
+        assert_eq!(
+            harness.create_atom(&other, "1").await.status(),
+            StatusCode::CREATED,
+            "the other tenant has its own atom-create budget"
+        );
+
+        // The window slides: after it elapses, alpha admits again.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            harness.create_atom(&alpha, "4").await.status(),
+            StatusCode::CREATED,
+            "window reset lets alpha create again"
+        );
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn broad_request_rate_limit_catches_any_route() {
+    with_control_db("rate_limit_requests", |url| async move {
+        // Request limit of 2; any third authenticated request 429s.
+        let harness = Harness::spawn(
+            &url,
+            DataPlaneRateLimits {
+                requests: 2,
+                atom_creates: 1000,
+                url_ingestion: 1000,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await;
+        let alpha = harness.provision("alpha").await;
+
+        // Two GETs (reads) admit.
+        for _ in 0..2 {
+            let resp = harness
+                .api(Method::GET, &alpha.subdomain, "/api/atoms")
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("list");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // The third request of ANY type 429s on the broad request limit.
+        let limited = harness
+            .api(Method::GET, &alpha.subdomain, "/api/tags")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("third");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = limited.json().await.expect("body");
+        assert_eq!(body["limit"], "requests");
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn url_ingestion_rate_limit_is_enforced() {
+    with_control_db("rate_limit_url_ingestion", |url| async move {
+        let harness = Harness::spawn(
+            &url,
+            DataPlaneRateLimits {
+                requests: 1000,
+                atom_creates: 1000,
+                url_ingestion: 1,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await;
+        let alpha = harness.provision("alpha").await;
+
+        // The first ingestion charges the narrow limit (the handler may
+        // 4xx/5xx on the fake URL, but it is admitted past the guard); the
+        // second is refused as url_ingestion before the handler.
+        let first = harness
+            .api(Method::POST, &alpha.subdomain, "/api/ingest/url")
+            .bearer_auth(&alpha.token)
+            .json(&json!({ "url": "https://example.com/x" }))
+            .send()
+            .await
+            .expect("first ingest");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first ingestion is admitted"
+        );
+
+        let second = harness
+            .api(Method::POST, &alpha.subdomain, "/api/ingest/url")
+            .bearer_auth(&alpha.token)
+            .json(&json!({ "url": "https://example.com/y" }))
+            .send()
+            .await
+            .expect("second ingest");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = second.json().await.expect("body");
+        assert_eq!(body["limit"], "url_ingestion");
+        harness.stop().await;
+    })
+    .await;
+}
+
+// --- Billing: subscription lifecycle + dunning state machine ----------------
+
+#[tokio::test]
+async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
+    with_control_db("subscription_lifecycle", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+        link_stripe_customer(&control, &account_id, "cus_1")
+            .await
+            .expect("link customer");
+
+        // A created/active subscription on 'pro' widens the plan.
+        let sub = SubscriptionState {
+            stripe_customer_id: "cus_1".into(),
+            stripe_subscription_id: "sub_1".into(),
+            plan_id: "pro".into(),
+            status: "active".into(),
+            current_period_start: chrono::Utc::now(),
+            current_period_end: chrono::Utc::now() + chrono::Duration::days(30),
+            cancel_at_period_end: false,
+        };
+        apply_subscription_event(&control, &account_id, &sub)
+            .await
+            .expect("apply subscription");
+        assert_eq!(plan_id(&control, &account_id).await.as_deref(), Some("pro"));
+        assert_eq!(billing_state(&control, &account_id).await, "active");
+
+        // A failed payment enters past_due.
+        apply_payment_failed(&control, &account_id)
+            .await
+            .expect("payment failed");
+        assert_eq!(billing_state(&control, &account_id).await, "past_due");
+
+        // A succeeded payment clears it.
+        apply_payment_succeeded(&control, &account_id)
+            .await
+            .expect("payment succeeded");
+        assert_eq!(billing_state(&control, &account_id).await, "active");
+
+        // Subscription deleted: drop to free, data retained, state active.
+        apply_subscription_deleted(&control, &account_id)
+            .await
+            .expect("subscription deleted");
+        assert_eq!(
+            plan_id(&control, &account_id).await.as_deref(),
+            Some("free")
+        );
+        assert_eq!(billing_state(&control, &account_id).await, "active");
+
+        // The audit trail recorded the transitions.
+        let transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_transitions WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_one(control.pool())
+                .await
+                .expect("count transitions");
+        assert!(
+            transitions >= 3,
+            "every transition is audited, got {transitions}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
+    with_control_db("dunning_time_machine", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+
+        // Enter past_due, then backdate past_due_since by 4 days: a sweep at
+        // "now" must advance past_due → read_only (3-day threshold) but NOT
+        // yet suspended (14-day threshold).
+        apply_payment_failed(&control, &account_id)
+            .await
+            .expect("payment failed");
+        backdate_past_due(&control, &account_id, 4).await;
+        let advance = advance_dunning(&control, chrono::Utc::now())
+            .await
+            .expect("advance");
+        assert_eq!(advance.moved_to_read_only, 1);
+        assert_eq!(advance.moved_to_suspended, 0);
+        assert_eq!(billing_state(&control, &account_id).await, "read_only");
+
+        // Backdate to 15 days: the next sweep suspends (data retained).
+        backdate_past_due(&control, &account_id, 15).await;
+        let advance = advance_dunning(&control, chrono::Utc::now())
+            .await
+            .expect("advance");
+        assert_eq!(advance.moved_to_suspended, 1);
+        assert_eq!(billing_state(&control, &account_id).await, "suspended");
+
+        // The account row — and its data — still exist (never auto-deleted).
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+                .bind(&account_id)
+                .fetch_one(control.pool())
+                .await
+                .expect("exists");
+        assert!(exists, "suspended account is retained, never deleted");
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn suspended_account_is_blocked_at_auth_read_only_blocks_writes() {
+    with_control_db("billing_serving_gate", |url| async move {
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // read_only: reads pass, writes 402.
+        set_billing_state(&harness.control, &tenant.account_id, "read_only").await;
+        let read = harness
+            .api(Method::GET, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("read");
+        assert_eq!(
+            read.status(),
+            StatusCode::OK,
+            "read_only still serves reads"
+        );
+        let write = harness.create_atom(&tenant, "blocked").await;
+        assert_eq!(
+            write.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "read_only blocks writes"
+        );
+        let body: Value = write.json().await.expect("body");
+        assert_eq!(body["error"], "account_read_only");
+
+        // suspended: even reads are blocked at auth (data retained).
+        set_billing_state(&harness.control, &tenant.account_id, "suspended").await;
+        let read = harness
+            .api(Method::GET, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("read");
+        assert_eq!(
+            read.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "suspended blocks serving"
+        );
+        let body: Value = read.json().await.expect("body");
+        assert_eq!(body["error"], "account_suspended");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+// --- helpers -----------------------------------------------------------------
+
+/// Seed a bare active account directly (the dunning/lifecycle tests don't
+/// need a tenant database — they exercise control-plane state only).
+async fn seed_account(control: &ControlPlane, subdomain: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan, plan_id) \
+         VALUES ($1, $2, $3, 'active', 'free', 'free')",
+    )
+    .bind(&id)
+    .bind(subdomain)
+    .bind(format!("{subdomain}@example.com"))
+    .execute(control.pool())
+    .await
+    .expect("seed account");
+    id
+}
+
+async fn plan_id(control: &ControlPlane, account_id: &str) -> Option<String> {
+    let row: Option<String> = sqlx::query_scalar("SELECT plan_id FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(control.pool())
+        .await
+        .expect("plan_id");
+    row
+}
+
+async fn billing_state(control: &ControlPlane, account_id: &str) -> String {
+    sqlx::query_scalar("SELECT billing_state FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(control.pool())
+        .await
+        .expect("billing_state")
+}
+
+async fn set_billing_state(control: &ControlPlane, account_id: &str, state: &str) {
+    sqlx::query("UPDATE accounts SET billing_state = $2 WHERE id = $1")
+        .bind(account_id)
+        .bind(state)
+        .execute(control.pool())
+        .await
+        .expect("set billing_state");
+}
+
+/// Backdate `past_due_since` by `days` so a sweep at the real `now` crosses
+/// the threshold — the no-real-waits idiom.
+async fn backdate_past_due(control: &ControlPlane, account_id: &str, days: i64) {
+    sqlx::query(
+        "UPDATE accounts SET past_due_since = NOW() - make_interval(days => $2) WHERE id = $1",
+    )
+    .bind(account_id)
+    .bind(days as i32)
+    .execute(control.pool())
+    .await
+    .expect("backdate past_due_since");
+}

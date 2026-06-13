@@ -30,8 +30,8 @@ use atomic_cloud::{
     set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
     AccountPlaneConfig, BreakerConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
     CredentialOrigin, Dispatcher, DispatcherConfig, FallbackAppState, ManagedKeys, NewAccount,
-    NewCredentials, Provider, ProviderBreaker, Readiness, SecretKey, TenantPlane, TokenScope,
-    DEFAULT_CHAT_STREAMS_PER_ACCOUNT, DEFAULT_RETRY_AFTER_CAP,
+    NewCredentials, Provider, ProviderBreaker, QuotaBilling, Readiness, SecretKey, TenantPlane,
+    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, DEFAULT_RETRY_AFTER_CAP,
 };
 use atomic_core::models::{TaskRun, TaskRunState};
 use atomic_core::wiki::runner::WIKI_REGENERATE_TASK_ID;
@@ -521,6 +521,9 @@ impl Harness {
         // This harness runs no fleet gate; the deploy-gating suite owns
         // readiness behavior.
         let readiness = Readiness::ready(control.clone());
+        let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
+            .await
+            .expect("plans");
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -530,6 +533,7 @@ impl Harness {
                 control_for_app.clone(),
                 chat_streams.clone(),
                 readiness.clone(),
+                quota_billing.clone(),
             ))
         })
         .workers(1)

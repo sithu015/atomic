@@ -28,7 +28,8 @@ use atomic_cloud::{
     latest_deploy_run, run_fleet_gate, tenant_db_name, tenant_schema_target, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, ChatStreamLimiter,
     CloudAuth, ClusterConfig, ControlPlane, DeployPolicy, FallbackAppState, FleetMigrationConfig,
-    FleetMigrator, ManagedKeys, Readiness, TenantPlane, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    FleetMigrator, ManagedKeys, QuotaBilling, Readiness, TenantPlane,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use atomic_core::storage::PostgresStorage;
 use chrono::{DateTime, Utc};
@@ -868,6 +869,9 @@ async fn ready_route_is_public_and_tracks_the_gate() {
             // Boot state: migrating, exactly as `serve` starts.
             let readiness = Readiness::new(control.clone());
             let readiness_for_app = readiness.clone();
+            let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
+                .await
+                .expect("plans");
             let server = HttpServer::new(move || {
                 App::new().configure(configure_cloud_app(
                     state.clone(),
@@ -877,6 +881,7 @@ async fn ready_route_is_public_and_tracks_the_gate() {
                     control_for_app.clone(),
                     chat_streams.clone(),
                     readiness_for_app.clone(),
+                    quota_billing.clone(),
                 ))
             })
             .workers(1)

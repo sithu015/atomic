@@ -32,18 +32,21 @@
 
 use std::sync::Arc;
 
-use actix_web::{App, HttpServer};
+use actix_web::{web, App, HttpServer};
 use atomic_cloud::{
-    abandoned_run_threshold, advance_deploy, configure_cloud_app, delete_account,
+    abandoned_run_threshold, advance_deploy, advance_dunning, configure_cloud_app, delete_account,
     finalize_abandoned_runs, issue_token, latest_deploy_run, list_failed_migrations,
     list_unmigrated, provision_account, run_fleet_gate, tenant_schema_target, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, ChatStreamLimiter,
-    CloudAuth, ClusterConfig, ControlPlane, DeployPolicy, Dispatcher, DispatcherConfig,
-    EmailSender, EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender,
-    MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PoolCaps,
-    RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig,
+    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
+    DataPlaneRateLimits, DeployPolicy, Dispatcher, DispatcherConfig, EmailSender,
+    EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender, MailgunSender,
+    ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PlanRegistry, PoolCaps,
+    QuotaBilling, RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
+    DEFAULT_DUNNING_SWEEP_INTERVAL,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[command(name = "atomic-cloud", about = "Atomic Cloud multi-tenant server")]
@@ -178,6 +181,9 @@ enum Command {
 
         #[command(flatten)]
         provisioning: ProvisioningArgs,
+
+        #[command(flatten)]
+        billing: BillingArgs,
 
         #[command(flatten)]
         dispatcher: DispatcherArgs,
@@ -343,6 +349,70 @@ impl ProvisioningArgs {
                 })
             }
         }
+    }
+}
+
+/// Stripe billing selection for `serve` (plan: "Billing"). Billing is
+/// OPTIONAL: with no `--stripe-secret-key`, the billing routes degrade to a
+/// structured 503 and the dunning sweep simply never has past_due accounts
+/// to advance — fine for dev clusters and self-hosted-style deployments. The
+/// secret key and webhook signing secret are env-only by convention (they're
+/// secrets; argv leaks into process listings).
+#[derive(Args)]
+struct BillingArgs {
+    /// Stripe secret key (`sk_…`). Enables billing when set; env-only.
+    #[arg(long, env = "ATOMIC_CLOUD_STRIPE_SECRET_KEY", hide_env_values = true)]
+    stripe_secret_key: Option<String>,
+
+    /// Stripe webhook signing secret (`whsec_…`), used to verify the
+    /// `app.<base>/billing/webhook` signature. Required for the webhook to
+    /// accept anything; env-only.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_STRIPE_WEBHOOK_SECRET",
+        hide_env_values = true
+    )]
+    stripe_webhook_secret: Option<String>,
+
+    /// Plan→price mapping as repeatable `plan_id=stripe_price_id` pairs, e.g.
+    /// `--stripe-price pro=price_123`. The reverse map drives webhook
+    /// price→plan resolution (a price's `metadata.plan_id` takes precedence
+    /// when present).
+    #[arg(
+        long = "stripe-price",
+        env = "ATOMIC_CLOUD_STRIPE_PRICES",
+        value_delimiter = ','
+    )]
+    stripe_prices: Vec<String>,
+}
+
+impl BillingArgs {
+    /// Parse the `plan=price` pairs into a map.
+    fn plan_prices(&self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        let mut map = HashMap::new();
+        for pair in &self.stripe_prices {
+            let (plan, price) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("--stripe-price expects plan=price, got {pair:?}"))?;
+            map.insert(plan.to_string(), price.to_string());
+        }
+        Ok(map)
+    }
+
+    fn into_config(
+        self,
+        base_domain: String,
+        app_public_url: Option<String>,
+    ) -> Result<BillingConfig, Box<dyn std::error::Error>> {
+        let plan_prices = self.plan_prices()?;
+        Ok(BillingConfig {
+            stripe_secret_key: self.stripe_secret_key,
+            webhook_secret: self.stripe_webhook_secret,
+            plan_prices,
+            app_public_url,
+            base_domain,
+            stripe_base_url: None,
+        })
     }
 }
 
@@ -821,6 +891,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             app_public_url,
             max_concurrent_provisions,
             provisioning,
+            billing,
             dispatcher,
             fleet,
             chat_streams_per_account,
@@ -860,12 +931,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ..AccountCacheConfig::default()
             };
             let plane_config = AccountPlaneConfig {
-                app_public_url,
+                app_public_url: app_public_url.clone(),
                 trust_proxy_header,
                 rate_limits: RateLimits::default(),
                 max_concurrent_provisions,
                 ..AccountPlaneConfig::new(base_domain.clone())
             };
+
+            // Plans/quota/billing composition inputs (plan: "Quotas",
+            // "Billing"). The plan registry is loaded eagerly so an unseeded
+            // catalogue (a migration that didn't run) fails at boot. Billing
+            // is optional — no Stripe key means the routes 503 and the
+            // dunning sweep finds nothing to advance.
+            let plan_registry = web::Data::new(PlanRegistry::load(control.clone()).await?);
+            let billing_plane = Billing::new(
+                control.clone(),
+                billing.into_config(base_domain.clone(), app_public_url)?,
+            )?;
+            let quota_billing = QuotaBilling {
+                plan_registry,
+                rate_limiter: DataPlaneRateLimiter::new(DataPlaneRateLimits::default()),
+                billing: billing_plane,
+            };
+
             serve(
                 control,
                 cluster.into_config(),
@@ -884,6 +972,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 fleet_config,
                 deploy_policy,
                 ChatStreamLimiter::new(chat_streams_per_account),
+                quota_billing,
             )
             .await
         }
@@ -1132,6 +1221,7 @@ async fn serve(
     fleet_config: FleetMigrationConfig,
     deploy_policy: DeployPolicy,
     chat_streams: ChatStreamLimiter,
+    quota_billing: QuotaBilling,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -1203,6 +1293,32 @@ async fn serve(
         }
     });
 
+    // Dunning sweep (plan: "Billing" → dunning): advance past_due → read_only
+    // (3 days) → suspended (14 days), data always retained. Hourly is ample
+    // for day-granularity thresholds; the transition logic takes an explicit
+    // `now`, so this is interval glue around a tested function. Cross-pod
+    // safe: each transition is an idempotent conditional UPDATE (the first
+    // pod to advance an account wins; later pods match zero rows). Cheap
+    // when billing is disabled — no account is ever past_due, so every sweep
+    // is a no-op set of UPDATEs.
+    tokio::spawn({
+        let control = control.clone();
+        async move {
+            let mut ticker = tokio::time::interval(DEFAULT_DUNNING_SWEEP_INTERVAL);
+            ticker.tick().await; // first tick fires immediately
+            loop {
+                ticker.tick().await;
+                match advance_dunning(&control, chrono::Utc::now()).await {
+                    Ok(advance) if !advance.is_quiet() => {
+                        tracing::info!(?advance, "dunning sweep")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "dunning sweep failed"),
+                }
+            }
+        }
+    });
+
     // Per-pod background dispatcher (plan: "Worker fairness & job queue").
     // Spawned over the SAME AccountCache the request path uses, so worker
     // events land on the channels live WebSocket clients subscribe to.
@@ -1249,6 +1365,7 @@ async fn serve(
             control.clone(),
             chat_streams.clone(),
             readiness.clone(),
+            quota_billing.clone(),
         ))
     })
     .workers(4)

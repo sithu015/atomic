@@ -94,7 +94,15 @@ bind atomic-server's process-global state and have no per-tenant story yet —
 **Signup & email**
 - [`magic_links.rs`](src/magic_links.rs) — `aml_` links, single-use atomic consume
 - [`email.rs`](src/email.rs) — `EmailSender` trait + `LogSender` (dev) / `MailgunSender`
-- [`rate_limit.rs`](src/rate_limit.rs) — per-IP / per-email sliding-window limiters
+- [`rate_limit.rs`](src/rate_limit.rs) — per-IP / per-email sliding-window limiters (signup surface) + the per-account data-plane limiters (API requests / atom creates / URL ingestion) and their guard
+
+**Plans, quotas & billing**
+- [`plans.rs`](src/plans.rs) — the seeded plan catalogue + in-memory `PlanRegistry`
+- [`quota.rs`](src/quota.rs) — the data-plane resource-limit guard (atom/KB creates → 402 `quota_exceeded`)
+- [`billing.rs`](src/billing.rs) — `BillingProvider` trait + `StripeClient`, webhook signature verification + event projection
+- [`billing/dunning.rs`](src/billing/dunning.rs) — `BillingState`, subscription/payment transitions, the time-driven `advance_dunning` sweep
+- [`billing_routes.rs`](src/billing_routes.rs) — portal/checkout redirects (tenant) + the signed webhook (app host)
+- [`billing_guard.rs`](src/billing_guard.rs) — the `read_only` write-guard (suspended is gated in `CloudAuth`)
 
 **Providers** (managed keys + BYOK)
 - [`keyvault.rs`](src/keyvault.rs) — `KeyVault` trait, AES-256-GCM `EnvMasterKeyVault`, `SecretKey`
@@ -242,6 +250,7 @@ provider or sends real email.
   in-memory channel, so in a multi-pod deployment a WS client on another pod
   misses that execution's progress events. Durable state is always correct;
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
-- Several capabilities are scoped to later slices — Stripe billing, plan-tier
-  quotas, cloud OAuth/MCP, backups, and the signup frontend. See the plan doc's
-  Implementation log for the current frontier.
+- Several capabilities are scoped to later slices — cloud OAuth/MCP, backups,
+  observability metrics/tracing, the user-facing `account_events` log, and the
+  signup/billing frontend (the billing API + redirects exist; the UI doesn't).
+  See the plan doc's Implementation log for the current frontier.

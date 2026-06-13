@@ -55,9 +55,10 @@ reqwest = { version = "0.12", features = ["json"] }
 # Control-plane primitives — versions match the rest of the workspace.
 aes-gcm = "0.10"        # AES-256-GCM provider-credential encryption (keyvault)
 chrono = "0.4"
-data-encoding = "2"     # base32 tenant-database names; hex token hashes
+data-encoding = "2"     # base32 tenant-database names; hex token/HMAC hashes
+hmac = "0.12"           # HMAC-SHA256 Stripe webhook signature verification
 rand = "0.8"            # OsRng for token/session secrets
-sha2 = "0.10"           # SHA-256 token/session hashing
+sha2 = "0.10"           # SHA-256 token/session hashing; HMAC-SHA256 webhook
 url = "2"               # tenant-database URL construction
 uuid = { version = "1", features = ["v4"] }
 

@@ -246,10 +246,17 @@ pub async fn provision_account(
     // every other email comparison in the crate) is a crashed earlier
     // attempt — resume it. Anything else (an active account, or another
     // email's in-flight claim) reports taken.
+    // Stamp both the legacy bare `plan` column (still read by old binaries
+    // mid-rolling-deploy) and the new `plan_id` FK (read by quota
+    // enforcement) to 'free' (plan: free-tier default; migration 010). A
+    // trial would land a paid plan here, but trials are the billing
+    // state-machine's job (plan: "Trials: 14 days of paid tier on signup");
+    // until that wires in, every new account defaults to 'free' — see
+    // crate::plans::DEFAULT_PLAN_ID.
     let account_id = Uuid::new_v4();
     let claim = sqlx::query(
-        "INSERT INTO accounts (id, subdomain, email, status, plan) \
-         VALUES ($1, $2, $3, 'provisioning', 'free')",
+        "INSERT INTO accounts (id, subdomain, email, status, plan, plan_id) \
+         VALUES ($1, $2, $3, 'provisioning', 'free', 'free')",
     )
     .bind(account_id.to_string())
     .bind(&subdomain)

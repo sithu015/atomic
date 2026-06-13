@@ -1272,6 +1272,64 @@ fleets hit `rollback_required` easily (1 broken of 2 = 50%); that is the
 policy working as designed — the operator path is fix/delete the tenant
 and redeploy.
 
+### Slice 6 — plans, quotas, Stripe billing & dunning (2026-06-13, branch `cloud-billing`)
+
+Landed: migration 010 (additive) — the `plans` (seeded `free` + placeholder
+`pro`) and `quota_usage` tables, `accounts.plan_id` (FK with `ON DELETE
+RESTRICT`, backfilled alongside the retained legacy bare `plan` column),
+`accounts.billing_state`/`past_due_since`, and the `stripe_customers` /
+`stripe_subscriptions` / `plan_transitions` tables. An in-memory
+[`PlanRegistry`](../../crates/atomic-cloud/src/plans.rs) (eager-loaded at
+boot; `provision_account` stamps `plan_id='free'`). The plan-tier resource
+guard ([`quota.rs`](../../crates/atomic-cloud/src/quota.rs)) on `api_scope`:
+`POST /api/atoms`, `/api/atoms/bulk` (batch-delta accounted by a buffer-and-
+replay body peek), and `POST /api/databases` → the plan's exact
+`quota_exceeded` 402 shape (`resets_at: null`, derived `upgrade_url`); NULL
+limit = unlimited never blocks; atom/KB counts read **live** from the tenant
+DB (cheap, strongly consistent), `quota_usage` reserved for storage/rollups,
+the AI-credits counter advisory only (OpenRouter enforces it). The three
+remaining anti-abuse rate-limit rows (API 600/min, atom-creates 60/min,
+URL-ingestion 30/min) as per-account sliding windows + a data-plane guard
+(429 + `Retry-After`, per-pod approximate). The full Stripe integration:
+`BillingProvider` trait + `StripeClient` (salvaged from `4b44c51`, adapted to
+`CloudError` + constant-time webhook verify), the customer-portal/checkout
+redirects (tenant plane) and the signed webhook (app host, single URL),
+subscription/payment event projection. The dunning state machine
+([`billing/dunning.rs`](../../crates/atomic-cloud/src/billing/dunning.rs)):
+`past_due → read_only` (3d) `→ suspended` (14d), data always retained —
+suspended gated in `CloudAuth`, read_only by a write-guard, advanced by an
+injectable-clock `advance_dunning` sweep (hourly loop in `serve`).
+
+**Deviations from this plan (deliberate):**
+
+- **`accounts.billing_state` is a new column, orthogonal to `status`.** The
+  plan describes dunning as moving "Status → past_due", but `accounts.status`
+  is CloudAuth's provisioning/active gate; overloading it would conflate
+  "being set up" with "behind on payment". A delinquent account stays
+  `status='active'` with a separate `billing_state` (active/past_due/
+  read_only/suspended) — cleaner serving logic, and the audit trail
+  (`plan_transitions`) records every move.
+- **Billing is optional.** No `--stripe-secret-key` ⇒ the billing routes 503
+  and the dunning sweep finds nothing to advance, so dev clusters and
+  self-hosted-style deployments run unchanged. The plan assumes Stripe is
+  always present; making it optional cost nothing and unblocks local testing.
+- **Webhook verify uses constant-time MAC comparison** (`Mac::verify_slice`),
+  not the parts-bin's `==` on hex strings — a timing oracle on the MAC would
+  let a forger reconstruct a valid signature byte by byte.
+- **Resource counts are read live, not from `quota_usage`.** The plan's
+  schema implies a counter; for atoms/KBs a live `count_atoms()` /
+  `list_databases()` is cheaper than maintaining a counter and can't drift.
+  `quota_usage` stays for the metrics that genuinely need it (storage,
+  rollups) and the advisory AI counter.
+
+**Deferred:** observability metrics/tracing; the user-facing `account_events`
+log (rides with the frontend slice); the `quota_usage` writer + 1-hour
+period-rollover job (the table exists; nothing writes it yet); trials (14-day
+paid tier on signup — `provision` defaults to `free` with a doc pointer);
+plan-change → PATCH managed-key credit limit (the managed-keys seam exists);
+the signup/billing **frontend** (API + redirects only); paid-tier pricing
+(the `pro` numbers are documented placeholders).
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +

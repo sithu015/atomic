@@ -54,8 +54,8 @@ use atomic_cloud::{
     configure_cloud_app, issue_token, latest_deploy_run, provision_account, run_fleet_gate,
     run_reaper_pass, tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane,
     AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DeployPolicy,
-    FallbackAppState, FleetMigrationConfig, ManagedKeys, NewAccount, Readiness, ReaperPolicy,
-    TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    FallbackAppState, FleetMigrationConfig, ManagedKeys, NewAccount, QuotaBilling, Readiness,
+    ReaperPolicy, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use chrono::{DateTime, Utc};
 use reqwest::header::HOST;
@@ -141,6 +141,9 @@ impl Pod {
         let state = fallback.data();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
+        let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
+            .await
+            .expect("plans");
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -150,6 +153,7 @@ impl Pod {
                 control_for_app.clone(),
                 chat_streams.clone(),
                 readiness.clone(),
+                quota_billing.clone(),
             ))
         })
         .workers(1)

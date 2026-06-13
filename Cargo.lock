@@ -651,6 +651,7 @@ dependencies = [
  "data-encoding",
  "futures",
  "futures-util",
+ "hmac",
  "rand 0.8.5",
  "reqwest 0.12.26",
  "serde",

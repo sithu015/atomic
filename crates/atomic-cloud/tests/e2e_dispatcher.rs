@@ -25,7 +25,7 @@ use atomic_cloud::{
     AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig, BreakerConfig,
     ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin, Dispatcher,
     DispatcherConfig, FallbackAppState, ManagedKeys, NewAccount, NewCredentials, PoolCaps,
-    Provider, Readiness, SecretKey, TenantPlane, TokenScope, WorkerPoolsConfig,
+    Provider, QuotaBilling, Readiness, SecretKey, TenantPlane, TokenScope, WorkerPoolsConfig,
 };
 use atomic_test_support::MockAiServer;
 use futures_util::StreamExt;
@@ -181,6 +181,9 @@ impl E2eHarness {
         // This harness runs no fleet gate; the deploy-gating suite owns
         // readiness behavior.
         let readiness = Readiness::ready(control.clone());
+        let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
+            .await
+            .expect("plans");
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -190,6 +193,7 @@ impl E2eHarness {
                 control_for_app.clone(),
                 limiter_for_app.clone(),
                 readiness.clone(),
+                quota_billing.clone(),
             ))
         })
         .workers(1)

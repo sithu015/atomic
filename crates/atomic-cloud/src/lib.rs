@@ -27,6 +27,9 @@ pub mod account_cache;
 pub mod account_plane;
 pub mod auth;
 pub mod backpressure;
+pub mod billing;
+pub mod billing_guard;
+pub mod billing_routes;
 pub mod chat_streams;
 pub mod control_plane;
 pub mod curated_models;
@@ -39,11 +42,13 @@ pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod plans;
 pub mod pools;
 pub mod provider_config;
 pub mod provider_credentials;
 pub mod provision;
 pub mod provisioning_api;
+pub mod quota;
 pub mod rate_limit;
 pub mod reaper;
 pub mod reserved_subdomains;
@@ -60,6 +65,17 @@ pub use backpressure::{
     ai_interactive_route, out_of_credits_guard, provider_failure_policy, BreakerConfig, PauseKind,
     ProviderBreaker, ProviderPause, DEFAULT_RETRY_AFTER_CAP,
 };
+pub use billing::dunning::{
+    advance_dunning, apply_payment_failed, apply_payment_succeeded, apply_subscription_deleted,
+    apply_subscription_event, billing_state_from_column, link_stripe_customer, BillingState,
+    DunningAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL, READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
+};
+pub use billing::{
+    now_unix, parse_event, verify_webhook, BillingProvider, StripeClient, StripeSession,
+    SubscriptionState, WebhookEvent, WEBHOOK_TOLERANCE_SECS,
+};
+pub use billing_guard::billing_write_guard;
+pub use billing_routes::{Billing, BillingConfig};
 pub use chat_streams::{
     chat_stream_guard, chat_stream_route, ChatStreamLimiter, ChatStreamPermit,
     DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
@@ -96,6 +112,7 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
+pub use plans::{Plan, PlanRegistry, DEFAULT_PLAN_ID};
 pub use pools::{PoolCaps, PoolPermit, WorkClass, WorkTypeCap, WorkerPools, WorkerPoolsConfig};
 pub use provider_config::{
     build_provider_config, config_for_credentials, keyless_provider_config,
@@ -115,8 +132,12 @@ pub use provisioning_api::{
     CreatedRuntimeKey, OpenRouterProvisioning, ProvisioningApi, RuntimeKeyUsage,
     DEFAULT_OPENROUTER_PROVISIONING_URL, PROVISIONING_KEY_ENV,
 };
+pub use quota::quota_guard;
+pub use rate_limit::{
+    data_plane_rate_limit_guard, DataPlaneLimit, DataPlaneRateLimiter, DataPlaneRateLimits,
+};
 pub use reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
-pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState};
+pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState, QuotaBilling};
 pub use tenant_plane::TenantPlane;
 pub use tokens::{
     create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,

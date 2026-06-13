@@ -57,6 +57,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (8, include_str!("../migrations/008_migration_tracking.sql")),
     (9, include_str!("../migrations/009_deploy_runs.sql")),
+    (10, include_str!("../migrations/010_plans_billing.sql")),
 ];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks

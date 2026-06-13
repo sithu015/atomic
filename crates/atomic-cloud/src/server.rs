@@ -113,11 +113,16 @@ use tokio::sync::broadcast;
 use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
 use crate::backpressure::out_of_credits_guard;
+use crate::billing_guard::billing_write_guard;
+use crate::billing_routes::Billing;
 use crate::chat_streams::{chat_stream_guard, ChatStreamLimiter};
 use crate::control_plane::ControlPlane;
 use crate::deploy::Readiness;
 use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
+use crate::plans::PlanRegistry;
+use crate::quota::quota_guard;
+use crate::rate_limit::{data_plane_rate_limit_guard, DataPlaneRateLimiter};
 use crate::tenant_plane::TenantPlane;
 
 /// The inert [`AppState`] registered as app data in the cloud composition.
@@ -295,6 +300,59 @@ async fn ready(readiness: web::Data<Readiness>) -> HttpResponse {
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
 /// clones the arguments into each worker's call.
+/// The plans/quota/billing composition inputs, bundled so the (already
+/// long) `configure_cloud_app` signature grows by one argument rather than
+/// three, and so a test harness can build the lot with one call
+/// ([`QuotaBilling::for_tests`]).
+///
+/// - `plan_registry` — the in-memory plan catalogue the quota guard reads
+///   (one shared instance; `web::Data` clones the `Arc`).
+/// - `rate_limiter` — the per-account data-plane sliding windows (one
+///   process-wide instance, cloned into every worker; a per-worker instance
+///   would multiply every limit by the worker count).
+/// - `billing` — the billing plane (portal/checkout routes + the webhook),
+///   `provider: None` when Stripe isn't configured (routes degrade to 503).
+#[derive(Clone)]
+pub struct QuotaBilling {
+    pub plan_registry: web::Data<PlanRegistry>,
+    pub rate_limiter: DataPlaneRateLimiter,
+    pub billing: Billing,
+}
+
+impl QuotaBilling {
+    /// A test/disabled-billing bundle: an **unlimited** plan registry,
+    /// default data-plane rate limits, and a Stripe-disabled billing plane.
+    ///
+    /// The seeded `free` plan is widened to unlimited (NULL atom/kb limits)
+    /// before the registry loads, so the many integration harnesses that
+    /// aren't *about* quotas (they create several atoms and KBs as fixtures)
+    /// are never tripped by the free-tier ceiling. The dedicated quota suite
+    /// (`tests/quota_billing.rs`) builds its own `QuotaBilling` with explicit
+    /// limits to exercise enforcement. Per-test control DB, so this widening
+    /// only ever touches test data.
+    pub async fn for_tests(control: ControlPlane, base_domain: &str) -> Result<Self, CloudError> {
+        sqlx::query("UPDATE plans SET atom_limit = NULL, kb_limit = NULL")
+            .execute(control.pool())
+            .await
+            .map_err(CloudError::db("widening test plan limits"))?;
+        Ok(Self {
+            plan_registry: web::Data::new(PlanRegistry::load(control.clone()).await?),
+            rate_limiter: DataPlaneRateLimiter::new(
+                crate::rate_limit::DataPlaneRateLimits::default(),
+            ),
+            billing: Billing::with_provider(
+                control,
+                None,
+                "",
+                std::collections::HashMap::new(),
+                format!("https://app.{base_domain}"),
+                base_domain,
+            ),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Composition assembly; each argument is a distinct plane/guard input.
 pub fn configure_cloud_app(
     state: web::Data<AppState>,
     auth: CloudAuth,
@@ -303,7 +361,13 @@ pub fn configure_cloud_app(
     control: ControlPlane,
     chat_streams: ChatStreamLimiter,
     readiness: Readiness,
+    quota_billing: QuotaBilling,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
+    let QuotaBilling {
+        plan_registry,
+        rate_limiter,
+        billing,
+    } = quota_billing;
     move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(state)
             .route("/health", web::get().to(health))
@@ -313,6 +377,10 @@ pub fn configure_cloud_app(
                     .route(web::get().to(ready)),
             );
         account_plane.configure(cfg);
+        // The signed Stripe webhook on the app host (unauthenticated — the
+        // signature is the auth; guarded to the app host like the account
+        // plane). Registered with the app plane, never on tenant subdomains.
+        billing.configure_app(cfg);
         // Before api_scope: its exact-path /api/account resource must win
         // the route match over the /api scope.
         tenant_plane.configure(cfg, auth.clone());
@@ -324,26 +392,38 @@ pub fn configure_cloud_app(
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth.clone()),
         )
-        .service(
-            api_scope()
+        .service({
+            let mut scope = api_scope()
                 .app_data(web::Data::new(DispatchHintWriter::new(control)))
                 .app_data(web::Data::new(chat_streams))
+                .app_data(plan_registry)
+                .app_data(web::Data::new(rate_limiter));
+            // The authenticated tenant-plane billing routes (portal,
+            // checkout) live inside the /api scope so they share its
+            // CloudAuth wrap and resolved tenant.
+            scope = scope.configure(|c| billing.configure_tenant(c));
+            scope
                 // Execution order is outermost-last-registered: auth
-                // resolves the tenant, the guard fails closed / unroutes the
-                // fallback-bound planes, the credits guard 402s the
-                // AI-interactive routes while the tenant's credits pause is
-                // in force (crate::backpressure), the chat-stream guard
-                // 429s an over-cap chat send (crate::chat_streams), and
-                // only then does the hint writer see the request — so
-                // unrouted planes, unauthenticated requests, and denied
-                // requests (402/429 — neither ever reaches a handler)
-                // never mark hints.
+                // resolves the tenant, the plane guard fails closed /
+                // unroutes the fallback-bound planes, the rate-limit guard
+                // 429s an over-quota account before any work, the billing
+                // write-guard 402s mutations on a read_only (dunning)
+                // account, the quota guard 402s a create that would exceed
+                // the plan's resource limit, the credits guard 402s the
+                // AI-interactive routes under a credits pause, the
+                // chat-stream guard 429s an over-cap chat send, and only
+                // then does the hint writer see the request — so unrouted
+                // planes, unauthenticated requests, and every denial
+                // (402/429 — none reach a handler) never mark hints.
                 .wrap(from_fn(mark_hint_on_mutation))
                 .wrap(from_fn(chat_stream_guard))
                 .wrap(from_fn(out_of_credits_guard))
+                .wrap(from_fn(quota_guard))
+                .wrap(from_fn(billing_write_guard))
+                .wrap(from_fn(data_plane_rate_limit_guard))
                 .wrap(from_fn(cloud_plane_guard))
-                .wrap(auth),
-        );
+                .wrap(auth)
+        });
     }
 }
 

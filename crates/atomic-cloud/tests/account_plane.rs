@@ -24,8 +24,8 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
-    FallbackAppState, MagicLinkPurpose, ManagedKeys, NewAccount, RateLimits, Readiness,
-    TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
+    FallbackAppState, MagicLinkPurpose, ManagedKeys, NewAccount, QuotaBilling, RateLimits,
+    Readiness, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
@@ -124,6 +124,9 @@ impl PlaneHarness {
         // This harness runs no fleet gate; the deploy-gating suite owns
         // readiness behavior.
         let readiness = Readiness::ready(control.clone());
+        let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
+            .await
+            .expect("plans");
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -133,6 +136,7 @@ impl PlaneHarness {
                 control_for_app.clone(),
                 chat_streams.clone(),
                 readiness.clone(),
+                quota_billing.clone(),
             ))
         })
         .workers(1)
