@@ -45,6 +45,28 @@ pub const READ_ONLY_AFTER_DAYS: i64 = 3;
 /// Days past_due before serving is blocked (`read_only → suspended`).
 pub const SUSPENDED_AFTER_DAYS: i64 = 14;
 
+/// The two day-count thresholds the time-driven dunning ladder advances on
+/// (plan: 3 days → read_only, 14 days → suspended). A config struct rather
+/// than two bare `const`s so `serve` can expose them as `--dunning-*` flags
+/// (with the plan's defaults) and a test can shrink them; [`Default`] is the
+/// plan's `READ_ONLY_AFTER_DAYS`/`SUSPENDED_AFTER_DAYS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DunningThresholds {
+    /// Days past_due before `past_due → read_only`.
+    pub read_only_after_days: i64,
+    /// Days past_due before `read_only → suspended`.
+    pub suspended_after_days: i64,
+}
+
+impl Default for DunningThresholds {
+    fn default() -> Self {
+        Self {
+            read_only_after_days: READ_ONLY_AFTER_DAYS,
+            suspended_after_days: SUSPENDED_AFTER_DAYS,
+        }
+    }
+}
+
 /// The serving restriction a billing problem imposes. Stored as text in
 /// `accounts.billing_state`; read by CloudAuth (suspended → block) and the
 /// billing write-guard (read_only → block writes).
@@ -492,8 +514,20 @@ pub async fn advance_dunning(
     control: &ControlPlane,
     now: DateTime<Utc>,
 ) -> Result<DunningAdvance, CloudError> {
-    let suspend_horizon = now - chrono::Duration::days(SUSPENDED_AFTER_DAYS);
-    let read_only_horizon = now - chrono::Duration::days(READ_ONLY_AFTER_DAYS);
+    advance_dunning_with(control, now, DunningThresholds::default()).await
+}
+
+/// [`advance_dunning`] with explicit [`DunningThresholds`] — the form `serve`
+/// calls so its `--dunning-read-only-days` / `--dunning-suspended-days` flags
+/// take effect. The two functions share one body; `advance_dunning` is the
+/// default-thresholds convenience the unit tests use.
+pub async fn advance_dunning_with(
+    control: &ControlPlane,
+    now: DateTime<Utc>,
+    thresholds: DunningThresholds,
+) -> Result<DunningAdvance, CloudError> {
+    let suspend_horizon = now - chrono::Duration::days(thresholds.suspended_after_days);
+    let read_only_horizon = now - chrono::Duration::days(thresholds.read_only_after_days);
 
     // 14+ days: suspend (from past_due or read_only). Data retained.
     let suspended = sqlx::query(

@@ -307,6 +307,7 @@ mod tests {
             subdomain: "alpha".to_string(),
             provider_pause: None,
             billing_state: crate::billing::dunning::BillingState::Active,
+            storage_state: crate::quota_usage::StorageState::Active,
         }
     }
 

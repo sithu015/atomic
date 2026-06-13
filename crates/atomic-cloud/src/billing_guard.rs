@@ -1,15 +1,28 @@
-//! Data-plane write-guard for the `read_only` billing state (plan: "Billing"
-//! → "3 days past_due → Read-only mode"; "Subscription deleted … read-only
-//! until under").
+//! Data-plane write-guard for the two "writes blocked, data retained" states:
+//! the dunning `read_only` billing state (plan: "Billing" → "3 days past_due
+//! → Read-only mode"; "Subscription deleted … read-only until under") and the
+//! storage-bytes `restricted` state (plan: "Quotas" → enforcement table:
+//! "Periodic reaper | Storage bytes recompute | Week 1 warn; week 2 restrict
+//! writes; **no auto-delete**").
 //!
 //! `suspended` is gated up front in [`CloudAuth`](crate::auth) — the request
-//! never reaches a handler. `read_only` is subtler: reads and exports must
-//! keep working (the user can still see and retrieve their data; nothing is
-//! deleted), only *writes* are blocked. That distinction needs the request
-//! method, so it lives here as a data-plane middleware that 402s mutating
-//! methods while passing reads through. Wired inside CloudAuth and the plane
-//! guard (so [`ResolvedTenant`] is installed) and *outside* the dispatch-hint
-//! writer, so a blocked write never marks a hint.
+//! never reaches a handler. `read_only` and storage-`restricted` are subtler:
+//! reads and exports must keep working (the user can still see and retrieve
+//! their data; **nothing is deleted**), only *writes* are blocked. That
+//! distinction needs the request method, so it lives here as a data-plane
+//! middleware that 402s mutating methods while passing reads through. Wired
+//! inside CloudAuth and the plane guard (so [`ResolvedTenant`] is installed)
+//! and *outside* the dispatch-hint writer, so a blocked write never marks a
+//! hint.
+//!
+//! The two causes are **orthogonal** (a tenant can be over its storage
+//! ceiling while current on payment, or vice versa) and recover
+//! independently, so each rides its own column on [`ResolvedTenant`]. This
+//! guard blocks a write when *either* says so, and reports which: a billing
+//! delinquency returns `account_read_only`, a storage overage returns
+//! `account_storage_restricted` (so the frontend routes the user to the right
+//! remedy — pay vs. delete data/upgrade). Billing is checked first: it is the
+//! more time-sensitive remedy.
 //!
 //! The same pattern the quota and out-of-credits guards use: read the state
 //! off [`ResolvedTenant`] (CloudAuth already loaded it from the accounts row
@@ -32,7 +45,8 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
-/// Data-plane middleware: while the tenant is `billing_state = 'read_only'`,
+/// Data-plane middleware: while the tenant is blocked for writes by EITHER
+/// the dunning `read_only` billing state or the storage `restricted` state,
 /// return a structured 402 for mutating requests (module docs). A missing
 /// [`ResolvedTenant`] is skipped defensively (the plane guard fails such
 /// requests closed already).
@@ -40,27 +54,61 @@ pub async fn billing_write_guard(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-    let read_only = req
-        .extensions()
-        .get::<ResolvedTenant>()
-        .is_some_and(|t| t.billing_state.blocks_writes());
+    // Billing first (the more time-sensitive remedy), then storage. Each
+    // rides its own column; either blocks, with a distinct error code.
+    let block = req.extensions().get::<ResolvedTenant>().and_then(|t| {
+        if t.billing_state.blocks_writes() {
+            Some(WriteBlock::Billing)
+        } else if t.storage_state.blocks_writes() {
+            Some(WriteBlock::Storage)
+        } else {
+            None
+        }
+    });
 
-    if read_only && is_mutating(req.method()) {
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri().host())
-            .unwrap_or_default();
-        let denial = HttpResponse::PaymentRequired().json(serde_json::json!({
-            "error": "account_read_only",
-            "message": "This account is read-only for non-payment. Your data is \
-                        retained and readable; update your billing to resume editing.",
-            "upgrade_url": upgrade_url(host),
-        }));
-        return Ok(req.into_response(denial));
+    if let Some(block) = block {
+        if is_mutating(req.method()) {
+            let host = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| req.uri().host())
+                .unwrap_or_default();
+            let denial = HttpResponse::PaymentRequired().json(block.body(host));
+            return Ok(req.into_response(denial));
+        }
     }
     next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
+/// Why a write is blocked, and the structured 402 body each cause returns.
+#[derive(Debug, Clone, Copy)]
+enum WriteBlock {
+    /// Dunning read-only (non-payment): the remedy is updating billing.
+    Billing,
+    /// Storage over the plan ceiling past the grace window: the remedy is
+    /// deleting data or upgrading. Data is retained, never deleted.
+    Storage,
+}
+
+impl WriteBlock {
+    fn body(self, host: &str) -> serde_json::Value {
+        match self {
+            WriteBlock::Billing => serde_json::json!({
+                "error": "account_read_only",
+                "message": "This account is read-only for non-payment. Your data is \
+                            retained and readable; update your billing to resume editing.",
+                "upgrade_url": upgrade_url(host),
+            }),
+            WriteBlock::Storage => serde_json::json!({
+                "error": "account_storage_restricted",
+                "message": "This account is over its storage limit. Your data is \
+                            retained and readable; delete some data or upgrade your \
+                            plan to resume editing.",
+                "upgrade_url": upgrade_url(host),
+            }),
+        }
+    }
 }
 
 /// `<sub>.<base>` → `https://app.<base>/billing` (plan: `upgrade_url`).

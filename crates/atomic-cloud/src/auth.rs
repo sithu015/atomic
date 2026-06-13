@@ -158,6 +158,17 @@ pub struct ResolvedTenant {
     /// mutations while still serving reads. `active`/`past_due` impose no
     /// restriction.
     pub billing_state: crate::billing::dunning::BillingState,
+    /// The account's storage serving state, read off the same accounts row
+    /// the auth lookup already pays for (plan: "Quotas" → enforcement table:
+    /// "Periodic reaper | Storage bytes recompute | Week 1 warn; week 2
+    /// restrict writes; no auto-delete"). Orthogonal to
+    /// [`billing_state`](Self::billing_state) — a tenant can be over its
+    /// storage ceiling while perfectly current on payment, and vice versa. A
+    /// `restricted` value rides here so the data-plane write-guard 402s
+    /// mutations while still serving reads (data is RETAINED, never deleted);
+    /// `active`/`warn` impose no restriction. Set by the storage-recompute
+    /// arm ([`crate::quota_usage::recompute_storage`]).
+    pub storage_state: crate::quota_usage::StorageState,
 }
 
 /// Everything a request needs to be authenticated, shared across workers.
@@ -276,11 +287,12 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
         String,
+        String,
         Option<i32>,
     );
     let account: Option<AccountRow> = sqlx::query_as(
         "SELECT id, status, provider_generation, provider_paused_until, provider_pause_kind, \
-                billing_state, \
+                billing_state, storage_state, \
                 (SELECT MIN(last_migrated_version) FROM account_databases \
                  WHERE account_id = accounts.id AND status = 'active') \
          FROM accounts WHERE subdomain = $1",
@@ -299,11 +311,13 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         paused_until,
         pause_kind,
         billing_state_raw,
+        storage_state_raw,
         migrated_version,
     ) = account.ok_or_else(not_found)?;
     let provider_pause =
         crate::backpressure::ProviderPause::from_columns(paused_until, pause_kind.as_deref());
     let billing_state = crate::billing::dunning::billing_state_from_column(&billing_state_raw);
+    let storage_state = crate::quota_usage::storage_state_from_column(&storage_state_raw);
     match status.as_str() {
         "active" => {}
         "provisioning" => return Err(account_provisioning()),
@@ -402,6 +416,7 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         subdomain,
         provider_pause,
         billing_state,
+        storage_state,
     });
     Ok(())
 }

@@ -99,10 +99,11 @@ bind atomic-server's process-global state and have no per-tenant story yet —
 **Plans, quotas & billing**
 - [`plans.rs`](src/plans.rs) — the seeded plan catalogue + in-memory `PlanRegistry`
 - [`quota.rs`](src/quota.rs) — the data-plane resource-limit guard (atom/KB creates → 402 `quota_exceeded`)
+- [`quota_usage.rs`](src/quota_usage.rs) — the two control-plane jobs that write `quota_usage`: the monthly `roll_over_period` (idempotent, cross-pod safe) and the storage-bytes `recompute_storage` arm (`pg_database_size` → `StorageState` warn → restrict; data always retained)
 - [`billing.rs`](src/billing.rs) — `BillingProvider` trait + `StripeClient`, webhook signature verification + event projection
-- [`billing/dunning.rs`](src/billing/dunning.rs) — `BillingState` (incl. `trialing`), subscription/payment transitions, the time-driven `advance_dunning` + `advance_expired_trials` sweeps, and `start_trial` (signup grants the 14-day paid trial)
+- [`billing/dunning.rs`](src/billing/dunning.rs) — `BillingState` (incl. `trialing`), subscription/payment transitions, the time-driven `advance_dunning` (+ `advance_dunning_with` for configurable `DunningThresholds`) + `advance_expired_trials` sweeps, and `start_trial` (signup grants the 14-day paid trial)
 - [`billing_routes.rs`](src/billing_routes.rs) — portal/checkout redirects (tenant) + the signed webhook (app host)
-- [`billing_guard.rs`](src/billing_guard.rs) — the `read_only` write-guard (suspended is gated in `CloudAuth`)
+- [`billing_guard.rs`](src/billing_guard.rs) — the write-guard that 402s mutations under EITHER the dunning `read_only` state (`account_read_only`) or the storage `restricted` state (`account_storage_restricted`); suspended is gated in `CloudAuth`
 
 **Providers** (managed keys + BYOK)
 - [`keyvault.rs`](src/keyvault.rs) — `KeyVault` trait, AES-256-GCM `EnvMasterKeyVault`, `SecretKey`
@@ -200,6 +201,8 @@ any subcommand with `--help` for the full flag set. Notable `serve` groups:
 - **Routing**: `--base-domain`, `--port`, `--bind`, `--app-public-url`
 - **Email**: `--email-mode log|mailgun` (+ `--mailgun-*`)
 - **Providers**: `--provisioning-mode`, `--managed-key-allowance-cents`, `--master-key-env`
+- **Billing (Stripe, optional)**: `--stripe-secret-key-env`, `--stripe-webhook-secret-env`, `--stripe-price plan=price_…` (secret *values* are env-only, never argv)
+- **Quotas & dunning**: `--period-rollover-interval-secs`, `--storage-recompute-interval-secs`, `--storage-warn-after-days`, `--storage-restrict-after-days`, `--dunning-read-only-days` (3), `--dunning-suspended-days` (14)
 - **Dispatcher**: `--dispatcher`, `--dispatcher-tick-ms`, the four `--*-pool-total`/`--*-pool-per-tenant` caps, `--reports-per-tenant-cap`
 - **Backpressure**: `--breaker-*`, `--retry-after-cap-secs`, `--chat-streams-per-account`
 - **Deploy gating**: `--fleet-migration-*`, `--deploy-ready-failure-rate`, `--deploy-review-failure-rate`
@@ -210,7 +213,7 @@ process listings.
 
 ## Migrations
 
-Control-plane migrations live in [`migrations/`](migrations) (`001`–`012`) and
+Control-plane migrations live in [`migrations/`](migrations) (`001`–`013`) and
 run through the hardened runner in `control_plane.rs` (schema-version table,
 advisory lock on a detached connection, errors propagated). Tenant databases run
 atomic-core's own migrations via `initialize()`.
@@ -252,5 +255,33 @@ provider or sends real email.
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
 - Several capabilities are scoped to later slices — cloud OAuth/MCP, backups,
   observability metrics/tracing, the user-facing `account_events` log, and the
-  signup/billing frontend (the billing API + redirects exist; the UI doesn't).
-  See the plan doc's Implementation log for the current frontier.
+  signup/billing frontend. See the plan doc's Implementation log for the
+  current frontier.
+
+## What's shipped (this slice: billing & quotas)
+
+- **Plan-tier resource limits** — `plans` catalogue + `accounts.plan_id`,
+  live atom/KB enforcement (402 `quota_exceeded`); free-tier defaults (100
+  atoms, 1 KB, 100 MB, $0.50/mo AI), `pro` placeholder (unlimited atoms/KBs,
+  10 GB, frontier-models flag).
+- **Anti-abuse rate limits** — per-IP/email signup-surface limiters plus the
+  per-account data-plane rows (600 req/min, 60 atom-creates/min, 30 URL
+  ingestions/min), 429 with `Retry-After`.
+- **Stripe billing** — customer-portal + checkout redirects (account-scope
+  gated), the signed webhook on the app host (HMAC-SHA256 verification with a
+  replay-tolerance window + event-id idempotency ledger), and the full
+  subscription lifecycle projection (`created/updated/deleted`,
+  `payment_{succeeded,failed}`). The Stripe HTTP client is behind a
+  `BillingProvider` trait; the real client's request shape is wiremock-pinned
+  and the webhook scheme is unit-tested over a known-secret fixture. No test
+  hits real Stripe.
+- **Dunning** — `past_due → read_only (3d) → suspended (14d)`, time-driven by
+  `advance_dunning`; thresholds are `--dunning-*` flags. **Data is always
+  retained, never auto-deleted.**
+- **Trials** — 14-day paid trial at signup (no card), auto-downgraded to free
+  by the sweep (read-only if over the free limits, data retained).
+- **Period rollover** — a 1-hour `quota_usage` rollover for the non-AI metrics
+  (idempotent, cross-pod safe); AI allowances reset natively at OpenRouter.
+- **Storage enforcement** — a periodic `pg_database_size` recompute into
+  `quota_usage` with week-1-warn / week-2-restrict serving states (the
+  `account_storage_restricted` write-block), **never auto-deleting**.

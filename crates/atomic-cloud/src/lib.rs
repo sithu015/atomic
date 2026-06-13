@@ -49,6 +49,7 @@ pub mod provider_credentials;
 pub mod provision;
 pub mod provisioning_api;
 pub mod quota;
+pub mod quota_usage;
 pub mod rate_limit;
 pub mod reaper;
 pub mod reserved_subdomains;
@@ -67,11 +68,12 @@ pub use backpressure::{
     ProviderBreaker, ProviderPause, DEFAULT_RETRY_AFTER_CAP,
 };
 pub use billing::dunning::{
-    advance_dunning, advance_expired_trials, apply_payment_failed, apply_payment_succeeded,
-    apply_subscription_deleted, apply_subscription_event, billing_state_from_column,
-    claim_webhook_event, expired_trials, finish_expired_trial, link_stripe_customer,
-    release_webhook_event, start_trial, BillingState, DunningAdvance, TrialAdvance,
-    DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS, READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
+    advance_dunning, advance_dunning_with, advance_expired_trials, apply_payment_failed,
+    apply_payment_succeeded, apply_subscription_deleted, apply_subscription_event,
+    billing_state_from_column, claim_webhook_event, expired_trials, finish_expired_trial,
+    link_stripe_customer, release_webhook_event, start_trial, BillingState, DunningAdvance,
+    DunningThresholds, TrialAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS,
+    READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
 };
 pub use billing::{
     now_unix, parse_event, verify_webhook, BillingProvider, StripeClient, StripeSession,
@@ -137,6 +139,11 @@ pub use provisioning_api::{
     DEFAULT_OPENROUTER_PROVISIONING_URL, PROVISIONING_KEY_ENV,
 };
 pub use quota::{account_over_plan_limits, quota_guard};
+pub use quota_usage::{
+    current_period_start, recompute_storage, roll_over_period, storage_state_from_column,
+    StoragePolicy, StorageRecompute, StorageState, DEFAULT_PERIOD_ROLLOVER_INTERVAL,
+    DEFAULT_STORAGE_RECOMPUTE_INTERVAL, ROLLED_OVER_METRICS, STORAGE_BYTES_METRIC,
+};
 pub use rate_limit::{
     data_plane_rate_limit_guard, DataPlaneLimit, DataPlaneRateLimiter, DataPlaneRateLimits,
 };

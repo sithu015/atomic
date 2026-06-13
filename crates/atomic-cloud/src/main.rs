@@ -35,16 +35,17 @@ use std::sync::Arc;
 use actix_web::{web, App, HttpServer};
 use atomic_cloud::account_over_plan_limits;
 use atomic_cloud::{
-    abandoned_run_threshold, advance_deploy, advance_dunning, advance_expired_trials,
+    abandoned_run_threshold, advance_deploy, advance_dunning_with, advance_expired_trials,
     configure_cloud_app, delete_account, finalize_abandoned_runs, issue_token, latest_deploy_run,
-    list_failed_migrations, list_unmigrated, provision_account, run_fleet_gate,
-    tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    AdvanceOutcome, Billing, BillingConfig, ChatStreamLimiter, CloudAuth, ClusterConfig,
-    ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits, DeployPolicy, Dispatcher,
-    DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig,
-    KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount,
-    OpenRouterProvisioning, PlanRegistry, PoolCaps, QuotaBilling, RateLimits, Readiness,
-    TenantPlane, TokenScope, WorkerPoolsConfig, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_PLAN_ID,
+    list_failed_migrations, list_unmigrated, provision_account, recompute_storage,
+    roll_over_period, run_fleet_gate, tenant_schema_target, AccountCache, AccountCacheConfig,
+    AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig, ChatStreamLimiter,
+    CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits,
+    DeployPolicy, Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState,
+    FleetMigrationConfig, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
+    NewAccount, OpenRouterProvisioning, PlanRegistry, PoolCaps, QuotaBilling, RateLimits,
+    Readiness, TenantPlane, TokenScope, WorkerPoolsConfig, DEFAULT_DUNNING_SWEEP_INTERVAL,
+    DEFAULT_PLAN_ID,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
@@ -185,6 +186,9 @@ enum Command {
 
         #[command(flatten)]
         billing: BillingArgs,
+
+        #[command(flatten)]
+        quota: QuotaArgs,
 
         #[command(flatten)]
         dispatcher: DispatcherArgs,
@@ -427,6 +431,116 @@ impl BillingArgs {
             base_domain,
             stripe_base_url: None,
         })
+    }
+}
+
+/// Quota period-rollover, storage enforcement, and dunning-threshold knobs
+/// for `serve` (plan: "Observability, quotas, billing" → "Quotas" period
+/// rollover + storage recompute; "Billing" → dunning ladder). Every value
+/// defaults to the plan's number, so a deployment that sets none of these
+/// gets the plan's behavior verbatim.
+#[derive(Args)]
+struct QuotaArgs {
+    /// How often the period-rollover job runs, in seconds (plan: "A
+    /// 1-hour-cadence job inserts new `period_start` rows"). Each run opens
+    /// the current month's `quota_usage` rows for the non-AI metrics
+    /// (idempotent `ON CONFLICT DO NOTHING`, cross-pod safe); AI allowances
+    /// reset natively at OpenRouter and need no rollover code.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_PERIOD_ROLLOVER_INTERVAL_SECS",
+        default_value_t = 3600
+    )]
+    period_rollover_interval_secs: u64,
+
+    /// How often the storage-bytes recompute runs, in seconds (plan:
+    /// "Periodic reaper | Storage bytes recompute"). Each run measures every
+    /// active tenant's `pg_database_size`, records it in `quota_usage`, and
+    /// advances the storage serving state (warn → restrict) against the
+    /// plan's `storage_bytes_limit`. Hourly is ample for the day-granularity
+    /// grace windows.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_STORAGE_RECOMPUTE_INTERVAL_SECS",
+        default_value_t = 3600
+    )]
+    storage_recompute_interval_secs: u64,
+
+    /// Days an account may sit over its storage limit before the `warn`
+    /// marker is set (plan: "week 1 warn"). 0 = warn the instant a recompute
+    /// finds it over (the default — the banner should show immediately; the
+    /// "week 1" is the window warn occupies before restriction).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_STORAGE_WARN_AFTER_DAYS",
+        default_value_t = 0
+    )]
+    storage_warn_after_days: u64,
+
+    /// Days an account may stay over its storage limit before writes are
+    /// restricted (plan: "week 2 restrict writes; no auto-delete"). Default
+    /// 7 — the first week is warn-only, restriction lands at week two. Data
+    /// is RETAINED, never deleted.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_STORAGE_RESTRICT_AFTER_DAYS",
+        default_value_t = 7
+    )]
+    storage_restrict_after_days: u64,
+
+    /// Days past_due before a delinquent account goes read-only (writes
+    /// blocked, reads allowed; plan: "3 days past_due → Read-only mode").
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DUNNING_READ_ONLY_DAYS",
+        default_value_t = atomic_cloud::READ_ONLY_AFTER_DAYS
+    )]
+    dunning_read_only_days: i64,
+
+    /// Days past_due before a delinquent account is suspended (serving and
+    /// login blocked; data RETAINED, never deleted; plan: "14 days past_due
+    /// → Suspended").
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DUNNING_SUSPENDED_DAYS",
+        default_value_t = atomic_cloud::SUSPENDED_AFTER_DAYS
+    )]
+    dunning_suspended_days: i64,
+}
+
+/// The resolved quota/billing background-job configuration, built from
+/// [`QuotaArgs`] and handed to `serve`.
+#[derive(Clone)]
+struct QuotaJobsConfig {
+    period_rollover_interval: std::time::Duration,
+    storage_recompute_interval: std::time::Duration,
+    storage_policy: atomic_cloud::StoragePolicy,
+    dunning_thresholds: atomic_cloud::DunningThresholds,
+}
+
+impl QuotaArgs {
+    fn into_config(self) -> QuotaJobsConfig {
+        QuotaJobsConfig {
+            // tokio::time::interval panics on a zero period; clamp.
+            period_rollover_interval: std::time::Duration::from_secs(
+                self.period_rollover_interval_secs.max(1),
+            ),
+            storage_recompute_interval: std::time::Duration::from_secs(
+                self.storage_recompute_interval_secs.max(1),
+            ),
+            storage_policy: atomic_cloud::StoragePolicy {
+                warn_after: std::time::Duration::from_secs(
+                    self.storage_warn_after_days * 24 * 60 * 60,
+                ),
+                restrict_after: std::time::Duration::from_secs(
+                    self.storage_restrict_after_days * 24 * 60 * 60,
+                ),
+            },
+            dunning_thresholds: atomic_cloud::DunningThresholds {
+                read_only_after_days: self.dunning_read_only_days,
+                suspended_after_days: self.dunning_suspended_days,
+            },
+        }
     }
 }
 
@@ -906,6 +1020,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_concurrent_provisions,
             provisioning,
             billing,
+            quota,
             dispatcher,
             fleet,
             chat_streams_per_account,
@@ -967,6 +1082,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 rate_limiter: DataPlaneRateLimiter::new(DataPlaneRateLimits::default()),
                 billing: billing_plane,
             };
+            let quota_jobs = quota.into_config();
 
             serve(
                 control,
@@ -987,6 +1103,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 deploy_policy,
                 ChatStreamLimiter::new(chat_streams_per_account),
                 quota_billing,
+                quota_jobs,
             )
             .await
         }
@@ -1236,6 +1353,7 @@ async fn serve(
     deploy_policy: DeployPolicy,
     chat_streams: ChatStreamLimiter,
     quota_billing: QuotaBilling,
+    quota_jobs: QuotaJobsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -1246,6 +1364,9 @@ async fn serve(
         Arc::clone(&vault),
         cache_config,
     ));
+    // Cluster handle for the storage-recompute loop's maintenance
+    // connection, captured before `cluster` is moved into the account plane.
+    let cluster_for_jobs = cluster.clone();
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
     let tenant_plane = TenantPlane::new(
         control.clone(),
@@ -1323,6 +1444,7 @@ async fn serve(
     // live atom/KB count vs the free plan), via the same `AccountCache` the
     // request path uses; the free plan comes from the loaded registry.
     let trial_registry = quota_billing.plan_registry.clone();
+    let dunning_thresholds = quota_jobs.dunning_thresholds;
     tokio::spawn({
         let control = control.clone();
         let cache = Arc::clone(&cache);
@@ -1332,7 +1454,7 @@ async fn serve(
             loop {
                 ticker.tick().await;
                 let now = chrono::Utc::now();
-                match advance_dunning(&control, now).await {
+                match advance_dunning_with(&control, now, dunning_thresholds).await {
                     Ok(advance) if !advance.is_quiet() => {
                         tracing::info!(?advance, "dunning sweep")
                     }
@@ -1368,6 +1490,67 @@ async fn serve(
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "trial sweep failed"),
+                }
+            }
+        }
+    });
+
+    // Period-rollover loop (plan: "Period rollover" — "A 1-hour-cadence job
+    // inserts new `period_start` rows for the remaining metrics"). Opens the
+    // current month's quota_usage rows for the non-AI metrics; idempotent
+    // (`ON CONFLICT DO NOTHING`) and cross-pod safe with no lock — the first
+    // pod to run it in a new month inserts the rows, every later pod is a
+    // no-op INSERT. AI allowances reset natively at OpenRouter, so they are
+    // deliberately absent from the rollover. The transition takes an explicit
+    // `now`, so this is interval glue around a tested function.
+    let period_rollover_interval = quota_jobs.period_rollover_interval;
+    tokio::spawn({
+        let control = control.clone();
+        async move {
+            let mut ticker = tokio::time::interval(period_rollover_interval);
+            // The first tick fires immediately — open the current period at
+            // boot so a fresh deploy has rows without waiting an interval.
+            loop {
+                ticker.tick().await;
+                match roll_over_period(&control, chrono::Utc::now()).await {
+                    Ok(n) if n > 0 => tracing::info!(opened = n, "quota period rollover"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "quota period rollover failed"),
+                }
+            }
+        }
+    });
+
+    // Storage-recompute loop (plan: "Periodic reaper | Storage bytes
+    // recompute | Week 1 warn; week 2 restrict writes; **no auto-delete**").
+    // Measures every active tenant's pg_database_size into quota_usage and
+    // advances each account's storage_state (warn → restrict) against its
+    // plan's storage_bytes_limit; data is RETAINED, never deleted. The arm
+    // takes an explicit `now`/policy, so this is interval glue around a tested
+    // function. Cross-pod safe: the per-account state UPDATE only ever
+    // advances or clears, and the metric UPSERT is last-writer-wins on a
+    // snapshot (not an accumulator), so concurrent pods converge.
+    let storage_recompute_interval = quota_jobs.storage_recompute_interval;
+    let storage_policy = quota_jobs.storage_policy.clone();
+    let storage_registry = quota_billing.plan_registry.clone();
+    tokio::spawn({
+        let control = control.clone();
+        let cluster = cluster_for_jobs.clone();
+        async move {
+            let mut ticker = tokio::time::interval(storage_recompute_interval);
+            ticker.tick().await; // first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let summary = recompute_storage(
+                    &control,
+                    &cluster,
+                    &storage_registry,
+                    &storage_policy,
+                    chrono::Utc::now(),
+                )
+                .await;
+                if !summary.is_quiet() {
+                    tracing::info!(?summary, "storage recompute");
                 }
             }
         }
