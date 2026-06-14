@@ -88,7 +88,48 @@ cargo run -p atomic-cloud -- ... --bind 0.0.0.0 --app-public-url http://app.clou
 ```
 
 Either way the client `/etc/hosts` is what makes the `Host`-based subdomain
-routing resolve — there's no wildcard DNS for `*.cloudtest.local`.
+routing resolve.
+
+## Resolving tenant subdomains (the thing that bites)
+
+`/etc/hosts` has **no wildcards**. Each line maps one exact name, so the
+entries above (`app.cloudtest.local`, `alpha.cloudtest.local`) only cover those
+names. After signup the server redirects to **`<your-slug>.cloudtest.local`** —
+if that slug isn't in `/etc/hosts`, the browser fails with **"the server IP
+address could not be found"** (a DNS miss, not a connection error). The quick
+fix is to add the exact slug:
+
+```bash
+echo "127.0.0.1  myslug.cloudtest.local" | sudo tee -a /etc/hosts   # your actual slug
+#   (use the box's Tailscale IP instead of 127.0.0.1 if you're hitting it directly, not via the tunnel)
+```
+
+To stop editing `/etc/hosts` for every account, give yourself **wildcard DNS
+for `*.cloudtest.local`** with dnsmasq (one-time setup, macOS):
+
+```bash
+brew install dnsmasq
+echo 'address=/cloudtest.local/127.0.0.1' >> "$(brew --prefix)/etc/dnsmasq.conf"
+sudo brew services start dnsmasq
+# tell macOS to resolve *.cloudtest.local via the local dnsmasq:
+sudo mkdir -p /etc/resolver
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/cloudtest.local
+# verify:
+scutil --dns | grep -A1 cloudtest.local        # should list 127.0.0.1
+dscacheutil -q host -a name anything.cloudtest.local   # should resolve to 127.0.0.1
+```
+
+Now every `*.cloudtest.local` resolves to loopback (point it at the box's
+Tailscale IP instead of `127.0.0.1` for the direct-Tailscale mode), no per-slug
+edits, and the cross-subdomain session cookie keeps working because
+`cloudtest.local` is a normal multi-label domain.
+
+**Zero-install alternative:** serve with `--base-domain 127.0.0.1.sslip.io
+--app-public-url http://app.127.0.0.1.sslip.io:8080`. [sslip.io](https://sslip.io)
+resolves `<anything>.127.0.0.1.sslip.io` → `127.0.0.1` (and
+`<anything>.<dashed-ip>.sslip.io` → that IP, e.g. your Tailscale address) over
+public DNS — no `/etc/hosts`, no dnsmasq. Uglier URLs and needs internet, but
+nothing to configure.
 
 ## Create an account and log in
 
