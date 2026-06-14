@@ -275,6 +275,263 @@ async fn nightly_pass_backs_up_every_tenant_plus_control() {
     .await;
 }
 
+/// A [`BackupStore`] that delegates to an inner local store but fails `put`
+/// for one specific key substring — used to prove a single tenant's dump
+/// failure mid-pass is recorded WITHOUT aborting the rest of the fleet.
+struct PutFailsForKey {
+    inner: Arc<dyn BackupStore>,
+    fail_substring: String,
+}
+
+#[async_trait::async_trait]
+impl BackupStore for PutFailsForKey {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), atomic_cloud::CloudError> {
+        if key.contains(&self.fail_substring) {
+            return Err(atomic_cloud::CloudError::BackupStore(format!(
+                "simulated upload failure for {key}"
+            )));
+        }
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, atomic_cloud::CloudError> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, atomic_cloud::CloudError> {
+        self.inner.list(prefix).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool, atomic_cloud::CloudError> {
+        self.inner.exists(key).await
+    }
+}
+
+/// One tenant whose dump upload fails is recorded as failed and surfaced in the
+/// summary, but the OTHER tenant and the control plane still back up — a broken
+/// tenant must never starve its neighbors (plan: "one tenant failing NEVER
+/// aborts the pass"). The `backup_runs` ledger reflects the split (succeeded=1,
+/// failed=1), and the failed tenant's row carries `last_backup_error` while its
+/// `last_backup_at` is left untouched (the staleness monitor must keep seeing
+/// the last success, never be reset by a failure).
+#[tokio::test]
+async fn one_tenant_failure_does_not_abort_the_pass() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "one_tenant_failure_does_not_abort_the_pass: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db(
+        "one_tenant_failure_does_not_abort_the_pass",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            // Two active tenants: "good" backs up, "bad" has its upload rejected.
+            let good = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "good@example.com".into(),
+                    subdomain: "goodten".into(),
+                },
+            )
+            .await
+            .expect("provision good");
+            let bad = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "bad@example.com".into(),
+                    subdomain: "badten".into(),
+                },
+            )
+            .await
+            .expect("provision bad");
+
+            // The store fails `put` only for the bad tenant's db_name in the key.
+            let (_dir, inner) = temp_store();
+            let store: Arc<dyn BackupStore> = Arc::new(PutFailsForKey {
+                inner: Arc::clone(&inner),
+                fail_substring: bad.db_name.clone(),
+            });
+
+            let now = chrono::Utc::now();
+            let config = atomic_cloud::BackupConfig::default();
+            let summary =
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+
+            // The good tenant + control plane succeeded; the bad tenant failed,
+            // but the pass as a whole did not abort.
+            assert_eq!(
+                summary.tenants_backed_up,
+                vec![good.account_id.clone()],
+                "only the good tenant is backed up: {summary:?}"
+            );
+            assert_eq!(
+                summary.tenants_failed,
+                vec![bad.account_id.clone()],
+                "the bad tenant is recorded failed: {summary:?}"
+            );
+            assert!(summary.control_backed_up, "control still backs up");
+            assert_eq!(summary.errors.len(), 1, "one per-tenant error: {summary:?}");
+
+            // The dumps physically present: good tenant + control under the day's
+            // prefix (the bad tenant's upload was rejected, so it is absent).
+            let date_prefix = format!("backups/{}/", now.format("%Y-%m-%d"));
+            let keys = inner.list(&date_prefix).await.unwrap();
+            assert_eq!(keys.len(), 2, "good tenant + control only: {keys:?}");
+            assert!(keys.iter().any(|k| k.contains(&good.db_name)));
+            assert!(keys.iter().any(|k| k.ends_with("control.dump")));
+            assert!(
+                !keys.iter().any(|k| k.contains(&bad.db_name)),
+                "the failed tenant's dump must NOT be present"
+            );
+
+            // The good tenant was stamped; the bad tenant carries the error and
+            // was NOT stamped (last_backup_at stays NULL — it never succeeded).
+            let (good_at, good_err): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT last_backup_at, last_backup_error FROM account_databases \
+                     WHERE account_id = $1",
+                )
+                .bind(&good.account_id)
+                .fetch_one(control.pool())
+                .await
+                .unwrap();
+            assert!(good_at.is_some(), "good tenant stamped");
+            assert!(good_err.is_none(), "good tenant has no error");
+
+            let (bad_at, bad_err): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT last_backup_at, last_backup_error FROM account_databases \
+                     WHERE account_id = $1",
+                )
+                .bind(&bad.account_id)
+                .fetch_one(control.pool())
+                .await
+                .unwrap();
+            assert!(
+                bad_at.is_none(),
+                "the failed tenant must NOT be stamped (it never succeeded)"
+            );
+            assert!(
+                bad_err.is_some(),
+                "the failed tenant must carry last_backup_error"
+            );
+
+            // The ledger reflects the split: two attempted, one succeeded, one
+            // failed.
+            let (total, succeeded, failed): (i32, i32, i32) = sqlx::query_as(
+                "SELECT total, succeeded, failed FROM backup_runs \
+                 ORDER BY started_at DESC LIMIT 1",
+            )
+            .fetch_one(control.pool())
+            .await
+            .unwrap();
+            assert_eq!((total, succeeded, failed), (2, 1, 1), "ledger split");
+        },
+    )
+    .await;
+}
+
+/// Two pods cannot dump the same tenant at once: while a held per-account
+/// advisory lock simulates another pod mid-dump, a concurrent pass skips that
+/// tenant (observable in [`BackupSummary::tenants_skipped_locked`]) rather than
+/// dumping it twice. The same per-account lock the reaper takes
+/// ([`try_account_advisory_lock`]) is what makes the backup pass cross-pod safe
+/// (plan: "so two pods do not dump the same tenant at once").
+#[tokio::test]
+async fn concurrent_pass_skips_a_locked_tenant() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "concurrent_pass_skips_a_locked_tenant: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db("concurrent_pass_skips_a_locked_tenant", |url| async move {
+        let (control, cluster) = setup(&url).await;
+
+        // Two active tenants. We hold the lock for "locked" to stand in for a
+        // sibling pod that is mid-dump, and leave "free" unlocked.
+        let locked = provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            NewAccount {
+                email: "locked@example.com".into(),
+                subdomain: "lockedten".into(),
+            },
+        )
+        .await
+        .expect("provision locked");
+        let free = provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            NewAccount {
+                email: "free@example.com".into(),
+                subdomain: "freeten".into(),
+            },
+        )
+        .await
+        .expect("provision free");
+
+        // Take and HOLD the locked tenant's advisory lock for the duration of
+        // the pass — the connection owning the session-level lock must outlive
+        // run_backup_pass, so the pass's own try-lock returns None and skips.
+        let held = atomic_cloud::reaper::try_account_advisory_lock(&control, &locked.account_id)
+            .await
+            .expect("take advisory lock")
+            .expect("lock is free before the pass");
+
+        let (_dir, store) = temp_store();
+        let now = chrono::Utc::now();
+        let config = atomic_cloud::BackupConfig::default();
+        let summary = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+
+        // The locked tenant was skipped (not dumped, not failed); the free
+        // tenant backed up normally; the control plane backed up.
+        assert_eq!(
+            summary.tenants_skipped_locked,
+            vec![locked.account_id.clone()],
+            "the contended tenant is skipped, not double-dumped: {summary:?}"
+        );
+        assert_eq!(
+            summary.tenants_backed_up,
+            vec![free.account_id.clone()],
+            "the free tenant still backs up: {summary:?}"
+        );
+        assert!(summary.tenants_failed.is_empty(), "a skip is not a failure");
+        assert!(summary.control_backed_up);
+
+        // The skipped tenant has no dump on disk and was not stamped (a skip is
+        // a no-op for that tenant — the next pass will reach it).
+        let date_prefix = format!("backups/{}/", now.format("%Y-%m-%d"));
+        let keys = store.list(&date_prefix).await.unwrap();
+        assert!(
+            !keys.iter().any(|k| k.contains(&locked.db_name)),
+            "the locked tenant must have no dump: {keys:?}"
+        );
+        let locked_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT last_backup_at FROM account_databases WHERE account_id = $1",
+        )
+        .bind(&locked.account_id)
+        .fetch_one(control.pool())
+        .await
+        .unwrap();
+        assert!(
+            locked_at.is_none(),
+            "a skipped tenant is not stamped — the next pass reaches it"
+        );
+
+        // Release the held lock (end the session) so cleanup can drop the DBs.
+        let _ = sqlx::Connection::close(held).await;
+    })
+    .await;
+}
+
 // ==================== Real dump → restore → verify ====================
 
 #[tokio::test]
