@@ -59,6 +59,13 @@
 //! - `/api/*` — atomic-server's full route table
 //!   ([`api_scope`](atomic_server::app::api_scope)) wrapped in [`CloudAuth`]
 //!   (in place of self-hosted's `BearerAuth`) plus [`cloud_plane_guard`].
+//! - **The account-plane SPA** ([`crate::spa`]) — the built signup/login +
+//!   `/account/*` dashboard, served as the app's **fallback**
+//!   (`default_service`) when a [`SpaServer`](crate::spa::SpaServer) is wired.
+//!   Registered **last**, so every explicit route above wins the match and the
+//!   fallback only ever handles an unmatched path (a client-routed page like
+//!   `/login`, or a build asset) — it can never shadow a JSON/API route. A
+//!   deployment with no built frontend simply omits it and unmatched paths 404.
 //!
 //! Deliberately **not** registered, with their replacements landing in later
 //! slices (plan: `docs/plans/atomic-cloud.md`):
@@ -417,6 +424,7 @@ pub fn configure_cloud_app(
     chat_streams: ChatStreamLimiter,
     readiness: Readiness,
     quota_billing: QuotaBilling,
+    spa: Option<crate::spa::SpaServer>,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     let QuotaBilling {
         plan_registry,
@@ -499,6 +507,18 @@ pub fn configure_cloud_app(
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth)
         });
+        // The SPA fallback is registered LAST, as the app's `default_service`:
+        // actix matches every explicit service above first (health, ready, the
+        // account/oauth/billing planes, the tenant plane, `/mcp`, `/ws`, and
+        // `/api/*`), and only an unmatched path — a browser navigation to a
+        // client-routed page like `/login` or `/account/provider`, or a build
+        // asset — falls through here. So the SPA can never shadow a JSON route.
+        // When no built frontend is wired (a pure-API pod, or a test that
+        // doesn't exercise serving), the fallback is simply absent and
+        // unmatched paths 404 as before.
+        if let Some(spa) = spa {
+            spa.configure_fallback(cfg);
+        }
     }
 }
 

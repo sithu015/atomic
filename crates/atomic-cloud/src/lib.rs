@@ -59,6 +59,7 @@ pub mod rate_limit;
 pub mod reaper;
 pub mod reserved_subdomains;
 pub mod server;
+pub mod spa;
 pub mod tenant_plane;
 pub mod tokens;
 
@@ -178,6 +179,7 @@ pub use server::{
     cloud_plane_guard, configure_cloud_app, FallbackAppState, QuotaBilling,
     DEFAULT_MCP_SSE_KEEP_ALIVE,
 };
+pub use spa::SpaServer;
 pub use tenant_plane::TenantPlane;
 pub use tokens::{
     create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,

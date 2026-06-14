@@ -3,8 +3,35 @@
 //! Most of the tenant plane *is* atomic-server's `api_scope()` under
 //! [`CloudAuth`](crate::auth::CloudAuth); this module holds the routes that
 //! have no self-hosted counterpart because they act on the **account** —
-//! control-plane state — rather than on knowledge-base data. Two route
-//! families: account deletion, and the provider settings API.
+//! control-plane state — rather than on knowledge-base data. Three route
+//! families: the dashboard overview, account deletion, and the provider
+//! settings API.
+//!
+//! # `GET /api/account/overview` (cloud-only: the account dashboard's read)
+//!
+//! A single account-scope read that assembles everything the hosted
+//! dashboard's landing view needs in one round-trip, so the SPA never
+//! fans out across the plan/billing/provider/usage surfaces on mount:
+//!
+//! - **identity** — `subdomain`, `email` (the accounts row);
+//! - **plan** — `{id, name}` plus the resource ceilings, resolved through
+//!   the same `accounts.plan_id` FK the quota guard reads;
+//! - **billing** — `billing_state` and `trial_ends_at`, the serving state
+//!   the dashboard renders banners from (read off the same accounts row the
+//!   [`CloudAuth`](crate::auth) lookup already resolved into
+//!   [`ResolvedTenant`]);
+//! - **usage** — live `atoms_used` (summed across the account's knowledge
+//!   bases via [`AtomicCore::count_atoms`](atomic_core::AtomicCore::count_atoms))
+//!   and `kb_count` (the [`DatabaseManager::list_databases`] length),
+//!   counted straight from the tenant database the same way enforcement does
+//!   ([`crate::plans`]) — never a stored counter that could skew;
+//! - **provider** — the active credentials' *status only* (origin, provider,
+//!   configured flag, the plaintext `model_config` summary, validation
+//!   timestamps), reusing the provider status route's discipline:
+//!   **no key material, ever**.
+//!
+//! Like every route here it is account-scope only (database/MCP tokens 403)
+//! and read-only — it touches no credential secret and writes nothing.
 //!
 //! Every route here shares the same authorization posture: CloudAuth's host
 //! routing binds the request to the subdomain's account (unreachable from
@@ -382,6 +409,13 @@ impl TenantPlane {
                 .wrap(auth.clone()),
         );
         cfg.service(
+            web::resource("/api/account/overview")
+                .app_data(self.state.clone())
+                .route(web::get().to(account_overview_route))
+                .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth.clone()),
+        );
+        cfg.service(
             web::resource("/api/account/provider")
                 .app_data(self.state.clone())
                 .route(web::get().to(provider_status_route))
@@ -404,6 +438,201 @@ impl TenantPlane {
                 .wrap(auth),
         );
     }
+}
+
+// --- Dashboard overview route (cloud-only) ----------------------------------
+
+/// `GET /api/account/overview`: the hosted dashboard's single read (module
+/// docs). Account-scope only; never returns key material.
+///
+/// The provider summary reuses the status route's exact discipline — the
+/// active credentials' `origin`/`provider`/`model_config`/validation
+/// timestamps, and nothing that could carry a secret. Usage is counted live
+/// from the tenant database (atoms summed across knowledge bases, KB count
+/// from the manager) so it cannot skew from a stored counter, the same
+/// source the quota guard enforces against.
+async fn account_overview_route(
+    req: HttpRequest,
+    state: web::Data<PlaneState>,
+) -> HttpResponse {
+    let tenant = match require_account_scope(&req) {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
+    };
+    let account_id = &tenant.principal.account_id;
+
+    // Identity + plan, joined off the one accounts row (and its plan FK). A
+    // NULL plan_id falls back to the default plan id, matching
+    // `PlanRegistry::for_account`; a resolved plan_id that names no row is a
+    // fail-closed invariant rather than a silent unlimited grant.
+    let account_row: Option<AccountOverviewRow> = match sqlx::query_as(
+        "SELECT a.email, \
+                a.trial_ends_at, \
+                COALESCE(a.plan_id, 'free') AS plan_id, \
+                p.name AS plan_name, \
+                p.atom_limit, \
+                p.kb_limit, \
+                p.ai_credits_monthly_cents \
+           FROM accounts a \
+           LEFT JOIN plans p ON p.id = COALESCE(a.plan_id, 'free') \
+          WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(state.control.pool())
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            return provider_state_error(
+                account_id,
+                "reading account overview",
+                CloudError::db("reading account overview")(e),
+            )
+        }
+    };
+    let Some(account_row) = account_row else {
+        // CloudAuth resolved this request to the account moments ago, so the
+        // row vanishing here is a concurrent deletion: 404, like a repeat
+        // DELETE.
+        return HttpResponse::NotFound().json(json!({
+            "error": "account_not_found",
+            "message": "This account no longer exists.",
+        }));
+    };
+    if account_row.plan_name.is_none() {
+        tracing::error!(
+            account_id,
+            plan_id = account_row.plan_id,
+            "account references an unknown plan; overview cannot resolve it"
+        );
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "plan_unresolved",
+            "message": "This account's plan could not be resolved.",
+        }));
+    }
+
+    // Live usage from the tenant database: atoms summed across every
+    // knowledge base, KB count from the manager (the same reads enforcement
+    // uses; see crate::plans). A failure here is best-effort — usage renders
+    // as unknown rather than failing the whole overview, which would leave the
+    // dashboard blank for a transient tenant-DB blip.
+    let (atoms_used, kb_count) = account_usage(&state, account_id).await;
+
+    // Provider summary: status only, never the key (same contract as the
+    // provider status route). A read failure degrades to `null`, not a 500 —
+    // the dashboard shows "no provider summary" rather than nothing.
+    let provider = match get_active_credentials(
+        &state.control,
+        state.vault.as_ref(),
+        account_id,
+    )
+    .await
+    {
+        Ok(Some(credentials)) => json!({
+            "configured": true,
+            "origin": credentials.origin.as_str(),
+            "provider": credentials.provider.as_str(),
+            "model_config": credentials.model_config,
+            "last_validated_at": credentials.last_validated_at.map(|t| t.to_rfc3339()),
+            "last_validation_error": credentials.last_validation_error,
+        }),
+        Ok(None) => json!({
+            "configured": false,
+            "origin": Value::Null,
+            "provider": Value::Null,
+            "model_config": Value::Null,
+            "last_validated_at": Value::Null,
+            "last_validation_error": Value::Null,
+        }),
+        Err(e) => {
+            tracing::warn!(account_id, error = %e, "overview: provider summary unavailable");
+            Value::Null
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "subdomain": tenant.subdomain,
+        "email": account_row.email,
+        "plan": {
+            "id": account_row.plan_id,
+            "name": account_row.plan_name,
+        },
+        "billing_state": tenant.billing_state.as_str(),
+        "trial_ends_at": account_row.trial_ends_at.map(|t| t.to_rfc3339()),
+        "usage": {
+            "atoms_used": atoms_used,
+            "atom_limit": account_row.atom_limit,
+            "kb_count": kb_count,
+            "kb_limit": account_row.kb_limit,
+            "ai_credits_monthly_cents": account_row.ai_credits_monthly_cents,
+        },
+        "provider": provider,
+        "mcp_url": mcp_url(&req),
+    }))
+}
+
+/// The accounts+plans join the overview reads. `plan_name` is `Option` so a
+/// dangling `plan_id` (no matching `plans` row) surfaces as a fail-closed
+/// error rather than decoding past it.
+#[derive(sqlx::FromRow)]
+struct AccountOverviewRow {
+    email: String,
+    trial_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    plan_id: String,
+    plan_name: Option<String>,
+    atom_limit: Option<i32>,
+    kb_limit: Option<i32>,
+    ai_credits_monthly_cents: i32,
+}
+
+/// Live `(atoms_used, kb_count)` for the overview, summed across the
+/// account's knowledge bases through the serving cache's manager (the same
+/// path [`rearm_provider_held_work`] uses). Best-effort: a tenant-DB read
+/// failure returns `(None, None)` and logs, so the dashboard renders "usage
+/// unavailable" rather than the whole overview 500ing on a transient blip.
+async fn account_usage(state: &PlaneState, account_id: &str) -> (Option<i64>, Option<i64>) {
+    let handle = match state.cache.get_or_load(account_id).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(account_id, error = %e, "overview: tenant load failed; usage omitted");
+            return (None, None);
+        }
+    };
+    let databases = match handle.manager.list_databases().await {
+        Ok((databases, _)) => databases,
+        Err(e) => {
+            tracing::warn!(account_id, error = %e, "overview: listing knowledge bases failed");
+            return (None, None);
+        }
+    };
+    let kb_count = databases.len() as i64;
+    let mut atoms_used: i64 = 0;
+    for db in &databases {
+        let core = match handle.manager.get_core(&db.id).await {
+            Ok(core) => core,
+            Err(e) => {
+                tracing::warn!(account_id, db_id = db.id, error = %e, "overview: core resolve failed");
+                return (None, Some(kb_count));
+            }
+        };
+        match core.count_atoms().await {
+            Ok(count) => atoms_used += i64::from(count),
+            Err(e) => {
+                tracing::warn!(account_id, db_id = db.id, error = %e, "overview: count_atoms failed");
+                return (None, Some(kb_count));
+            }
+        }
+    }
+    (Some(atoms_used), Some(kb_count))
+}
+
+/// The account's MCP endpoint URL, derived from the request's own
+/// origin (scheme + the tenant `Host`) so it is correct per deployment
+/// without threading the base domain in. The dashboard only *displays* this;
+/// the endpoint itself is the `/mcp` route wired in `server.rs`.
+fn mcp_url(req: &HttpRequest) -> String {
+    let conn = req.connection_info().clone();
+    format!("{}://{}/mcp", conn.scheme(), conn.host())
 }
 
 /// Confirmation body for `DELETE /api/account`. Extracted as

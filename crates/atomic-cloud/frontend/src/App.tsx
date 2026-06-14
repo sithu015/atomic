@@ -3,18 +3,23 @@ import { isAppHost } from './lib/host';
 import { Landing } from './pages/Landing';
 import { Signup } from './pages/Signup';
 import { Login } from './pages/Login';
-import { AccountShell } from './pages/AccountShell';
 import { NotFound } from './pages/NotFound';
+import { AccountShell } from './pages/account/AccountShell';
+import { Overview } from './pages/account/Overview';
+import { Provider } from './pages/account/Provider';
+import { Billing } from './pages/account/Billing';
+import { Mcp } from './pages/account/Mcp';
+import { Danger } from './pages/account/Danger';
 
 /**
  * One build, two route contexts, switched by `Host`:
  *
- * - **App host** (bare base domain + `app.<base>`) — the public pre-auth pages:
- *   landing, /signup, /login.
- * - **Tenant subdomain** (`<slug>.<base>`) — the authenticated `/account/*`
- *   dashboard. The placeholder shell lands next phase; for now any path under a
- *   tenant host renders the branded loading frame, and `/` redirects to
- *   `/account`.
+ * - **App host** (bare base domain + `app.<base>`) — the public pre-auth
+ *   pages: landing, /signup, /login.
+ * - **Tenant subdomain** (`<slug>.<base>`) — the authenticated dashboard. The
+ *   {@link AccountShell} owns the chrome and the overview load; the nested
+ *   routes render the active section. Unauthenticated calls under it bounce to
+ *   the app-host login (the API client redirects a 401).
  *
  * The split happens once at the router root rather than per-route so the two
  * surfaces never bleed into each other (a tenant host can't render the public
@@ -43,8 +48,17 @@ function TenantRoutes() {
   return (
     <Routes>
       <Route path="/" element={<Navigate to="/account" replace />} />
-      <Route path="/account/*" element={<AccountShell />} />
-      <Route path="*" element={<AccountShell />} />
+      <Route path="/account" element={<AccountShell />}>
+        <Route index element={<Overview />} />
+        <Route path="provider" element={<Provider />} />
+        <Route path="billing" element={<Billing />} />
+        <Route path="mcp" element={<Mcp />} />
+        <Route path="danger" element={<Danger />} />
+        {/* An unknown /account/* deep link returns to the overview. */}
+        <Route path="*" element={<Navigate to="/account" replace />} />
+      </Route>
+      {/* Any non-account path on a tenant host → the dashboard root. */}
+      <Route path="*" element={<Navigate to="/account" replace />} />
     </Routes>
   );
 }

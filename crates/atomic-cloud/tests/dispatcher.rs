@@ -1393,6 +1393,7 @@ impl DispatcherHarness {
                 chat_streams.clone(),
                 readiness.clone(),
                 quota_billing.clone(),
+                None,
             ))
         })
         .workers(1)

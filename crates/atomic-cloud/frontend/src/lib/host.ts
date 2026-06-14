@@ -82,6 +82,18 @@ export function appHostLoginUrl(): string {
   return `${protocol}//${appHost}${portSuffix}/login`;
 }
 
+/**
+ * The tenant root URL — `<scheme>://<this tenant host>/` — where the product
+ * knowledge-base app is served (an existing nginx concern at the tenant root,
+ * separate from this account dashboard at `/account/*`). The dashboard's "Open
+ * knowledge base" link points here.
+ */
+export function tenantRootUrl(): string {
+  if (typeof window === 'undefined') return '/';
+  const { protocol, host } = window.location;
+  return `${protocol}//${host}/`;
+}
+
 function appHostFromCurrent(): string {
   const host = currentHost();
   const labels = host.split('.');

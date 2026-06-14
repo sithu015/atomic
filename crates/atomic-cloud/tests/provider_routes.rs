@@ -176,6 +176,7 @@ impl ProviderHarness {
                 chat_streams.clone(),
                 readiness.clone(),
                 quota_billing.clone(),
+                None,
             ))
         })
         .workers(1)
@@ -1890,6 +1891,132 @@ async fn second_pod_sees_rotation_after_one_request() {
                 "pod 2 must serve the rotated provider after one request"
             );
             assert_eq!(after.openai_compat_base_url, byok_mock.base_url());
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// `GET /api/account/overview` (the dashboard's single read): an
+/// account-scope credential gets the assembled shape — identity, plan,
+/// billing/trial state, live atom/KB usage, and the provider summary —
+/// while a database-scoped token is refused 403, and no key material (the
+/// managed plaintext, the master key) appears in any body.
+#[actix_web::test]
+async fn account_overview_assembles_shape_and_refuses_db_scope() {
+    with_control_db(
+        "account_overview_assembles_shape_and_refuses_db_scope",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            // Full HTTP signup → managed key minted + the paid trial started
+            // (start_trial stamps trial_ends_at + billing_state='trialing').
+            let (account_id, _session) = h.signup("alpha@example.com", "alpha").await;
+            let (managed_plaintext, _key_id) = RecordingProvisioning::nth_key(0);
+
+            let token = issue_token(&h.control, &account_id, TokenScope::Account, None, "e2e")
+                .await
+                .expect("issue account token");
+            // Two atoms, one driven all the way through embedding via the
+            // managed mock, so count_atoms returns a real, non-zero number.
+            h.embed_atom("alpha", &token, "Overview note about Rust workspaces.")
+                .await;
+            h.create_atom("alpha", &token, "A second note.").await;
+
+            let resp = h
+                .api(Method::GET, "alpha", "/api/account/overview")
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("send overview");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "account-scope overview: {body}");
+
+            // Identity.
+            assert_eq!(body["subdomain"], "alpha", "{body}");
+            assert_eq!(body["email"], "alpha@example.com", "{body}");
+
+            // Plan: the trial promotes the account off `free`; whatever tier
+            // it lands on, both id and a human name must resolve.
+            assert!(body["plan"]["id"].is_string(), "plan id: {body}");
+            assert!(body["plan"]["name"].is_string(), "plan name: {body}");
+
+            // Billing: signup starts the 14-day paid trial.
+            assert_eq!(body["billing_state"], "trialing", "{body}");
+            assert!(
+                body["trial_ends_at"].is_string(),
+                "trialing account carries trial_ends_at: {body}"
+            );
+
+            // Usage: both atoms counted, exactly one knowledge base. The
+            // limit fields are present (null = unlimited under the widened
+            // test plan).
+            assert_eq!(body["usage"]["atoms_used"], 2, "live atom count: {body}");
+            assert_eq!(body["usage"]["kb_count"], 1, "one KB: {body}");
+            assert!(
+                body["usage"].get("atom_limit").is_some(),
+                "atom_limit key present: {body}"
+            );
+            assert!(
+                body["usage"].get("kb_limit").is_some(),
+                "kb_limit key present: {body}"
+            );
+
+            // Provider summary: managed + configured, the curated embedding
+            // model echoed, validation surface present — and never a key.
+            assert_eq!(body["provider"]["configured"], true, "{body}");
+            assert_eq!(body["provider"]["origin"], "managed", "{body}");
+            assert_eq!(body["provider"]["provider"], "openrouter", "{body}");
+            assert_eq!(
+                body["provider"]["model_config"]["embedding_model"],
+                "openai/text-embedding-3-small",
+                "{body}"
+            );
+            assert!(
+                body["provider"].get("last_validated_at").is_some(),
+                "validation surface present: {body}"
+            );
+            // No api_key (or any secret-shaped key) in the provider summary.
+            assert!(
+                body["provider"]["model_config"].get("api_key").is_none(),
+                "model_config must never carry a key: {body}"
+            );
+
+            // MCP URL points at this tenant's /mcp endpoint.
+            assert_eq!(
+                body["mcp_url"], "http://alpha.cloudtest.local/mcp",
+                "mcp_url: {body}"
+            );
+
+            // A database-scoped token must be refused — the overview reads
+            // account-level state (plan, billing, provider), strictly above a
+            // KB-pinned credential's station.
+            let db_scoped = issue_token(
+                &h.control,
+                &account_id,
+                TokenScope::Database,
+                Some("default"),
+                "db-scoped",
+            )
+            .await
+            .expect("issue db-scoped token");
+            let resp = h
+                .api(Method::GET, "alpha", "/api/account/overview")
+                .bearer_auth(&db_scoped)
+                .send()
+                .await
+                .expect("send db-scoped overview");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "db-scoped overview: {body}");
+            assert_eq!(body["error"], "account_scope_required", "{body}");
+
+            // No secret material in any collected body (managed plaintext,
+            // master key in either common encoding).
+            h.assert_bodies_free_of(&managed_plaintext, "managed key plaintext");
+            let master_hex = data_encoding::HEXLOWER.encode(&TEST_MASTER_KEY);
+            let master_b64 = data_encoding::BASE64.encode(&TEST_MASTER_KEY);
+            h.assert_bodies_free_of(&master_hex, "master key (hex)");
+            h.assert_bodies_free_of(&master_b64, "master key (base64)");
 
             h.stop().await;
         },

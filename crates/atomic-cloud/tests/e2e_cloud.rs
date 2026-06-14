@@ -25,7 +25,7 @@ use atomic_cloud::{
     upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
     ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin, FallbackAppState,
     ManagedKeys, NewAccount, NewCredentials, Provider, QuotaBilling, Readiness, SecretKey,
-    TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
+    SpaServer, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -71,6 +71,9 @@ struct CloudHarness {
     /// Owns the scratch directory behind the inert fallback `AppState`;
     /// must outlive the server.
     _fallback: FallbackAppState,
+    /// Owns the fixture `dist/` the SPA fallback serves; must outlive the
+    /// server (the SPA reads assets from disk on each request).
+    _spa_dir: tempfile::TempDir,
 }
 
 impl CloudHarness {
@@ -134,6 +137,21 @@ impl CloudHarness {
             format!("http://app.{BASE_DOMAIN}"),
         );
         let mcp_transport = fallback.mcp_transport(atomic_cloud::DEFAULT_MCP_SSE_KEEP_ALIVE);
+
+        // A fixture `dist/` so the composed server serves the account-plane
+        // SPA fallback exactly as `serve` wires it — base-domain meta and all.
+        let spa_dir = tempfile::tempdir().expect("spa fixture dir");
+        std::fs::write(
+            spa_dir.path().join("index.html"),
+            r#"<!doctype html><html><head>
+<meta name="atomic-cloud-base-domain" content="__ATOMIC_CLOUD_BASE_DOMAIN__" />
+</head><body><div id="root"></div></body></html>"#,
+        )
+        .expect("write fixture index.html");
+        let spa = SpaServer::load(spa_dir.path(), BASE_DOMAIN)
+            .await
+            .expect("load fixture SPA");
+
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -146,6 +164,7 @@ impl CloudHarness {
                 chat_streams.clone(),
                 readiness.clone(),
                 quota_billing.clone(),
+                Some(spa.clone()),
             ))
         })
         .workers(1)
@@ -165,6 +184,7 @@ impl CloudHarness {
             base_url: format!("http://127.0.0.1:{port}"),
             handle,
             _fallback: fallback,
+            _spa_dir: spa_dir,
         }
     }
 
@@ -1399,6 +1419,110 @@ async fn straggler_accounts_get_account_upgrading_503() {
             h.list_atoms(&alpha).await;
             let ws = h.ws_connect(&alpha).await;
             drop(ws);
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The account-plane SPA fallback through the **composed** server: the app
+/// host serves the base-domain-injected shell on a client-routed path, a
+/// tenant subdomain serves the shell for an `/account/*` deep link, and —
+/// critically — the JSON planes (`/health`, the unauthenticated tenant
+/// `/api/*`) still resolve and are never shadowed by the fallback.
+#[actix_web::test]
+async fn spa_fallback_serves_app_and_tenant_without_shadowing_json() {
+    with_control_db(
+        "spa_fallback_serves_app_and_tenant_without_shadowing_json",
+        |url| async move {
+            let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+            let tenant = h.provision("alpha").await;
+
+            // App host (`app.<base>`): a client-routed path with no file →
+            // the SPA shell, with the base domain injected into the meta tag.
+            for host in [format!("app.{BASE_DOMAIN}"), BASE_DOMAIN.to_string()] {
+                for path in ["/", "/login", "/signup"] {
+                    let resp = h
+                        .client
+                        .get(format!("{}{path}", h.base_url))
+                        .header(HOST, &host)
+                        .send()
+                        .await
+                        .expect("send app-host page");
+                    assert_eq!(resp.status(), StatusCode::OK, "{host}{path}");
+                    let ct = resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert!(ct.contains("text/html"), "{host}{path} is HTML: {ct}");
+                    let body = resp.text().await.expect("body");
+                    assert!(
+                        body.contains(&format!(r#"content="{BASE_DOMAIN}""#)),
+                        "{host}{path} carries the injected base domain"
+                    );
+                }
+            }
+
+            // Tenant subdomain: an `/account/*` deep link serves the same SPA
+            // shell (the client then cookie-authes the API and redirects on
+            // 401). The shell is served unauthenticated — the gate is the API.
+            let resp = h
+                .api(Method::GET, &tenant.subdomain, "/account/provider")
+                .send()
+                .await
+                .expect("send tenant deep link");
+            assert_eq!(resp.status(), StatusCode::OK, "tenant deep link serves shell");
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(ct.contains("text/html"), "tenant deep link is HTML: {ct}");
+
+            // JSON planes are NOT shadowed:
+            // - `/health` resolves to its JSON on any host.
+            let resp = h
+                .client
+                .get(format!("{}/health", h.base_url))
+                .header(HOST, format!("app.{BASE_DOMAIN}"))
+                .send()
+                .await
+                .expect("send health");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(ct.contains("application/json"), "health stays JSON: {ct}");
+
+            // - the tenant `/api/account/overview` without auth returns the
+            //   API's structured 401 (CloudAuth), not the HTML shell.
+            let resp = h
+                .api(Method::GET, &tenant.subdomain, "/api/account/overview")
+                .send()
+                .await
+                .expect("send unauth overview");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated overview is a 401, not the shell"
+            );
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                ct.contains("application/json"),
+                "unauth overview stays JSON (not shadowed): {ct}"
+            );
 
             h.stop().await;
         },

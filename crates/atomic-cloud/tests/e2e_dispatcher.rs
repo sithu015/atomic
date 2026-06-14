@@ -203,6 +203,7 @@ impl E2eHarness {
                 limiter_for_app.clone(),
                 readiness.clone(),
                 quota_billing.clone(),
+                None,
             ))
         })
         .workers(1)

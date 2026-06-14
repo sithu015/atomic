@@ -171,6 +171,20 @@ enum Command {
         #[arg(long, env = "ATOMIC_CLOUD_APP_PUBLIC_URL")]
         app_public_url: Option<String>,
 
+        /// Directory holding the built account-plane SPA (`npm run build` →
+        /// `dist`) to serve as the cloud server's fallback route — the
+        /// signup/login pages and the authenticated `/account/*` dashboard.
+        /// Defaults to `crates/atomic-cloud/frontend/dist` relative to the
+        /// repo root; if that directory has no `index.html` (a pure-API pod,
+        /// or a dev run that hasn't built the frontend), the SPA fallback is
+        /// simply absent and unmatched paths 404.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_SPA_DIR",
+            default_value = "crates/atomic-cloud/frontend/dist"
+        )]
+        spa_dir: std::path::PathBuf,
+
         /// Max signups provisioning concurrently in this process; further
         /// signup completions get a 503 + Retry-After without consuming
         /// their link (the plan budgets 4-8).
@@ -1242,6 +1256,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             master_key_env,
             trust_proxy_header,
             app_public_url,
+            spa_dir,
             max_concurrent_provisions,
             provisioning,
             billing,
@@ -1349,6 +1364,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 backup_store,
                 backup_config,
                 std::time::Duration::from_secs(backup_interval_secs.max(1)),
+                spa_dir,
             )
             .await
         }
@@ -1862,6 +1878,7 @@ async fn serve(
     backup_store: Arc<dyn atomic_cloud::BackupStore>,
     backup_config: atomic_cloud::BackupConfig,
     backup_interval: std::time::Duration,
+    spa_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -2162,6 +2179,21 @@ async fn serve(
         base_domain,
         "account plane (signup/login) on {base_domain} and app.{base_domain}"
     );
+    // Load the account-plane SPA (signup/login + the `/account/*` dashboard)
+    // to serve as the fallback route. Absent (no `index.html` under `spa_dir`)
+    // is a clean degrade — a pure-API pod or an un-built dev run boots without
+    // the fallback and unmatched paths 404. A directory that *exists* but is
+    // unreadable is a hard boot error (a real misconfiguration).
+    let spa = atomic_cloud::SpaServer::load_optional(&spa_dir, &base_domain).await?;
+    match &spa {
+        Some(_) => tracing::info!(spa_dir = %spa_dir.display(), "serving account-plane SPA"),
+        None => tracing::warn!(
+            spa_dir = %spa_dir.display(),
+            "no built SPA found (run `npm run build` in crates/atomic-cloud/frontend); \
+             serving API only"
+        ),
+    }
+
     tracing::info!(bind, port, "listening on http://{bind}:{port}");
     tracing::info!(bind, port, "health: http://{bind}:{port}/health");
 
@@ -2177,6 +2209,7 @@ async fn serve(
             chat_streams.clone(),
             readiness.clone(),
             quota_billing.clone(),
+            spa.clone(),
         ))
     })
     .workers(4)

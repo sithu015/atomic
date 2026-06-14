@@ -7,7 +7,7 @@ switched by the request `Host`:
 | Context | Hosts | What it serves |
 |---|---|---|
 | **App host** | the bare base domain + `app.<base>` | public pre-auth pages: landing `/`, `/signup`, `/login` |
-| **Tenant subdomain** | `<slug>.<base>` | the authenticated `/account/*` dashboard (built in the next phase) |
+| **Tenant subdomain** | `<slug>.<base>` | the authenticated `/account/*` dashboard: overview, AI provider, billing, MCP, account |
 
 It is visually consistent with the marketing site (`atomic-website`): the
 warm light-paper palette, Crimson Pro serif display, DM Sans body, one purple
@@ -40,12 +40,33 @@ the deployable bundle with `npm run build`.
 
 ## How the dist is served
 
-The cloud server (`atomic-cloud`, actix) serves the built `dist/` directory via
-`actix-files` with an SPA fallback (any non-API, non-asset path returns
-`index.html` so client-side routing works). That serving wiring lands in a
-later phase of this slice; this package only produces the bundle. The build
-output is intentionally flat and predictable so the Rust side can point a single
-`Files` service at `crates/atomic-cloud/frontend/dist`.
+The cloud server (`atomic-cloud`, actix) serves the built `dist/` directory as
+its **fallback** route — registered last in `configure_cloud_app`, after every
+JSON/OAuth/MCP/WS route, so it only ever handles an unmatched path (a
+client-routed page, or a build asset) and can never shadow an API route. The
+serving layer lives in [`src/spa.rs`](../src/spa.rs):
+
+- a real file under `dist/` (a hashed asset, the favicon, a logo) is served as
+  that file with an appropriate cache header;
+- anything else returns `index.html` (the SPA shell) so client-side routing
+  takes over;
+- the base-domain meta placeholder is rewritten **once at startup** with the
+  deployment's real base domain.
+
+Point the server at the build with `--spa-dir` (env `ATOMIC_CLOUD_SPA_DIR`); it
+defaults to `crates/atomic-cloud/frontend/dist`. If that directory has no
+`index.html` (a pure-API pod, or a dev run that hasn't built the frontend) the
+fallback is simply absent and unmatched paths 404 — so the API runs without the
+SPA. Produce the bundle the server serves with:
+
+```bash
+npm install && npm run build      # → crates/atomic-cloud/frontend/dist
+```
+
+`dist/` is git-ignored and **not** committed; build it as part of the deploy.
+The Rust serving tests don't depend on a full build — they generate a tiny
+fixture `dist/` in a tempdir (see `tests/spa_serving.rs` and the `e2e_cloud.rs`
+harness).
 
 ## Host / context detection
 
@@ -72,22 +93,46 @@ dashboard drivable locally against e.g. `alpha.localhost` without a server.
 `src/lib/api.ts` is a small typed `fetch` client — **same-origin**,
 `credentials: 'include'` (so the `.<base>` session cookie rides along on the
 tenant dashboard), JSON in/out, the cloud error shapes parsed into a typed
-`ApiError` (validation code, `Retry-After`, structured billing/auth states), and
-a `401` → redirect-to-app-host-login for authenticated routes. This phase
-implements `requestSignupLink` and `requestLoginLink`; the cookie-authed
-dashboard methods are added next phase.
+`ApiError` (validation code, `Retry-After`, the parsed body for structured
+fields, structured billing/auth states), and a `401` →
+redirect-to-app-host-login for authenticated routes. It covers the public
+signup/login routes and the dashboard methods: `getOverview`,
+`getProviderStatus`, `saveByokProvider`, `activateProvider`, `updateModels`, and
+`deleteAccount`.
+
+## The dashboard
+
+The authenticated `/account/*` surface lives under `src/pages/account/`. The
+shell (`AccountShell`) loads the account overview once on mount and routes the
+structured cloud states into branded frames:
+
+- **provisioning / upgrading** (503) → a friendly auto-retrying hold;
+- **suspended** (402) → a blocking notice with the billing upgrade link;
+- **trialing / past_due / read_only** → a global `BillingBanner`;
+- **ready** → the chrome (top bar, nav) wrapping the active section.
+
+A `401` never reaches the shell — the API client redirects an expired session to
+the app-host login. The loaded overview is shared with child routes via an
+outlet context (`src/lib/accountContext.ts`), so the overview page renders
+without its own fetch; the provider page fetches the fuller provider status.
 
 ## Layout
 
 ```
 src/
   components/         SiteNav, SiteFooter, NodeGraphBackdrop, CheckEmail
-    ui/               Button, Card, Field, Banner, Spinner, Logo, TextLink
+    ui/               Button, Card, Field, PasswordField, Select, Banner,
+                      Spinner, Logo, TextLink, StatusPill, SegmentedControl
+    account/          AccountTopbar, AccountNav, BillingBanner, HoldScreen,
+                      UsageMeter, ByokForm, ManagedModels
   layouts/            PublicLayout (nav/footer), AuthLayout (centered card + hero)
-  lib/                api.ts, host.ts, validate.ts, cn.ts
-  pages/              Landing, Signup, Login, AccountShell (placeholder), NotFound
+  lib/                api.ts, host.ts, validate.ts, cn.ts, format.ts, models.ts,
+                      provider.ts, accountContext.ts, useOverview.ts,
+                      useProviderStatus.ts
+  pages/              Landing, Signup, Login, NotFound
+    account/          AccountShell, Overview, Provider, Billing, Mcp, Danger
   styles/global.css   @theme tokens + node-graph motif + font setup
-  App.tsx             host-split router
+  App.tsx             host-split router (nested /account routes on the tenant host)
   main.tsx            entry
 public/               logo.svg, logo-dark.svg, logo-mark.svg, favicon.svg
 ```

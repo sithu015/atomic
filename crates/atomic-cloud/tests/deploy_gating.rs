@@ -891,6 +891,7 @@ async fn ready_route_is_public_and_tracks_the_gate() {
                     chat_streams.clone(),
                     readiness_for_app.clone(),
                     quota_billing.clone(),
+                    None,
                 ))
             })
             .workers(1)
