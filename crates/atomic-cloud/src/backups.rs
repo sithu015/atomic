@@ -375,21 +375,25 @@ pub async fn finalize_abandoned_backup_runs(
 pub async fn stale_tenant_backups(
     control: &ControlPlane,
     horizon: Duration,
-    now: DateTime<Utc>,
 ) -> Result<Vec<StaleBackup>, CloudError> {
-    let cutoff = now
-        .checked_sub_signed(chrono::Duration::from_std(horizon).unwrap_or(chrono::Duration::MAX))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    // The cutoff is computed from the database clock (`NOW()`), not a
+    // caller-supplied timestamp: in a multi-pod deployment the pods' wall
+    // clocks can skew relative to the cluster, and at a small horizon that
+    // skew would otherwise flip the staleness verdict. Comparing the DB
+    // clock against DB-written `created_at`/`last_backup_at` keeps the check
+    // skew-immune.
+    let horizon_secs = horizon.as_secs_f64();
     sqlx::query_as(
         "SELECT ad.account_id, ad.db_name, ad.last_backup_at \
          FROM account_databases ad \
          JOIN accounts a ON a.id = ad.account_id \
          WHERE ad.status = 'active' AND a.status = 'active' \
-           AND a.created_at < $1 \
-           AND (ad.last_backup_at IS NULL OR ad.last_backup_at < $1) \
+           AND a.created_at < NOW() - make_interval(secs => $1) \
+           AND (ad.last_backup_at IS NULL \
+                OR ad.last_backup_at < NOW() - make_interval(secs => $1)) \
          ORDER BY ad.last_backup_at ASC NULLS FIRST",
     )
-    .bind(cutoff)
+    .bind(horizon_secs)
     .fetch_all(control.pool())
     .await
     .map_err(CloudError::db("listing stale tenant backups"))

@@ -1558,7 +1558,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             BackupAction::Status { staleness_secs } => {
                 let horizon = std::time::Duration::from_secs(staleness_secs);
-                let now = chrono::Utc::now();
 
                 // Finalize any in-flight runs left by a pod that died mid-pass
                 // so status doesn't show a perpetually in-flight pass
@@ -1591,7 +1590,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                 }
 
-                let stale = atomic_cloud::stale_tenant_backups(&control, horizon, now).await?;
+                let stale = atomic_cloud::stale_tenant_backups(&control, horizon).await?;
                 println!();
                 if stale.is_empty() {
                     println!(
@@ -2275,7 +2274,7 @@ async fn run_backup_loop(
         // the horizon (or who has never been backed up and is past it) is the
         // signal that the backup job is failing for that tenant — escalate at
         // error level so it pages, not just logs.
-        match atomic_cloud::stale_tenant_backups(&control, config.staleness_horizon, now).await {
+        match atomic_cloud::stale_tenant_backups(&control, config.staleness_horizon).await {
             Ok(stale) if !stale.is_empty() => {
                 for tenant in &stale {
                     tracing::error!(

@@ -134,7 +134,7 @@ async fn backup_status_and_ledger_round_trip() {
         // It is stale (never backed up) only once older than the horizon —
         // with a zero horizon, a never-backed-up active tenant trips it.
         let now = chrono::Utc::now();
-        let stale = stale_tenant_backups(&control, std::time::Duration::ZERO, now)
+        let stale = stale_tenant_backups(&control, std::time::Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(
@@ -149,7 +149,7 @@ async fn backup_status_and_ledger_round_trip() {
             .await
             .unwrap();
         let fresh =
-            stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60), now)
+            stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60))
                 .await
                 .unwrap();
         assert!(fresh.is_empty(), "a just-backed-up tenant is not stale");
@@ -1789,7 +1789,7 @@ async fn backup_status_reports_freshness_and_stale_tenants() {
             // Staleness query at the 36h horizon: only the never-backed-up
             // tenant trips it.
             let stale_set =
-                stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60), now)
+                stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60))
                     .await
                     .unwrap();
             assert_eq!(
