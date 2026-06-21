@@ -106,14 +106,13 @@ journey works per account:
   `WWW-Authenticate` challenge pointing at *this tenant's* protected-resource
   metadata, so the client discovers the right per-account OAuth flow.
 
-**MCP-token default scope** (the plan's open question, resolved): OAuth-minted
-tokens are classified `scope='mcp'` in `cloud_tokens` and default to
-**account-level access** (`allowed_db_id = NULL`) — one MCP URL per account,
-full access to all its KBs, matching "one account = one user" in v1. A db-pinned
-authorization still mints a KB-pinned `mcp` token, and CloudAuth's
-`allowed_db_id` chokepoint enforces the pin (a pinned MCP token can't reach
-another KB via the `X-Atomic-Database` header). Per-KB-MCP-by-default is
-deferred.
+**MCP-token default scope**: OAuth-minted tokens are classified `scope='mcp'`
+in `cloud_tokens` and default to **account-level access** (`allowed_db_id =
+NULL`) — one MCP URL per account, full access to all its KBs, matching "one
+account = one user". A db-pinned authorization still mints a KB-pinned `mcp`
+token, and CloudAuth's `allowed_db_id` chokepoint enforces the pin (a pinned
+MCP token can't reach another KB via the `X-Atomic-Database` header). Per-KB
+MCP scoping by default is not yet supported.
 
 ## Module map
 
@@ -449,9 +448,9 @@ repointing while a pod serves the old database would split-brain reads):
 3. **Evict the running serve process's `AccountCache` entry** for that account —
    otherwise a serving pod keeps a `DatabaseManager` pointing at the OLD
    `db_name` and serves the stale database. A CLI restore cannot reach another
-   process's cache (the slice-2 deletion gap); until an admin evict endpoint
-   exists (a later slice), restart the pod or let the idle TTL reclaim the entry.
-   In-process (e.g. the HTTP deletion route) this is `AccountCache::evict`.
+   process's cache, so until an admin evict endpoint exists, restart the pod or
+   let the idle TTL reclaim the entry. In-process (e.g. the HTTP deletion route)
+   this is `AccountCache::evict`.
 
 4. **Drop the old database** once you've confirmed the restored tenant serves.
 
@@ -492,93 +491,18 @@ provider or sends real email.
   in-memory channel, so in a multi-pod deployment a WS client on another pod
   misses that execution's progress events. Durable state is always correct;
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
-- Several capabilities are scoped to later slices — observability
-  metrics/tracing and the user-facing `account_events` log. The account-plane
-  SPA (signup/login + the authenticated `/account/*` dashboard) ships in
-  [`frontend/`](frontend) and is served by the cloud server. The OAuth flow is
-  shipped as API + a minimal server-rendered consent/approve form (no SPA); a
-  richer consent UI is later. See the plan doc's Implementation log for the
-  current frontier.
-- **Backup PITR is deferred**: backups are nightly logical dumps (`pg_dump
-  -Fc`) per tenant + control plane, not point-in-time recovery via WAL
-  archiving — recovery granularity is one day. The restore CLI restores into
-  a *fresh* database; **repointing `account_databases.db_name` and evicting a
-  running pod's `AccountCache` entry are deliberate manual runbook steps** (a
-  CLI invocation can't reach another process's in-memory cache; an admin evict
-  endpoint is a later slice).
+- **Not yet built**: observability metrics/tracing and the user-facing
+  `account_events` log. The OAuth consent/approve step is a minimal
+  server-rendered form, not a full SPA flow.
+- **No point-in-time recovery**: backups are nightly logical dumps (`pg_dump
+  -Fc`) per tenant + control plane, not PITR via WAL archiving — recovery
+  granularity is one day. The restore CLI restores into a *fresh* database;
+  **repointing `account_databases.db_name` and evicting a running pod's
+  `AccountCache` entry are deliberate manual runbook steps** (a CLI invocation
+  can't reach another process's in-memory cache; an admin evict endpoint is not
+  yet built).
 
-## What's shipped (this slice: backups & disaster recovery)
-
-- **`BackupStore` seam** — a trait (`put`/`get`/`list`/`exists`) with a
-  `LocalFileSystemStore` (dev + every test; pure `tokio::fs`, never network)
-  and an `S3Store` backed by the `object_store` crate (S3 + any S3-compatible
-  endpoint; SigV4 not hand-rolled). `serve`/CLI select it via
-  `--backup-store local|s3`; S3 credentials are env-only.
-- **Logical dump/restore runner** — `pg_dump -Fc` / `pg_restore` via
-  `tokio::process`, with the connection **password in `PGPASSWORD` in the
-  child env, never argv** (a unit test asserts a sentinel password is only in
-  the env), `is_tenant_db_name` shape-validation before any DDL, and bounded
-  stderr capture. A real dump → restore → verify roundtrip is integration-
-  tested (provision a tenant, write an atom, dump, restore into a fresh DB,
-  assert the atom rehydrated) — gated on `pg_dump` being on PATH.
-- **Nightly pass** (`backups.rs`) — dumps every active tenant (each under the
-  reaper's per-account advisory lock, so two pods never dump one tenant at
-  once) plus the control plane, records per-tenant `last_backup_at` /
-  `last_backup_error` and a `backup_runs` ledger row (migration `015`), and
-  runs the **staleness monitor** (error-level alert when a tenant's last
-  successful backup is >36h old). Wired into `serve` with a jittered start +
-  CLI knobs, mirroring the reaper loop.
-- **Fail-closed final dump on deletion** — `delete_account` takes a final
-  `backups/final/` dump **before** the `DROP DATABASE`, scoped to the
-  active-account deletion path (HTTP route, CLI, and the reaper's
-  interrupted-deletion arm; the never-activated rollback/orphan paths
-  correctly take none). A dump failure aborts the deletion rather than destroy
-  un-backed-up data — the operator's only undo under hard-delete v1. Retention
-  (14 daily + 8 weekly; 30-day finals) is bucket lifecycle policy, not code.
-- **Operator + restore CLI + runbook** — `atomic-cloud backup run` (one pass
-  now), `backup status` (per-tenant `last_backup_at` + last error + the stale
-  set + recent `backup_runs`), `backup list --subdomain` (one tenant's dumps,
-  per-tenant by key construction), and `backup restore` — restore a dump into
-  a fresh database, then print the remaining manual runbook steps (repoint
-  `account_databases.db_name` **with the schema version**, evict the running
-  pod's `AccountCache`). The full final-dump → restore → repoint → verify
-  runbook is rehearsed at the library level
-  (`tests/backup.rs::final_dump_restore_runbook_roundtrip`) **and end to end
-  through the composed cloud server** with two tenants
-  ([`tests/e2e_backup.rs`](tests/e2e_backup.rs)): provision alpha + beta, nightly
-  pass, delete alpha (final dump), confirm alpha 404s and is gone from
-  `pg_database` while **beta is wholly unaffected**, then restore alpha into a
-  fresh DB, repoint, evict, and confirm its atom is served live — per-tenant
-  isolation asserted at every step, plus a staleness-alert case (one
-  manufactured-old tenant surfaces, a fresh one does not). PITR via WAL archiving
-  is deferred.
-
-## Previously shipped (OAuth & per-tenant MCP)
-
-- **Per-account OAuth 2.0** — cloud's own Dynamic Client Registration +
-  Authorization Code + PKCE (S256) flow on the tenant subdomain
-  ([`oauth_routes.rs`](src/oauth_routes.rs)), storing clients/codes in the
-  control plane scoped by `account_id` ([`oauth_store.rs`](src/oauth_store.rs),
-  migration `014`). Discovery is per-tenant (issuer = the addressed origin);
-  the approve step authenticates the session cookie, not a pasted token.
-  Hash-only client secrets and codes, single-use 60s codes, S256 verification
-  against an RFC 7636 fixture. atomic-server's self-hosted OAuth handlers are
-  left untouched.
-- **Per-tenant MCP** — `/mcp` mounts behind CloudAuth; atomic-server's MCP
-  transport resolves its `DatabaseManager` from the per-request
-  `RequestDatabaseManager` extension (a cloud-unaware generality mirroring the
-  data plane's `Db` extractor — self-hosted runs byte-identical via the
-  baked-in fallback), so each tenant's MCP tool calls hit its own KB. An
-  unauthenticated `/mcp` returns the MCP `WWW-Authenticate` challenge pointing
-  at *this tenant's* OAuth discovery.
-- **MCP token default scope** — OAuth-minted tokens are `scope='mcp'` with
-  account-level access (`allowed_db_id = NULL`); db-pinned tokens are still
-  honored and chokepoint-enforced. The full Claude-Desktop journey
-  (discovery → DCR → authorize → token → `initialize` + `tools/call`) and the
-  cross-tenant isolation / PKCE-replay / expired-code / db-pin cases are driven
-  over real HTTP in [`tests/e2e_oauth.rs`](tests/e2e_oauth.rs).
-
-## Previously shipped (billing & quotas)
+## Plan tiers, quotas & billing
 
 - **Plan-tier resource limits** — `plans` catalogue + `accounts.plan_id`,
   live atom/KB enforcement (402 `quota_exceeded`); free-tier defaults (100
