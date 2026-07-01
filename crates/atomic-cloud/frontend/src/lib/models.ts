@@ -31,8 +31,8 @@ export const PINNED_EMBEDDING_DIMENSION = 1536;
  */
 export const MANAGED_LLM_MODELS: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini' },
-  { id: 'anthropic/claude-3.5-haiku', label: 'Claude 3.5 Haiku' },
-  { id: 'google/gemini-2.0-flash-001', label: 'Gemini 2.0 Flash' },
+  { id: 'anthropic/claude-haiku-4.5', label: 'Claude Haiku 4.5' },
+  { id: 'google/gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
 ];
 
 /** Human label for a managed LLM id, falling back to the raw id. */

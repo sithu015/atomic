@@ -42,10 +42,10 @@ use crate::managed_keys::ManagedKeys;
 use crate::plans::DEFAULT_PLAN_ID;
 
 /// Days past_due before writes are blocked (`past_due → read_only`).
-pub const READ_ONLY_AFTER_DAYS: i64 = 3;
+pub const READ_ONLY_AFTER_DAYS: i64 = 7;
 
 /// Days past_due before serving is blocked (`read_only → suspended`).
-pub const SUSPENDED_AFTER_DAYS: i64 = 14;
+pub const SUSPENDED_AFTER_DAYS: i64 = 21;
 
 /// The two day-count thresholds the time-driven dunning ladder advances on
 /// (plan: 3 days → read_only, 14 days → suspended). A config struct rather

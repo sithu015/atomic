@@ -57,8 +57,8 @@ pub const PINNED_EMBEDDING_DIMENSION: usize = 1536;
 /// seeded at signup ([`crate::managed_keys::default_managed_model_config`]).
 pub const MANAGED_LLM_MODELS: &[&str] = &[
     "openai/gpt-4o-mini",
-    "anthropic/claude-3.5-haiku",
-    "google/gemini-2.0-flash-001",
+    "anthropic/claude-haiku-4.5",
+    "google/gemini-2.5-flash",
 ];
 
 /// The `model_config` keys a **user** may write on a managed row — the
