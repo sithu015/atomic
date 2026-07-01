@@ -57,7 +57,7 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("ollama_timeout_secs", "120"), // 2 minutes default for Ollama (local models can be slow)
     ("ollama_context_length", "65536"),
     ("openrouter_context_length", ""),
-    ("embedding_model", "openai/text-embedding-3-small"),
+    ("embedding_model", "qwen/qwen3-embedding-8b"),
     ("tagging_model", "openai/gpt-4o-mini"),
     // Pipeline strategy defaults. These are intentionally conservative: whole-atom
     // rechunking and cost-bounded full-content tagging with truncation.
@@ -268,7 +268,7 @@ mod tests {
 
         // For a key that doesn't exist, should return default
         let value = get_setting_or_default(&conn, "embedding_model");
-        assert_eq!(value, "openai/text-embedding-3-small");
+        assert_eq!(value, "qwen/qwen3-embedding-8b");
 
         // For a key with no default, should return empty string
         let unknown = get_setting_or_default(&conn, "unknown_key");

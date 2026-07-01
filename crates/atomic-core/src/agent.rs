@@ -421,7 +421,7 @@ async fn execute_search_atoms(
 
     // Generate query embedding
     let provider = crate::providers::get_embedding_provider(&config).map_err(|e| e.to_string())?;
-    let embed_config = crate::providers::EmbeddingConfig::new(config.embedding_model());
+    let embed_config = config.embedding_config();
     let embeddings = provider
         .embed_batch(&[query.to_string()], &embed_config)
         .await

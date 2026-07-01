@@ -51,6 +51,18 @@ impl ProviderType {
 /// servers that speak the same API).
 pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
+/// The default embedding model (OpenRouter provider). Qwen3-Embedding-8B is the
+/// top open-weight retrieval model on MTEB, the cheapest embedding on
+/// OpenRouter, and self-hostable — we request it at
+/// [`DEFAULT_EMBEDDING_DIMENSION`] via Matryoshka so stored vectors stay
+/// compact. Its registered width lives in [`openrouter::models::EMBEDDING_MODELS`].
+pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
+
+/// The width we request/store for [`DEFAULT_EMBEDDING_MODEL`] (Matryoshka).
+/// Smaller than the model's 4096 native width — cheaper storage and faster
+/// vector search — with negligible retrieval loss for an 8B embedder.
+pub const DEFAULT_EMBEDDING_DIMENSION: usize = 1024;
+
 /// Provider configuration extracted from settings
 ///
 /// `Debug` is implemented manually to redact API keys — configs get logged
@@ -154,7 +166,7 @@ impl ProviderConfig {
             openrouter_embedding_model: settings
                 .get("embedding_model")
                 .cloned()
-                .unwrap_or_else(|| "openai/text-embedding-3-small".to_string()),
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string()),
             openrouter_llm_model: settings
                 .get("tagging_model")
                 .cloned()
@@ -349,6 +361,16 @@ impl ProviderConfig {
             ProviderType::Ollama => ollama::get_embedding_dimension(&self.ollama_embedding_model),
             ProviderType::OpenAICompat => self.openai_compat_embedding_dimension,
         }
+    }
+
+    /// The [`EmbeddingConfig`] for this provider: the active embedding model
+    /// pinned to its registered [`embedding_dimension`](Self::embedding_dimension).
+    /// This is the canonical constructor — it guarantees the requested output
+    /// width matches the dimension the vector schema was created at, so a
+    /// Matryoshka model (e.g. Qwen3-Embedding) can never silently store vectors
+    /// wider than the column expects.
+    pub fn embedding_config(&self) -> EmbeddingConfig {
+        EmbeddingConfig::new(self.embedding_model()).with_dimensions(self.embedding_dimension())
     }
 
     /// Get the context length (in tokens) for the current provider's LLM.
@@ -855,10 +877,7 @@ mod tests {
         let config = ProviderConfig::from_settings(&settings);
 
         assert_eq!(config.provider_type, ProviderType::OpenRouter); // Default
-        assert_eq!(
-            config.openrouter_embedding_model,
-            "openai/text-embedding-3-small"
-        );
+        assert_eq!(config.openrouter_embedding_model, DEFAULT_EMBEDDING_MODEL);
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
     }
 }

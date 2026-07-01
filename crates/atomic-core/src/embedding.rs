@@ -83,7 +83,7 @@ pub async fn generate_embeddings_with_config(
         retryable: false,
         batch_reducible: false,
     })?;
-    let embed_config = EmbeddingConfig::new(config.embedding_model());
+    let embed_config = config.embedding_config();
     let model = config.embedding_model();
     let provider_type = format!("{:?}", config.provider_type);
 
@@ -463,7 +463,8 @@ pub async fn generate_openrouter_embeddings_public(
     use crate::providers::traits::EmbeddingProvider;
 
     let provider = OpenRouterProvider::new(api_key.to_string());
-    let config = EmbeddingConfig::new("openai/text-embedding-3-small");
+    let config = EmbeddingConfig::new(crate::providers::DEFAULT_EMBEDDING_MODEL)
+        .with_dimensions(crate::providers::DEFAULT_EMBEDDING_DIMENSION);
 
     provider
         .embed_batch(texts, &config)

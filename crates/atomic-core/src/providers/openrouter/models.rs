@@ -25,12 +25,20 @@ pub struct OpenRouterEmbeddingModel {
 
 /// Curated list of OpenRouter text embedding models with verified dimensions.
 ///
-/// Dimensions are the size the API actually returns when we don't pass a
-/// `dimensions` / `output_dimension` parameter — which is how `embed_batch`
-/// currently calls the endpoint. For MRL-capable models this is the provider's
-/// *default*, which may be smaller than the native maximum (e.g. Codestral Embed
-/// is native 3072 but defaults to 1536).
+/// `dimension` is the width Atomic requests and stores for the model:
+/// `embed_batch` passes it as the `dimensions` parameter and enforces it
+/// client-side (truncate + renormalize) for MRL models, so this value is the
+/// authoritative vector width the schema is created at. For MRL-capable models
+/// it may be smaller than the native maximum (e.g. Qwen3-Embedding-8B is native
+/// 4096 but we store 1024).
 pub const EMBEDDING_MODELS: &[OpenRouterEmbeddingModel] = &[
+    // Qwen (default — top open-weight MTEB, cheapest, self-hostable)
+    OpenRouterEmbeddingModel {
+        id: "qwen/qwen3-embedding-8b",
+        name: "Qwen3 Embedding 8B",
+        dimension: 1024,
+        context_length: 32768,
+    },
     // OpenAI
     OpenRouterEmbeddingModel {
         id: "openai/text-embedding-3-small",

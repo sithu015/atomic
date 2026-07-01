@@ -6,7 +6,7 @@
 use crate::chunking::count_tokens;
 use crate::models::{ChunkSearchResult, ChunkWithContext, WikiArticleWithCitations};
 use crate::providers::types::{CompletionResponse, Message, ToolDefinition};
-use crate::providers::{get_embedding_provider, get_llm_provider, EmbeddingConfig, LlmConfig};
+use crate::providers::{get_embedding_provider, get_llm_provider, LlmConfig};
 use crate::storage::StorageBackend;
 
 use std::collections::HashSet;
@@ -168,7 +168,7 @@ async fn handle_search(
     // Try to generate query embedding for vector search
     let vector_results = match get_embedding_provider(provider_config) {
         Ok(provider) => {
-            let embed_config = EmbeddingConfig::new(provider_config.embedding_model());
+            let embed_config = provider_config.embedding_config();
             match provider.embed_batch(&[query.clone()], &embed_config).await {
                 Ok(embeddings) if !embeddings.is_empty() && !embeddings[0].is_empty() => {
                     match storage

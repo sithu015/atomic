@@ -1744,7 +1744,7 @@ impl AtomicCore {
                 // Generate query embedding via provider
                 let provider = providers::get_embedding_provider(&config)
                     .map_err(|e| AtomicCoreError::Search(e.to_string()))?;
-                let embed_config = providers::EmbeddingConfig::new(config.embedding_model());
+                let embed_config = config.embedding_config();
                 let embeddings = provider
                     .embed_batch(&[options.query.clone()], &embed_config)
                     .await
@@ -1767,7 +1767,7 @@ impl AtomicCore {
                 // Generate embedding for semantic leg
                 let provider = providers::get_embedding_provider(&config)
                     .map_err(|e| AtomicCoreError::Search(e.to_string()))?;
-                let embed_config = providers::EmbeddingConfig::new(config.embedding_model());
+                let embed_config = config.embedding_config();
                 let embeddings = provider
                     .embed_batch(&[options.query.clone()], &embed_config)
                     .await

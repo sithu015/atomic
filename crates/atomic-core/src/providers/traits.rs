@@ -10,20 +10,36 @@ use async_trait::async_trait;
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
     pub model: String,
+    /// Target output dimension (Matryoshka). `None` = the model's native
+    /// width. When set, it is sent as the `dimensions` request parameter
+    /// where the provider supports it, and — because our models are
+    /// MRL-trained — also enforced client-side (truncate + L2-renormalize) so
+    /// the stored vector width matches regardless of provider support.
+    /// Construct via [`crate::providers::ProviderConfig::embedding_config`] so
+    /// this always agrees with the model's registered dimension.
+    pub dimensions: Option<usize>,
 }
 
 impl EmbeddingConfig {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            dimensions: None,
         }
+    }
+
+    /// Pin the output vector width (Matryoshka). See [`Self::dimensions`].
+    pub fn with_dimensions(mut self, dimensions: usize) -> Self {
+        self.dimensions = Some(dimensions);
+        self
     }
 }
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            model: "openai/text-embedding-3-small".to_string(),
+            model: crate::providers::DEFAULT_EMBEDDING_MODEL.to_string(),
+            dimensions: None,
         }
     }
 }
