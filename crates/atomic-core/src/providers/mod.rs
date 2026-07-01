@@ -58,10 +58,12 @@ pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// compact. Its registered width lives in [`openrouter::models::EMBEDDING_MODELS`].
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
 
-/// The width we request/store for [`DEFAULT_EMBEDDING_MODEL`] (Matryoshka).
-/// Smaller than the model's 4096 native width — cheaper storage and faster
-/// vector search — with negligible retrieval loss for an 8B embedder.
-pub const DEFAULT_EMBEDDING_DIMENSION: usize = 1024;
+/// The width we request/store for [`DEFAULT_EMBEDDING_MODEL`] (Matryoshka):
+/// 1536, truncated from the model's 4096 native width. This matches the width
+/// the rest of the stack already assumes (the prior OpenAI default, the vector
+/// schema, the test embedder), so upgrading the *model* needs no dimension
+/// migration — with negligible retrieval loss for an 8B embedder.
+pub const DEFAULT_EMBEDDING_DIMENSION: usize = 1536;
 
 /// Default **utility** model for single-shot structured tasks (tagging). Cheap
 /// and fast — no agent loop runs on it, so a nano-tier model is the right tool.

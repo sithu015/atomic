@@ -32,11 +32,12 @@ pub struct OpenRouterEmbeddingModel {
 /// it may be smaller than the native maximum (e.g. Qwen3-Embedding-8B is native
 /// 4096 but we store 1024).
 pub const EMBEDDING_MODELS: &[OpenRouterEmbeddingModel] = &[
-    // Qwen (default — top open-weight MTEB, cheapest, self-hostable)
+    // Qwen (default — top open-weight MTEB, cheapest, self-hostable).
+    // Native 4096; we store 1536 (Matryoshka) to match the existing schema.
     OpenRouterEmbeddingModel {
         id: "qwen/qwen3-embedding-8b",
         name: "Qwen3 Embedding 8B",
-        dimension: 1024,
+        dimension: 1536,
         context_length: 32768,
     },
     // OpenAI

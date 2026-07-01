@@ -5636,7 +5636,7 @@ mod tests {
     async fn test_explicit_mode_embedding_space_writes_are_inert() {
         let (_registry, cores, _dir) = make_workspace(0);
         // Promote to explicit mode with the default config (OpenRouter,
-        // 1024-dim Qwen embedding model).
+        // 1536-dim Qwen embedding model).
         cores[0].update_provider_config(ProviderConfig::from_settings(
             &std::collections::HashMap::new(),
         ));
@@ -5659,9 +5659,9 @@ mod tests {
             assert_eq!(result.retried_failed_count, 0, "{key} must retry nothing");
         }
 
-        // The vector index was never touched: still at the 1024 dimension the
+        // The vector index was never touched: still at the 1536 dimension the
         // explicit config produces, not the 3072 the settings rows now claim.
-        assert_vec_chunks_dimension(&cores[0], 1024);
+        assert_vec_chunks_dimension(&cores[0], 1536);
 
         // The writes themselves landed — explicit mode stores values, it only
         // keeps them from steering the embedding space.

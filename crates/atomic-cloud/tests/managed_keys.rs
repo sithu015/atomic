@@ -159,7 +159,7 @@ async fn signup_creates_exactly_one_key_and_encrypted_row() {
             assert_eq!(creds.api_key.expose(), plaintext);
             assert_eq!(
                 creds.model_config["embedding_model"],
-                serde_json::json!("openai/text-embedding-3-small")
+                serde_json::json!("qwen/qwen3-embedding-8b")
             );
             assert_eq!(credentials_count(&control, &account.account_id).await, 1);
 

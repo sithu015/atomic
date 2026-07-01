@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(config.monthly_allowance_cents, 50, "$0.50/mo free tier");
         assert_eq!(
             config.model_config["embedding_model"],
-            serde_json::json!("openai/text-embedding-3-small"),
+            serde_json::json!(crate::curated_models::MANAGED_EMBEDDING_MODEL),
             "pinned fleet-wide embedding model"
         );
     }

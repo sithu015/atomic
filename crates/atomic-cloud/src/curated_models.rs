@@ -52,7 +52,7 @@ pub const MANAGED_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
 /// structured `embedding_dimension_unsupported` error instead of storing
 /// them with an unfulfillable re-embed warning. Revisit alongside a real
 /// dimension-migration story.
-pub const PINNED_EMBEDDING_DIMENSION: usize = 1024;
+pub const PINNED_EMBEDDING_DIMENSION: usize = 1536;
 
 /// The fleet-wide **tagging** model for managed keys — single-shot structured
 /// output, no agent loop. Platform-fixed (not user-selectable): it is seeded

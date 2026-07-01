@@ -24,8 +24,8 @@ use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
     FallbackAppState, ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, QuotaBilling,
-    Readiness, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, FREE_AGENTIC_MODELS,
-    MANAGED_EMBEDDING_MODEL, SESSION_COOKIE,
+    Readiness, TenantPlane, TokenScope, DEFAULT_AGENTIC_MODEL, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    FREE_AGENTIC_MODELS, MANAGED_EMBEDDING_MODEL, MANAGED_TAGGING_MODEL, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -53,8 +53,9 @@ const PIPELINE_DEADLINE: Duration = Duration::from_secs(15);
 /// writes can never set it (curation rejects base-URL keys on managed rows).
 fn managed_model_config(managed_mock: &MockAiServer) -> Value {
     json!({
-        "embedding_model": "openai/text-embedding-3-small",
-        "llm_model": "openai/gpt-4o-mini",
+        "embedding_model": MANAGED_EMBEDDING_MODEL,
+        "llm_model": DEFAULT_AGENTIC_MODEL,
+        "tagging_model": MANAGED_TAGGING_MODEL,
         "openrouter_base_url": managed_mock.base_url(),
     })
 }
@@ -494,7 +495,7 @@ async fn managed_signup_embeds_via_control_plane_config_only() {
             assert_eq!(body["origin"], "managed");
             assert_eq!(
                 body["model_config"]["embedding_model"],
-                "openai/text-embedding-3-small"
+                MANAGED_EMBEDDING_MODEL
             );
             assert_eq!(
                 body["usage"]["limit_usd"], 0.5,
@@ -2035,8 +2036,7 @@ async fn account_overview_assembles_shape_and_refuses_db_scope() {
             assert_eq!(body["provider"]["origin"], "managed", "{body}");
             assert_eq!(body["provider"]["provider"], "openrouter", "{body}");
             assert_eq!(
-                body["provider"]["model_config"]["embedding_model"],
-                "openai/text-embedding-3-small",
+                body["provider"]["model_config"]["embedding_model"], MANAGED_EMBEDDING_MODEL,
                 "{body}"
             );
             assert!(

@@ -13,7 +13,7 @@ export const MANAGED_EMBEDDING_MODEL = 'qwen/qwen3-embedding-8b';
 /** The platform-pinned embedding dimension (server:
  * `PINNED_EMBEDDING_DIMENSION`). A BYOK config whose effective dimension
  * differs is rejected server-side; the BYOK form surfaces that. */
-export const PINNED_EMBEDDING_DIMENSION = 1024;
+export const PINNED_EMBEDDING_DIMENSION = 1536;
 
 /** The fixed managed tagging model (server: `MANAGED_TAGGING_MODEL`). Tagging
  * is a single-shot utility task — platform-owned and not user-selectable, so
