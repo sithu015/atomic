@@ -51,11 +51,10 @@
 //! until someone asks.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use atomic_core::{ProviderConfig, ProviderType};
 use serde_json::Value;
-use url::{Host, Url};
+use url::Url;
 
 use crate::keyvault::SecretKey;
 use crate::provider_credentials::{Provider, ProviderCredentials};
@@ -190,24 +189,21 @@ pub fn validate_byok_model_config(model_config: &Value) -> Result<(), String> {
 
 /// SSRF gate for a tenant-supplied provider base URL (the OpenRouter /
 /// OpenAI-compatible API base). The same string is fetched at save time and
-/// on every live pipeline call, so an unrestricted value lets any
+/// on every live pipeline call, so an unrestricted value would let any
 /// authenticated tenant aim our outbound client at internal addresses on
-/// shared infrastructure. We reject anything that isn't an `https` URL to a
-/// public, literal-or-named host whose literal forms are all outside the
-/// private/loopback/link-local ranges (including the `169.254.169.254` cloud
-/// metadata endpoint).
+/// shared infrastructure.
+///
+/// Cloud closes this with a strict **host allowlist**: the URL must be `https`
+/// to a known managed-provider host ([`is_allowed_provider_host`] — OpenRouter
+/// or OpenAI). Because an arbitrary host can never match, there is nothing to
+/// rebind: a public IP, an internal name, or a name that later resolves to a
+/// private address is rejected up front, so no resolve-and-pin / egress-proxy
+/// plumbing is needed. Custom / self-hosted OpenAI-compatible endpoints are a
+/// desktop / self-hosted capability, not a cloud one; the dev/test escape
+/// ([`ALLOW_PRIVATE_PROVIDER_URLS_ENV`]) reopens the gate for local mocks.
 ///
 /// The error string is a fixed *reason* — it never echoes upstream response
 /// bytes — so it cannot become a read oracle.
-///
-/// TODO(ssrf): this validates the URL's host but does not resolve-and-pin a
-/// named host's address, so a name that passes here and later resolves to a
-/// private address (DNS rebinding) is still reachable on the live call. The
-/// durable fix is to resolve once, pin the IP for both the validation and
-/// pipeline requests, and re-check it against these ranges — or route all
-/// tenant egress through a deny-list forward proxy. That needs resolver /
-/// HTTP-client plumbing beyond this module (the provider clients live in
-/// atomic-core), so it is tracked separately.
 pub fn validate_byok_base_url(raw: &str) -> Result<(), &'static str> {
     let url = Url::parse(raw).map_err(|_| "must be a valid URL")?;
 
@@ -225,39 +221,18 @@ pub fn validate_byok_base_url(raw: &str) -> Result<(), &'static str> {
         return Err("must use the https scheme");
     }
 
-    match url.host() {
-        Some(Host::Ipv4(addr)) => {
-            if is_blocked_ipv4(&addr) {
-                return Err("must not point at a private, loopback, or link-local address");
-            }
-        }
-        Some(Host::Ipv6(addr)) => {
-            if is_blocked_ipv6(&addr) {
-                return Err("must not point at a private, loopback, or link-local address");
-            }
-        }
-        // A named host: block any name that is *itself* a literal in a
-        // blocked range (e.g. a host written as `[::1]` parses to Ipv6
-        // above, but defensive parsing also catches dotted-decimal names
-        // that slipped through as `Domain`). DNS rebinding is the TODO.
-        Some(Host::Domain(name)) => {
-            if name.is_empty() {
-                return Err("must have a host");
-            }
-            if let Ok(addr) = name.parse::<IpAddr>() {
-                let blocked = match addr {
-                    IpAddr::V4(v4) => is_blocked_ipv4(&v4),
-                    IpAddr::V6(v6) => is_blocked_ipv6(&v6),
-                };
-                if blocked {
-                    return Err("must not point at a private, loopback, or link-local address");
-                }
-            }
-        }
-        None => return Err("must have a host"),
+    // Cloud restricts BYOK base URLs to KNOWN provider hosts (OpenRouter /
+    // OpenAI). An allowlist is the tightest SSRF closure: an arbitrary
+    // tenant-supplied host — a public IP, an internal name, or a name that
+    // later rebinds to a private address — simply can't match, so nothing
+    // outside the two providers is ever fetched. Custom / self-hosted
+    // OpenAI-compatible endpoints are a desktop / self-hosted capability, not
+    // a cloud one.
+    if is_allowed_provider_host(url.host_str().unwrap_or_default()) {
+        Ok(())
+    } else {
+        Err("must be an OpenRouter or OpenAI endpoint; custom provider hosts aren't supported on cloud")
     }
-
-    Ok(())
 }
 
 /// The env var that disables the BYOK base-URL SSRF gate
@@ -272,38 +247,14 @@ pub fn private_provider_urls_allowed() -> bool {
         .unwrap_or(false)
 }
 
-/// Reject loopback (127.0.0.0/8), RFC 1918 private (10/8, 172.16/12,
-/// 192.168/16), link-local incl. cloud metadata (169.254.0.0/16, covering
-/// 169.254.169.254), the unspecified `0.0.0.0`, and broadcast.
-fn is_blocked_ipv4(addr: &Ipv4Addr) -> bool {
-    addr.is_loopback()
-        || addr.is_private()
-        || addr.is_link_local()
-        || addr.is_unspecified()
-        || addr.is_broadcast()
-}
-
-/// Reject loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
-/// link-local (`fe80::/10`), and IPv4-mapped addresses whose embedded v4 is
-/// itself blocked (so `::ffff:127.0.0.1` can't tunnel past the v4 checks).
-fn is_blocked_ipv6(addr: &Ipv6Addr) -> bool {
-    if addr.is_loopback() || addr.is_unspecified() {
-        return true;
-    }
-    // Unique-local fc00::/7 — top 7 bits are 1111110.
-    if addr.octets()[0] & 0xfe == 0xfc {
-        return true;
-    }
-    // Link-local fe80::/10 — first 10 bits are 1111111010.
-    let segments = addr.segments();
-    if segments[0] & 0xffc0 == 0xfe80 {
-        return true;
-    }
-    // IPv4-mapped (::ffff:a.b.c.d): re-check the embedded v4 address.
-    if let Some(v4) = addr.to_ipv4_mapped() {
-        return is_blocked_ipv4(&v4);
-    }
-    false
+/// Hosts a cloud BYOK base URL may target — the two managed providers, exact
+/// apex or a subdomain, and nothing else (see [`validate_byok_base_url`]).
+fn is_allowed_provider_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "openrouter.ai"
+        || host == "api.openai.com"
+        || host.ends_with(".openrouter.ai")
+        || host.ends_with(".openai.com")
 }
 
 /// The explicit config for a decrypted credentials row.
@@ -402,14 +353,14 @@ mod tests {
 
     #[test]
     fn byok_vocabulary_accepts_documented_keys_only() {
-        // Every documented key, well-typed: fine. Base URLs are public
-        // https endpoints (the SSRF gate is exercised separately below).
+        // Every documented key, well-typed: fine. Base URLs are known
+        // provider hosts (the SSRF allowlist is exercised separately below).
         assert_eq!(
             validate_byok_model_config(&json!({
                 "embedding_model": "mock-embed",
                 "llm_model": "any/model",
                 "openrouter_base_url": "https://openrouter.ai/api/v1",
-                "openai_compat_base_url": "https://api.example.com/v1",
+                "openai_compat_base_url": "https://api.openai.com/v1",
                 "embedding_dimension": 1536,
             })),
             Ok(())
@@ -444,11 +395,17 @@ mod tests {
     }
 
     #[test]
-    fn base_url_gate_accepts_public_https() {
+    fn base_url_gate_accepts_only_known_provider_hosts() {
+        // The two managed providers (apex + subdomain) pass.
         assert!(validate_byok_base_url("https://openrouter.ai/api/v1").is_ok());
-        assert!(validate_byok_base_url("https://api.example.com:8443/v1").is_ok());
-        // A public literal IP over https is fine.
-        assert!(validate_byok_base_url("https://8.8.8.8/v1").is_ok());
+        assert!(validate_byok_base_url("https://api.openai.com/v1").is_ok());
+        assert!(validate_byok_base_url("https://gateway.openrouter.ai/v1").is_ok());
+        // Any other public host — even a legitimate one — is rejected on cloud:
+        // custom endpoints are the SSRF surface the allowlist closes.
+        assert!(validate_byok_base_url("https://api.example.com:8443/v1").is_err());
+        assert!(validate_byok_base_url("https://8.8.8.8/v1").is_err());
+        // Lookalike suffixes must not slip past the allowlist.
+        assert!(validate_byok_base_url("https://openrouter.ai.evil.com/v1").is_err());
     }
 
     #[test]
@@ -496,7 +453,8 @@ mod tests {
                 "expected {raw} to be rejected"
             );
         }
-        assert!(validate_byok_base_url("https://[2606:4700::1111]/v1").is_ok());
+        // A public IPv6 literal is not a known provider host → rejected.
+        assert!(validate_byok_base_url("https://[2606:4700::1111]/v1").is_err());
     }
 
     #[test]
@@ -508,14 +466,14 @@ mod tests {
 
     #[test]
     fn byok_validation_runs_the_ssrf_gate_on_base_urls() {
-        // A private base URL is rejected, and the message names the field
-        // without echoing any upstream bytes.
+        // A non-provider (here, metadata-IP) base URL is rejected, and the
+        // message names the field without echoing any upstream bytes.
         let err = validate_byok_model_config(&json!({
             "openrouter_base_url": "https://169.254.169.254/v1",
         }))
         .unwrap_err();
         assert!(err.contains("openrouter_base_url"), "{err}");
-        assert!(err.contains("private"), "{err}");
+        assert!(err.contains("OpenRouter or OpenAI"), "{err}");
 
         let err = validate_byok_model_config(&json!({
             "openai_compat_base_url": "http://internal.svc/v1",
@@ -523,10 +481,10 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("openai_compat_base_url"), "{err}");
 
-        // Public https base URLs still pass.
+        // Known provider hosts pass.
         assert!(validate_byok_model_config(&json!({
             "openrouter_base_url": "https://openrouter.ai/api/v1",
-            "openai_compat_base_url": "https://api.example.com/v1",
+            "openai_compat_base_url": "https://api.openai.com/v1",
         }))
         .is_ok());
     }
