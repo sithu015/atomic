@@ -11,6 +11,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+/// The top-level tag categories seeded into every new knowledge base. The
+/// auto-tagger only extends these (they are the default auto-tag targets), so
+/// the set is a product decision — one source of truth here. (The V10→V11
+/// SQLite migration in `db.rs` names the same five to backfill existing DBs;
+/// that migration is frozen and must keep this list in mind if it ever grows.)
+pub const DEFAULT_TAG_CATEGORIES: &[&str] =
+    &["Topics", "People", "Locations", "Organizations", "Events"];
+
 /// Manages multiple knowledge-base databases.
 ///
 /// SQLite mode owns a `Registry` (`registry.db`) for cross-database state:
@@ -280,9 +288,7 @@ impl DatabaseManager {
                     let storage = core.storage.clone();
                     let all_tags = storage.get_all_tags_impl().await?;
                     if all_tags.is_empty() {
-                        for category in
-                            &["Topics", "People", "Locations", "Organizations", "Events"]
-                        {
+                        for category in DEFAULT_TAG_CATEGORIES {
                             storage.create_tag_impl(category, None).await?;
                         }
                     }
@@ -397,7 +403,7 @@ impl DatabaseManager {
                 // Seed default tags
                 let all_tags = core.storage.get_all_tags_impl().await?;
                 if all_tags.is_empty() {
-                    for category in &["Topics", "People", "Locations", "Organizations", "Events"] {
+                    for category in DEFAULT_TAG_CATEGORIES {
                         core.storage.create_tag_impl(category, None).await?;
                     }
                 }
