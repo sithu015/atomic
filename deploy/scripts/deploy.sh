@@ -29,22 +29,47 @@ BASE_DOMAIN=$(grep -E '^ATOMIC_CLOUD_BASE_DOMAIN=' "$DEPLOY_DIR/.env" | cut -d= 
 
 log "waiting for SSH on ${HOST#*@}"
 for _ in $(seq 1 30); do ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$HOST" true 2>/dev/null && break; sleep 5; done
-ssh "$HOST" 'command -v docker >/dev/null' || { echo "docker missing on host — is cloud-init finished? (cloud-init status --wait)" >&2; exit 1; }
+
+# SSH comes up before cloud-init's runcmd finishes (docker install, volume
+# mount, /opt/atomic) — wait for it or the sync races the bootstrap.
+log "waiting for cloud-init to finish"
+ssh "$HOST" 'command -v cloud-init >/dev/null && cloud-init status --wait >/dev/null; true'
+ssh "$HOST" 'command -v docker >/dev/null' || { echo "docker missing on host after cloud-init — check /var/log/cloud-init-output.log" >&2; exit 1; }
+ssh "$HOST" 'mkdir -p /opt/atomic/deploy'
 
 log "syncing deploy/ -> ${HOST}:/opt/atomic/deploy"
 rsync -az --delete --exclude scripts "$DEPLOY_DIR/" "$HOST:/opt/atomic/deploy/"
 ssh "$HOST" 'chmod 600 /opt/atomic/deploy/.env'
 
 if [ "$MODE" = "--build" ]; then
-  log "building the pod image on the box from ${REPO_URL}@${REPO_REF} (grab a coffee)"
+  # The build runs DETACHED on the box (nohup + exit-code file): a dropped SSH
+  # session must not kill a half-hour cargo build. Re-running this script
+  # while a build is in flight just resumes waiting on it.
+  log "building the pod image on the box from ${REPO_URL}@${REPO_REF} (detached; survives disconnects)"
   ssh "$HOST" "set -e
     if [ -d /opt/atomic/src/.git ]; then git -C /opt/atomic/src fetch --depth 1 origin '$REPO_REF' && git -C /opt/atomic/src checkout -f FETCH_HEAD
     else git clone --depth 1 --branch '$REPO_REF' '$REPO_URL' /opt/atomic/src; fi
-    docker build -f /opt/atomic/src/cloud.dockerfile -t atomic-cloud:local /opt/atomic/src
-    sed -i 's|^ATOMIC_CLOUD_IMAGE=.*|ATOMIC_CLOUD_IMAGE=atomic-cloud:local|' /opt/atomic/deploy/.env"
+    sed -i 's|^ATOMIC_CLOUD_IMAGE=.*|ATOMIC_CLOUD_IMAGE=atomic-cloud:local|' /opt/atomic/deploy/.env
+    if pgrep -f 'docker build.*cloud.dockerfile' >/dev/null; then
+      echo 'build already in flight — waiting on it'
+    else
+      rm -f /opt/atomic/build.exit
+      nohup sh -c 'docker build -f /opt/atomic/src/cloud.dockerfile -t atomic-cloud:local /opt/atomic/src; echo \$? > /opt/atomic/build.exit' >/opt/atomic/build.log 2>&1 &
+    fi"
+  log "waiting for the build (tail: ssh $HOST tail -f /opt/atomic/build.log)"
+  while :; do
+    status=$(ssh "$HOST" 'cat /opt/atomic/build.exit 2>/dev/null' || true)
+    if [ "$status" = "0" ]; then log "image built"; break; fi
+    if [ -n "$status" ]; then
+      ssh "$HOST" 'tail -30 /opt/atomic/build.log' >&2
+      echo "image build failed (exit $status)" >&2; exit 1
+    fi
+    sleep 20
+  done
 else
   log "pulling the pod image"
-  ssh "$HOST" 'cd /opt/atomic/deploy && docker compose pull atomic-cloud'
+  ssh "$HOST" 'cd /opt/atomic/deploy && docker compose pull atomic-cloud' \
+    || log "pull failed — continuing with the image already on the box"
 fi
 
 log "starting the stack"
