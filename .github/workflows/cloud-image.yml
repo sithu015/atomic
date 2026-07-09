@@ -63,5 +63,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
           cache-from: type=gha,scope=atomic-cloud
           cache-to: type=gha,mode=max,scope=atomic-cloud

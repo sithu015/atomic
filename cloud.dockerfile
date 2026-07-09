@@ -73,6 +73,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM node:24-bookworm-slim AS product-builder
 WORKDIR /app
 
+# The commit being built. The build context excludes .git, so vite's
+# git-fallback for the index.html build stamp can't run here — pass the sha
+# in, or every image stamps 'dev' and the PWA shell's precache revision goes
+# static (stale service-worker caches then survive deploys indefinitely).
+ARG BUILD_SHA=dev
+ENV BUILD_SHA=${BUILD_SHA}
+
 # --ignore-scripts skips better-sqlite3's native compile (a dev-only dep used
 # by local db scripts, not needed for `vite build`).
 COPY package.json package-lock.json ./

@@ -57,7 +57,8 @@ if [ "$MODE" = "--build" ]; then
       echo 'build already in flight — waiting on it'
     else
       rm -f /opt/atomic/build.exit
-      nohup sh -c 'docker build -f /opt/atomic/src/cloud.dockerfile -t atomic-cloud:local /opt/atomic/src; echo \$? > /opt/atomic/build.exit' >/opt/atomic/build.log 2>&1 &
+      BUILD_SHA=\$(git -C /opt/atomic/src rev-parse --short=12 HEAD)
+      nohup sh -c \"docker build -f /opt/atomic/src/cloud.dockerfile --build-arg BUILD_SHA=\$BUILD_SHA -t atomic-cloud:local /opt/atomic/src; echo \\\$? > /opt/atomic/build.exit\" >/opt/atomic/build.log 2>&1 &
       echo \$! > /opt/atomic/build.pid
     fi"
   log "waiting for the build (tail: ssh $HOST tail -f /opt/atomic/build.log)"
