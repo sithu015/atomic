@@ -3,6 +3,14 @@
   "private": true,
   "version": "1.39.1",
   "type": "module",
+  "description": "Atomic — a semantically-connected, AI-augmented personal knowledge base",
+  "author": "Kenneth Bergquist",
+  "license": "MIT",
+  "homepage": "https://atomicapp.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kenforthewin/atomic"
+  },
   "scripts": {
     "postinstall": "patch-package --error-on-fail",
     "dev": "vite",

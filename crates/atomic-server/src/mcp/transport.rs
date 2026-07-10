@@ -4,7 +4,8 @@
 //! owning the HTTP boundary where clients are strict about status codes and
 //! content types.
 
-use super::{AtomicMcpServer, DbSelection};
+use super::{AtomicMcpServer, DbSelection, RequestManager};
+use crate::db_extractor::RequestDatabaseManager;
 use crate::state::ServerEvent;
 use actix_web::{
     error::InternalError,
@@ -14,7 +15,7 @@ use actix_web::{
     },
     middleware,
     web::{self, Bytes, Data},
-    HttpRequest, HttpResponse, Result, Scope,
+    HttpMessage, HttpRequest, HttpResponse, Result, Scope,
 };
 use atomic_core::manager::DatabaseManager;
 use futures::{Stream, StreamExt};
@@ -139,24 +140,50 @@ fn request_session_id(req: &HttpRequest) -> Option<Arc<str>> {
         .map(|s| Arc::<str>::from(s.to_owned()))
 }
 
+/// Resolve which database this request selects, with the *same* precedence as
+/// the data plane's [`resolve_core`](crate::db_extractor::resolve_core): the
+/// `X-Atomic-Database` header first, then the `?db=` query parameter (and, on
+/// the server side, the manager's active database when neither is present).
+///
+/// Honoring the header — not just `?db=` — is what keeps the MCP path in step
+/// with the `Db` extractor: a composing layer that pre-resolves the manager
+/// per request can pin a selection by injecting `X-Atomic-Database`, and that
+/// pin is honored identically here and on the data plane. The standalone
+/// server injects no such header, so behavior is unchanged unless something
+/// installs it (the same contract the `Db` extractor exposes).
 fn db_selection(req: &HttpRequest) -> DbSelection {
-    let db_id = req.query_string().split('&').find_map(|pair| {
-        let mut parts = pair.splitn(2, '=');
-        if parts.next()? == "db" {
-            parts.next().map(String::from)
-        } else {
-            None
-        }
+    let header_db = req
+        .headers()
+        .get("X-Atomic-Database")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let db_id = header_db.or_else(|| {
+        req.query_string().split('&').find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next()? == "db" {
+                parts.next().map(String::from)
+            } else {
+                None
+            }
+        })
     });
     DbSelection(db_id)
 }
 
 fn attach_request_extensions(req: &HttpRequest, message: &mut ClientJsonRpcMessage) {
     if let ClientJsonRpcMessage::Request(request_msg) = message {
-        request_msg
-            .request
-            .extensions_mut()
-            .insert(db_selection(req));
+        let extensions = request_msg.request.extensions_mut();
+        extensions.insert(db_selection(req));
+        // Mirror the data plane's manager override
+        // (`db_extractor::request_manager`): when a composing layer installed
+        // a per-request manager, carry it into the tool-call context so the
+        // tools resolve against it rather than the manager baked in at
+        // construction. Absent — the standalone server installs no such
+        // middleware — the server falls back to the baked-in manager, so
+        // self-hosted behavior is byte-identical.
+        if let Some(manager) = req.extensions().get::<RequestDatabaseManager>() {
+            extensions.insert(RequestManager(std::sync::Arc::clone(&manager.0)));
+        }
     }
 }
 
@@ -729,5 +756,300 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_content_type(&resp, "text/plain");
+    }
+
+    // --- Per-request manager resolution ------------------------------------
+    //
+    // The transport copies a `RequestDatabaseManager` extension (installed by
+    // a composing layer's middleware) into the tool-call context, so the
+    // tools resolve against that manager rather than the one baked in at
+    // construction. With no such middleware (every test above) the baked-in
+    // manager is used, exactly as the standalone server runs — these two
+    // tests pin both sides of that fallback.
+
+    use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
+    use actix_web::{Error, HttpMessage};
+    use futures::future::{ready, LocalBoxFuture, Ready};
+    use std::task::{Context, Poll};
+
+    /// Minimal middleware that installs a `RequestDatabaseManager` on every
+    /// request — standing in for a composing layer's middleware that
+    /// pre-resolves the manager per request.
+    #[derive(Clone)]
+    struct InjectManager(Arc<DatabaseManager>);
+
+    impl<S> Transform<S, ServiceRequest> for InjectManager
+    where
+        S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
+    {
+        type Response = ServiceResponse;
+        type Error = Error;
+        type Transform = InjectManagerMw<S>;
+        type InitError = ();
+        type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+        fn new_transform(&self, service: S) -> Self::Future {
+            ready(Ok(InjectManagerMw {
+                service: Arc::new(service),
+                manager: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    struct InjectManagerMw<S> {
+        service: Arc<S>,
+        manager: Arc<DatabaseManager>,
+    }
+
+    impl<S> Service<ServiceRequest> for InjectManagerMw<S>
+    where
+        S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
+    {
+        type Response = ServiceResponse;
+        type Error = Error;
+        type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.service.poll_ready(cx)
+        }
+
+        fn call(&self, req: ServiceRequest) -> Self::Future {
+            req.extensions_mut()
+                .insert(RequestDatabaseManager(Arc::clone(&self.manager)));
+            let fut = self.service.call(req);
+            Box::pin(fut)
+        }
+    }
+
+    /// Read the JSON-RPC result text from a tool-call SSE response body.
+    async fn read_tool_text(resp: ServiceResponse) -> String {
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // The streamed body is `data: {json}\n\n`; pull the JSON line and dig
+        // out the tool result's text content.
+        let data_line = body
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("SSE body should carry a data line");
+        let value: serde_json::Value = serde_json::from_str(data_line).unwrap();
+        value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Build a transport over an empty baked-in manager, plus a *separate*
+    /// override manager whose active database holds one atom. Returns the
+    /// override manager and the created atom id.
+    async fn override_manager_with_atom() -> (Arc<DatabaseManager>, tempfile::TempDir, String) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(DatabaseManager::new(temp.path()).unwrap());
+        let core = manager.active_core().await.unwrap();
+        let atom = core
+            .create_atom(
+                atomic_core::CreateAtomRequest {
+                    content: "override-manager-atom-body".to_string(),
+                    source_url: None,
+                    published_at: None,
+                    tag_ids: vec![],
+                    skip_if_source_exists: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (manager, temp, atom.atom.id)
+    }
+
+    fn read_atom_request(id: i32, atom_id: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": "read_atom", "arguments": { "atom_id": atom_id } }
+        })
+    }
+
+    #[actix_web::test]
+    async fn tool_call_resolves_request_manager_override() {
+        // Baked-in manager is empty; the override manager holds the atom.
+        let (transport, _baked) = test_transport();
+        let (override_mgr, _override_temp, atom_id) = override_manager_with_atom().await;
+
+        let app = actix_test::init_service(
+            App::new().service(
+                web::scope("/mcp")
+                    .service(transport.scope())
+                    .wrap(InjectManager(override_mgr)),
+            ),
+        )
+        .await;
+        let session_id = initialize_session!(app);
+        send_initialized!(app, session_id);
+
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id))
+            .set_payload(read_atom_request(2, &atom_id).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The atom lives only in the override manager, so resolving against it
+        // returns the body — proving the per-request override won over the
+        // empty baked-in manager.
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("override-manager-atom-body"),
+            "tool must resolve against the injected per-request manager: {text}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn tool_call_falls_back_to_baked_in_manager_without_override() {
+        // No InjectManager middleware: exactly how the standalone server runs.
+        // The atom lives in a *different* manager the transport never sees, so
+        // the baked-in (empty) manager reports it missing — byte-identical to
+        // self-hosted behavior.
+        let (transport, _baked) = test_transport();
+        let (_override_mgr, _override_temp, atom_id) = override_manager_with_atom().await;
+
+        let app = actix_test::init_service(
+            App::new().service(web::scope("/mcp").service(transport.scope())),
+        )
+        .await;
+        let session_id = initialize_session!(app);
+        send_initialized!(app, session_id);
+
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id))
+            .set_payload(read_atom_request(2, &atom_id).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("Atom not found"),
+            "without an override the baked-in manager is used: {text}"
+        );
+    }
+
+    /// Build a manager with two databases: the ACTIVE (default) one holds
+    /// `active-kb-atom-body`, a SECOND non-active one holds
+    /// `second-kb-atom-body`. Returns the manager, the second db's id, and the
+    /// two atom ids `(active_atom, second_atom)`.
+    async fn manager_with_two_kbs() -> (
+        Arc<DatabaseManager>,
+        tempfile::TempDir,
+        String,
+        String,
+        String,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(DatabaseManager::new(temp.path()).unwrap());
+
+        let create = |core: atomic_core::AtomicCore, body: &'static str| async move {
+            core.create_atom(
+                atomic_core::CreateAtomRequest {
+                    content: body.to_string(),
+                    source_url: None,
+                    published_at: None,
+                    tag_ids: vec![],
+                    skip_if_source_exists: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .atom
+            .id
+        };
+
+        let active_core = manager.active_core().await.unwrap();
+        let active_atom = create(active_core, "active-kb-atom-body").await;
+
+        let second = manager.create_database("Second KB").await.unwrap();
+        let second_core = manager.get_core(&second.id).await.unwrap();
+        let second_atom = create(second_core, "second-kb-atom-body").await;
+
+        (manager, temp, second.id, active_atom, second_atom)
+    }
+
+    #[actix_web::test]
+    async fn tool_call_db_selection_honors_x_atomic_database_header_over_active() {
+        // The transport selects the request's database with the SAME precedence
+        // as the `Db` extractor: `X-Atomic-Database` header first, then `?db=`,
+        // then the manager's active db. Here the active db is a *different* KB
+        // than the one the header names, so a tool call carrying only the header
+        // (no `?db=`) must resolve against the header's KB — not the active one.
+        let (transport, _baked) = test_transport();
+        let (mgr, _temp, second_db, active_atom, second_atom) = manager_with_two_kbs().await;
+
+        let app = actix_test::init_service(
+            App::new().service(
+                web::scope("/mcp")
+                    .service(transport.scope())
+                    .wrap(InjectManager(mgr)),
+            ),
+        )
+        .await;
+        let session_id = initialize_session!(app);
+        send_initialized!(app, session_id);
+
+        // read_atom on the SECOND KB's atom, selecting that KB via the header
+        // only — resolves there, returning its body.
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id.clone()))
+            .insert_header(("X-Atomic-Database", second_db.clone()))
+            .set_payload(read_atom_request(2, &second_atom).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("second-kb-atom-body"),
+            "the header selects the second KB: {text}"
+        );
+
+        // The ACTIVE KB's atom is NOT reachable through the header-selected KB —
+        // proving the header won over the active-db fallback (not the reverse).
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id))
+            .insert_header(("X-Atomic-Database", second_db))
+            .set_payload(read_atom_request(3, &active_atom).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("Atom not found"),
+            "header selection does not fall through to the active KB: {text}"
+        );
     }
 }

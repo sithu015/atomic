@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 struct EmbeddingRequest {
     model: String,
     input: Vec<String>,
+    /// Matryoshka output width. Omitted when `None` so providers that don't
+    /// accept the parameter aren't sent it; when present we also enforce it
+    /// client-side (see [`embed_batch`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 /// OpenRouter Embeddings API response
@@ -51,6 +56,7 @@ pub async fn embed_batch(
     let request = EmbeddingRequest {
         model: config.model.clone(),
         input: texts.to_vec(),
+        dimensions: config.dimensions,
     };
 
     let response = provider
@@ -123,9 +129,32 @@ pub async fn embed_batch(
             ProviderError::ParseError(format!("Failed to parse embedding response: {e}"))
         })?;
 
-    Ok(embedding_response
+    let mut vectors: Vec<Vec<f32>> = embedding_response
         .data
         .into_iter()
         .map(|d| d.embedding)
-        .collect())
+        .collect();
+
+    // Enforce the requested Matryoshka width client-side. Our embedding models
+    // are MRL-trained, so truncating a longer vector to the target prefix and
+    // re-normalizing to unit length yields the same vector the provider would
+    // have returned for that dimension. This makes the stored width correct
+    // even when a provider silently ignores the `dimensions` parameter (as
+    // some OpenRouter upstreams do), so it can never mismatch the vector
+    // column the schema was created at.
+    if let Some(target) = config.dimensions {
+        for v in vectors.iter_mut() {
+            if v.len() > target {
+                v.truncate(target);
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for x in v.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(vectors)
 }

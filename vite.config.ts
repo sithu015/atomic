@@ -1,10 +1,35 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 import path from 'path'
+import { execSync } from 'node:child_process'
 
 const isWebBuild = process.env.VITE_BUILD_TARGET === 'web'
+
+/**
+ * Replace index.html's `__ATOMIC_BUILD_SHA__` with the commit being built, so
+ * the document's bytes are unique per deploy. This is load-bearing for the
+ * PWA: workbox reuses same-revision precache entries across service-worker
+ * updates without refetching, so if the shell's revision never changes, a
+ * client that once cached a wrong/stale copy keeps serving it forever.
+ * Resolution order: BUILD_SHA env (docker/CI, where .git isn't in the build
+ * context) → `git rev-parse` → 'dev'.
+ */
+function buildStamp(): Plugin {
+  let sha = process.env.BUILD_SHA?.trim().slice(0, 12) ?? ''
+  if (!sha) {
+    try {
+      sha = execSync('git rev-parse --short=12 HEAD').toString().trim()
+    } catch {
+      sha = 'dev'
+    }
+  }
+  return {
+    name: 'atomic-build-stamp',
+    transformIndexHtml: (html) => html.replace('__ATOMIC_BUILD_SHA__', sha),
+  }
+}
 const EDITOR_PEER_DEPS = [
   '@codemirror/autocomplete',
   '@codemirror/commands',
@@ -44,6 +69,7 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    buildStamp(),
     // The service worker + manifest only make sense for the web build. In
     // Tauri desktop the assets are already bundled, and a SW here would just
     // be dead code (Tauri's webview runs on custom schemes that don't play
@@ -74,10 +100,20 @@ export default defineConfig({
               navigateFallbackDenylist: [
                 /^\/api\//,
                 /^\/health/,
+                /^\/ready/,
                 /^\/ws/,
                 /^\/oauth\//,
                 /^\/\.well-known\//,
                 /^\/mcp(\/|$)/,
+                // Atomic Cloud server-owned pages on the same origin. The
+                // account dashboard and auth pages are a different SPA — if
+                // the product SW answers these navigations it serves the
+                // wrong app's shell (and on tenant hosts, hijacks the
+                // dashboard entirely).
+                /^\/account(\/|$)/,
+                /^\/signup(\/|$)/,
+                /^\/login(\/|$)/,
+                /^\/billing(\/|$)/,
               ],
               runtimeCaching: [
                 {

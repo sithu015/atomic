@@ -516,7 +516,7 @@ async fn handle_semantic_search(
 }
 
 async fn resolve_model(core: &AtomicCore) -> Result<(ProviderConfig, String), AtomicCoreError> {
-    let settings = core.get_settings().await?;
+    let settings = core.settings_for_ai().await?;
     let config = ProviderConfig::from_settings(&settings);
     let model = match config.provider_type {
         ProviderType::Ollama => config.llm_model().to_string(),
@@ -524,7 +524,7 @@ async fn resolve_model(core: &AtomicCore) -> Result<(ProviderConfig, String), At
         ProviderType::OpenRouter => settings
             .get("wiki_model")
             .cloned()
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string()),
+            .unwrap_or_else(|| crate::providers::DEFAULT_AGENTIC_MODEL.to_string()),
     };
     Ok((config, model))
 }

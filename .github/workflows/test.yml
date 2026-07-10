@@ -152,6 +152,62 @@ jobs:
             --locked \
             -- --test-threads=1
 
+      # The atomic-cloud suite is Postgres-gated: without ATOMIC_TEST_DATABASE_URL
+      # (the SQLite job above) it skips entirely, so this is the only job that
+      # actually runs it. Its backup tests shell out to pg_dump/pg_restore, which
+      # must be at least the service container's major (16) — the runner's stock
+      # client is older, so install from PGDG (the pg_wrapper on PATH resolves to
+      # the newest installed version).
+      - name: Install postgresql-client-16 (pg_dump/pg_restore for the backup suite)
+        run: |
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt jammy-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+
+      # Single-threaded like the suites above: every test creates + drops its own
+      # uniquely-named databases, but they all share the one physical cluster.
+      - name: Run atomic-cloud suite against Postgres
+        run: |
+          cargo test \
+            -p atomic-cloud \
+            --locked \
+            -- --test-threads=1
+
+  cloud-frontend-test:
+    name: Cloud frontend tests
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: crates/atomic-cloud/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: crates/atomic-cloud/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` runs `tsc -b` before vite — the step that catches type
+      # errors vitest's transform tolerates (it strips types without checking),
+      # so a suite-green-but-unbuildable SPA fails here.
+      - name: Build (tsc + vite)
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run Vitest
+        run: npm test
+
   frontend-test:
     name: Frontend tests
     runs-on: ubuntu-22.04

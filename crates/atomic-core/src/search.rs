@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::embedding::{distance_to_similarity, f32_vec_to_blob_public};
 use crate::models::{Atom, AtomWithTags, KindFilter, SemanticSearchResult, SimilarAtomResult, Tag};
-use crate::providers::{get_embedding_provider, EmbeddingConfig, ProviderConfig};
+use crate::providers::{get_embedding_provider, ProviderConfig};
 use crate::settings::get_all_settings;
 
 /// Search mode - determines which search algorithm(s) to use
@@ -483,7 +483,7 @@ async fn search_semantic_chunks(
     // Create embedding provider and generate query embedding
     let provider = get_embedding_provider(&provider_config)
         .map_err(|e| format!("Failed to create embedding provider: {}", e))?;
-    let embedding_config = EmbeddingConfig::new(provider_config.embedding_model());
+    let embedding_config = provider_config.embedding_config();
     let embeddings = provider
         .embed_batch(&[options.query.clone()], &embedding_config)
         .await

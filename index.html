@@ -10,6 +10,17 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Atomic" />
+    <!-- Replaced with "true" only when the Atomic Cloud server serves this app
+         on a tenant subdomain; left as the placeholder for self-hosted/Tauri
+         builds, where the app uses its normal bearer-token auth. -->
+    <meta name="atomic-cloud-tenant" content="__ATOMIC_CLOUD_TENANT__" />
+    <!-- Stamped with the commit sha at build time (vite.config.ts) so this
+         document's content — and therefore its service-worker precache
+         revision — changes on every deploy. Workbox carries same-revision
+         precache entries across SW updates WITHOUT refetching, so a stable
+         shell revision can pin a stale (or once-misserved) document in
+         clients' caches indefinitely. -->
+    <meta name="atomic-build" content="__ATOMIC_BUILD_SHA__" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <link rel="stylesheet" href="/fonts/fonts.css" />
     <title>Atomic</title>

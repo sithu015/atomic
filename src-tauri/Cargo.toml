@@ -1,8 +1,10 @@
 [package]
 name = "atomic"
 version = "1.39.1"
-description = "A note-taking desktop application"
-authors = ["you"]
+description = "Atomic — a semantically-connected, AI-augmented personal knowledge base"
+authors = ["Kenneth Bergquist"]
+license = "MIT"
+repository = "https://github.com/kenforthewin/atomic"
 edition = "2021"
 
 [lib]
