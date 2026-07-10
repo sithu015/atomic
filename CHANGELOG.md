@@ -2,6 +2,15 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.40.0 — 2026-07-10
+
+- Update default AI models: embedding now uses Qwen3-Embedding-8B (cheaper, top-tier retrieval quality), tagging uses GPT-5 Nano, and wiki/chat/reports use Claude Sonnet 5 — with tagging and agentic models now configured independently
+- Add "Migrate to Cloud" tab in Settings for pushing a local database to an Atomic Cloud or self-hosted Postgres server, with progress tracking and a switch-to-cloud button on completion
+- Fix tag extraction failing on GPT-5 family models (and other reasoning models that reject the temperature parameter) with a 404 routing error
+- Improve Postgres backend reliability with HNSW vector index, configurable connection pool, deadlock retry, per-database settings scoping, and migration lock fixes
+- Add durable task scheduling for feed polls, wiki regeneration, and system tasks — failed operations now retry with exponential backoff instead of being silently lost, with configurable retention and automatic cleanup
+- Add Atomic Cloud support in the product app: session-cookie authentication, cloud-aware onboarding wizard, friendly quota/billing error messages, and integration guidance pointing to the account dashboard
+
 ## v1.39.1 — 2026-05-30
 
 - Reduce memory usage for read connections by giving each a smaller default page cache (8 MB instead of 64 MB)
