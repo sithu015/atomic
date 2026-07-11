@@ -2,6 +2,13 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.42.0 — 2026-07-11
+
+- Open atoms in read mode by default — fully rendered markdown with clickable links and no accidental edits (especially on mobile). Toggle to edit with Cmd/Ctrl+E, `i`, or the titlebar button; Escape steps back to read mode then closes. Checkboxes remain toggleable and autosave from read mode
+- Fix the Chrome Web Store version of the web clipper failing to connect to Atomic Cloud (and self-hosted servers) due to missing CORS headers. Also fix server URLs entered without `https://` being treated as relative paths
+- Fix editor light-mode theming: links now follow the accent color across all themes, and the editor body no longer stays dark when the reader is in light mode or liquid-glass mode
+- Fix wiki article saves and SQLite-to-cloud migrations failing when wiki links reference deleted tags
+
 ## v1.41.0 — 2026-07-11
 
 - Add `migrate push` CLI command to push a local SQLite database to a remote Atomic server or Atomic Cloud tenant
