@@ -38,14 +38,15 @@ export interface ManagedModel {
  */
 export const FREE_AGENTIC_MODELS: ReadonlyArray<ManagedModel> = [
   { id: 'openai/gpt-5-mini', label: 'GPT-5 mini' },
-  { id: 'google/gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+  { id: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
 ];
 
 export const PRO_AGENTIC_MODELS: ReadonlyArray<ManagedModel> = [
   { id: 'openai/gpt-5-mini', label: 'GPT-5 mini' },
-  { id: 'google/gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-  { id: 'anthropic/claude-haiku-4.5', label: 'Claude Haiku 4.5' },
-  { id: 'deepseek/deepseek-v3.2', label: 'DeepSeek V3.2' },
+  { id: 'google/gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
+  { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
+  { id: 'openai/gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  { id: 'z-ai/glm-5.2', label: 'GLM-5.2' },
 ];
 
 /** The agentic model list a plan may pick from (server:

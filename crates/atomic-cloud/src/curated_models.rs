@@ -67,16 +67,24 @@ pub const MANAGED_TAGGING_MODEL: &str = "openai/gpt-5-nano";
 /// utility tier belongs on tagging, never here. Kept cheap enough that the
 /// free monthly allowance still buys real usage. The first entry is the signup
 /// default ([`crate::managed_keys::default_managed_model_config`]).
-pub const FREE_AGENTIC_MODELS: &[&str] = &["openai/gpt-5-mini", "google/gemini-2.5-flash"];
+pub const FREE_AGENTIC_MODELS: &[&str] = &["openai/gpt-5-mini", "google/gemini-3.1-flash-lite"];
 
 /// The **agentic** LLM list for premium (paid) plans: the free set plus the
 /// higher-quality options paid tiers unlock. Gated by the plan's
 /// `premium_models` feature flag (see [`agentic_models_for_plan`]).
+///
+/// Curation criteria (refresh 2026-07-12): every entry must do reliable
+/// multi-step tool calling on OpenRouter, be served by more than one upstream
+/// (single-provider models have no routing escape hatch when that upstream
+/// degrades), and price such that the plan's monthly AI allowance buys real
+/// usage. Sonnet 5 is the agentic headliner, Terra the OpenAI flagship-class
+/// option, GLM-5.2 the open-weight value pick.
 pub const PRO_AGENTIC_MODELS: &[&str] = &[
     "openai/gpt-5-mini",
-    "google/gemini-2.5-flash",
-    "anthropic/claude-haiku-4.5",
-    "deepseek/deepseek-v3.2",
+    "google/gemini-3.1-flash-lite",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.6-terra",
+    "z-ai/glm-5.2",
 ];
 
 /// The agentic model list a plan may pick from. Premium plans (the
@@ -253,7 +261,7 @@ mod tests {
     #[test]
     fn premium_only_model_is_gated_by_tier() {
         // A model on the pro list but not the free list: rejected for free,
-        // accepted for premium. `deepseek/deepseek-v3.2` is exactly that.
+        // accepted for premium. `z-ai/glm-5.2` is exactly that.
         let premium_only = PRO_AGENTIC_MODELS
             .iter()
             .find(|m| !FREE_AGENTIC_MODELS.contains(m))

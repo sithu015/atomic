@@ -299,7 +299,7 @@ mod tests {
             Some(&key),
             &json!({
                 "embedding_model": "openai/text-embedding-3-small",
-                "llm_model": "anthropic/claude-haiku-4.5",
+                "llm_model": "anthropic/claude-sonnet-5",
                 "tagging_model": "openai/gpt-5-nano",
                 "openrouter_base_url": "http://127.0.0.1:9999",
             }),
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(config.embedding_model(), "openai/text-embedding-3-small");
         // The split: `llm_model` is the agentic model, `tagging_model` the
         // utility model — they land in distinct slots, never collapsed.
-        assert_eq!(config.agentic_model(), "anthropic/claude-haiku-4.5");
+        assert_eq!(config.agentic_model(), "anthropic/claude-sonnet-5");
         assert_eq!(config.llm_model(), "openai/gpt-5-nano");
         assert_eq!(config.openrouter_base_url, "http://127.0.0.1:9999");
     }
