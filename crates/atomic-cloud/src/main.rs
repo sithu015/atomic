@@ -259,12 +259,14 @@ enum Command {
         #[command(flatten)]
         backup: BackupArgs,
 
-        /// How often the nightly backup pass runs, in seconds (plan:
-        /// "Backups & disaster recovery" → nightly logical dumps). Each pass
-        /// dumps every active tenant database (per-tenant advisory-locked,
-        /// cross-pod safe) plus the control plane to the configured backup
-        /// store. The default is 24h; a jittered start keeps a fleet of pods
-        /// from synchronizing their passes.
+        /// The backup *cadence* in seconds (plan: "Backups & disaster
+        /// recovery" → nightly logical dumps): how stale a tenant's last
+        /// successful backup may get before the next pass dumps it. The loop
+        /// itself ticks every few minutes (see `BACKUP_TICK`) and each tick
+        /// dumps only the tenants that are due (per-tenant advisory-locked,
+        /// cross-pod safe) plus the control plane once per UTC day — so a
+        /// process restart delays backups by minutes, not by a fresh
+        /// day-scale timer.
         #[arg(
             long,
             env = "ATOMIC_CLOUD_BACKUP_INTERVAL_SECS",
@@ -1556,6 +1558,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_backups_per_pass,
                 staleness_horizon: std::time::Duration::from_secs(backup_staleness_secs),
                 backup_timeout,
+                // The loop sets the real cadence from --backup-interval-secs.
+                cadence: None,
             };
 
             serve(
@@ -1786,8 +1790,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     ..atomic_cloud::BackupConfig::default()
                 };
                 let now = chrono::Utc::now();
+                // run-now is the operator's unconditional pass: every active
+                // tenant (default cadence: None) and the control plane.
                 let summary =
-                    atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+                    atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true)
+                        .await;
 
                 println!("backup pass complete:");
                 println!(
@@ -2613,23 +2620,50 @@ async fn run_reaper_loop(
 /// advisory locks — just wasteful). After each pass it runs the staleness
 /// monitor (plan: "alert when any tenant's last successful backup is >36h
 /// old"): an unmonitored backup job is a placebo.
+/// How often the backup loop *ticks*. Distinct from the backup cadence
+/// (`--backup-interval-secs`, default 24h): each tick runs a due-driven pass
+/// that only dumps tenants whose last successful backup is older than the
+/// cadence, so ticking often is nearly free — and a process restart costs at
+/// most one tick of delay, not a reroll of a day-scale timer. (The previous
+/// design slept a random 0..=interval before the first pass; launch-week
+/// deploy frequency meant the pass simply never fired.)
+const BACKUP_TICK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Cap on the startup jitter that staggers a multi-pod fleet's ticks. Politeness
+/// only — the per-account advisory locks already make concurrent passes safe.
+const BACKUP_JITTER_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn run_backup_loop(
     control: ControlPlane,
     cluster: ClusterConfig,
     store: Arc<dyn atomic_cloud::BackupStore>,
-    config: atomic_cloud::BackupConfig,
+    mut config: atomic_cloud::BackupConfig,
     interval: std::time::Duration,
 ) {
+    // The CLI interval is the *cadence* a tenant is held to; the loop ticks
+    // much faster and lets the due-filter do the work.
+    config.cadence = Some(interval);
+    let tick = BACKUP_TICK.min(interval);
+    let jitter_cap = BACKUP_JITTER_CAP.min(tick).as_millis().max(1) as u64;
     let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
         &mut rand::thread_rng(),
-        0..=interval.as_millis() as u64,
+        0..=jitter_cap,
     ));
     tokio::time::sleep(jitter).await;
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(tick);
+    // The control-plane dump is once per UTC day (its store key is per-day
+    // and idempotent, so the post-restart re-dump is a harmless overwrite).
+    let mut last_control_dump_date: Option<chrono::NaiveDate> = None;
     loop {
         ticker.tick().await;
         let now = chrono::Utc::now();
-        let summary = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+        let include_control = last_control_dump_date != Some(now.date_naive());
+        let summary =
+            atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, include_control)
+                .await;
+        if summary.control_backed_up {
+            last_control_dump_date = Some(now.date_naive());
+        }
         if summary.is_quiet() {
             tracing::debug!("backup pass: nothing to do");
         } else {

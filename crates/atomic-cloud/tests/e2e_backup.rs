@@ -429,7 +429,7 @@ async fn full_disaster_recovery_rehearsal() {
         // ---- Step 1: a nightly backup pass. ----
         let pass_at = chrono::Utc::now();
         let summary =
-            run_backup_pass(&h.control, &h.cluster, &h.store, &BackupConfig::default(), pass_at)
+            run_backup_pass(&h.control, &h.cluster, &h.store, &BackupConfig::default(), pass_at, true)
                 .await;
         assert_eq!(
             summary.tenants_backed_up.len(),
@@ -747,7 +747,7 @@ async fn staleness_alert_surfaces_only_the_stale_tenant() {
                 &h.cluster,
                 &h.store,
                 &BackupConfig::default(),
-                pass_at,
+                pass_at, true,
             )
             .await;
             assert_eq!(summary.tenants_backed_up.len(), 2, "{summary:?}");

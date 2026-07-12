@@ -235,7 +235,7 @@ async fn nightly_pass_backs_up_every_tenant_plus_control() {
             let config = atomic_cloud::BackupConfig::default();
             let now = chrono::Utc::now();
             let summary =
-                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true).await;
 
             // Every tenant + the control plane were backed up; no errors.
             assert_eq!(
@@ -369,7 +369,7 @@ async fn one_tenant_failure_does_not_abort_the_pass() {
             let now = chrono::Utc::now();
             let config = atomic_cloud::BackupConfig::default();
             let summary =
-                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true).await;
 
             // The good tenant + control plane succeeded; the bad tenant failed,
             // but the pass as a whole did not abort.
@@ -499,7 +499,7 @@ async fn concurrent_pass_skips_a_locked_tenant() {
         let (_dir, store) = temp_store();
         let now = chrono::Utc::now();
         let config = atomic_cloud::BackupConfig::default();
-        let summary = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+        let summary = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true).await;
 
         // The locked tenant was skipped (not dumped, not failed); the free
         // tenant backed up normally; the control plane backed up.
@@ -597,7 +597,7 @@ async fn pass_records_a_timeout_failure_and_keeps_going() {
 
             let started = std::time::Instant::now();
             let summary =
-                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true).await;
             let elapsed = started.elapsed();
 
             // The pass returned promptly — no hung child wedged it. (A real
@@ -690,7 +690,7 @@ async fn cap_defers_excess_and_next_pass_reaches_them() {
 
             // Pass one: exactly two dumped, exactly one deferred.
             let now1 = chrono::Utc::now();
-            let s1 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1).await;
+            let s1 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1, true).await;
             assert_eq!(s1.tenants_backed_up.len(), 2, "cap dumps exactly 2: {s1:?}");
             assert_eq!(s1.tenants_deferred.len(), 1, "one deferred: {s1:?}");
             assert!(s1.control_backed_up);
@@ -706,7 +706,7 @@ async fn cap_defers_excess_and_next_pass_reaches_them() {
             // Pass two (slightly later): the deferred tenant — now the most
             // overdue (NULL last_backup_at sorts first) — is reached.
             let now2 = now1 + chrono::Duration::seconds(1);
-            let s2 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2).await;
+            let s2 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2, true).await;
             assert!(
                 s2.tenants_backed_up.contains(&deferred_id),
                 "the previously deferred tenant is reached next pass: {s2:?}"
@@ -791,12 +791,12 @@ async fn persistently_failing_tenant_does_not_starve_a_healthy_one() {
             };
 
             let now1 = chrono::Utc::now();
-            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1).await;
+            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1, true).await;
             // After pass one, the broken tenant has a last_backup_attempt_at
             // (failure stamped) but no last_backup_at; the healthy tenant has
             // neither yet → it sorts first next pass.
             let now2 = now1 + chrono::Duration::seconds(1);
-            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2).await;
+            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2, true).await;
 
             let healthy_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
                 "SELECT last_backup_at FROM account_databases WHERE account_id = $1",
@@ -1947,4 +1947,99 @@ async fn dumps_for_account_lists_only_that_tenants_dumps() {
             format!("backups/final/{acct_b}-20260612T010203Z.dump"),
         ]
     );
+}
+
+// ==================== Due-driven cadence ====================
+
+/// The launch-week regression: the serve loop ticks every few minutes with
+/// `cadence: Some(interval)`, so a pass must dump never-backed-up tenants
+/// immediately, skip fresh ones, and — when nothing is due and no control
+/// dump is requested — do nothing at all, not even a ledger row (a quiet
+/// tick every five minutes must not bury the real runs).
+#[tokio::test]
+async fn due_driven_pass_dumps_new_tenants_and_skips_fresh_ones() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "due_driven_pass_dumps_new_tenants_and_skips_fresh_ones: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db(
+        "due_driven_pass_dumps_new_tenants_and_skips_fresh_ones",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            let mut accts = Vec::new();
+            for (email, sub) in [("a@example.com", "duea"), ("b@example.com", "dueb")] {
+                accts.push(
+                    provision_account(
+                        &control,
+                        &cluster,
+                        &ManagedKeys::Disabled,
+                        NewAccount {
+                            email: email.into(),
+                            subdomain: sub.into(),
+                        },
+                    )
+                    .await
+                    .expect("provision"),
+                );
+            }
+
+            let (_dir, store) = temp_store();
+            let cadence = std::time::Duration::from_secs(24 * 60 * 60);
+            let config = atomic_cloud::BackupConfig {
+                cadence: Some(cadence),
+                ..atomic_cloud::BackupConfig::default()
+            };
+            let now = chrono::Utc::now();
+
+            // Tick 1: both tenants have never been backed up — both are due
+            // the moment they exist (the exact case the jittered nightly
+            // design missed for day-one signups).
+            let s1 =
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, true).await;
+            assert_eq!(s1.tenants_backed_up.len(), 2, "new tenants are due: {s1:?}");
+            assert!(s1.control_backed_up);
+            let runs_after_first = recent_backup_runs(&control, 10).await.unwrap().len();
+
+            // Tick 2, minutes later: everyone is fresh, control not requested
+            // — a fully quiet tick, with no ledger row.
+            let s2 = atomic_cloud::run_backup_pass(
+                &control,
+                &cluster,
+                &store,
+                &config,
+                now + chrono::Duration::minutes(5),
+                false,
+            )
+            .await;
+            assert!(s2.tenants_backed_up.is_empty(), "fresh tenants skipped: {s2:?}");
+            assert!(!s2.control_backed_up);
+            assert!(s2.errors.is_empty());
+            assert_eq!(
+                recent_backup_runs(&control, 10).await.unwrap().len(),
+                runs_after_first,
+                "a quiet tick writes no ledger row"
+            );
+
+            // Tick 3, past the cadence: everyone is due again.
+            let s3 = atomic_cloud::run_backup_pass(
+                &control,
+                &cluster,
+                &store,
+                &config,
+                now + chrono::Duration::hours(25),
+                false,
+            )
+            .await;
+            assert_eq!(
+                s3.tenants_backed_up.len(),
+                2,
+                "tenants past the cadence are due again: {s3:?}"
+            );
+        },
+    )
+    .await;
 }

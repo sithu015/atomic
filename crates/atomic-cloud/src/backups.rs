@@ -159,6 +159,14 @@ pub struct BackupConfig {
     /// whole-pass worst case is bounded by this × the per-pass cap (see
     /// [`run_backup_pass`]). Defaults to [`DEFAULT_BACKUP_TIMEOUT`].
     pub backup_timeout: Duration,
+    /// How fresh a tenant's last successful backup may be before the pass
+    /// skips it. `Some(cadence)` makes the pass **due-driven** — only tenants
+    /// whose `last_backup_at` is older than `now - cadence` (or NULL) are
+    /// dumped, so the pass is safe to run far more often than the cadence and
+    /// process restarts can't lose a day (the serve loop ticks every
+    /// [`BACKUP_TICK`](crate) minutes). `None` dumps every active tenant
+    /// unconditionally — the `backup run-now` operator semantic.
+    pub cadence: Option<Duration>,
 }
 
 impl Default for BackupConfig {
@@ -167,6 +175,7 @@ impl Default for BackupConfig {
             max_backups_per_pass: DEFAULT_MAX_BACKUPS_PER_PASS,
             staleness_horizon: DEFAULT_STALENESS_HORIZON,
             backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
+            cadence: None,
         }
     }
 }
@@ -223,6 +232,25 @@ pub async fn list_active_tenant_databases(
     .fetch_all(control.pool())
     .await
     .map_err(CloudError::db("listing active tenant databases for backup"))
+}
+
+/// The due-driven variant: active tenants whose last successful backup is
+/// older than `due_before` — or who have never been backed up at all (the
+/// day-one signup the fixed-interval design silently missed).
+async fn list_due_tenant_databases(
+    control: &ControlPlane,
+    due_before: DateTime<Utc>,
+) -> Result<Vec<BackupTarget>, CloudError> {
+    sqlx::query_as(
+        "SELECT account_id, db_name FROM account_databases \
+         WHERE status = 'active' \
+           AND (last_backup_at IS NULL OR last_backup_at <= $1) \
+         ORDER BY COALESCE(last_backup_at, last_backup_attempt_at) ASC NULLS FIRST, account_id",
+    )
+    .bind(due_before)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing due tenant databases for backup"))
 }
 
 /// Record a successful backup of `db_name` for `account_id` at `at`, clearing
@@ -466,11 +494,19 @@ pub async fn recent_backup_runs(
 
 // ==================== The nightly pass ====================
 
-/// Run one nightly backup pass: dump every active tenant database (each under
-/// its own per-account advisory lock) plus the control plane to `store`, and
-/// record one `backup_runs` row. Never fails as a whole — per-target failures
-/// land in [`BackupSummary::errors`] and on the tenant's row, and the rest of
-/// the fleet proceeds (a broken tenant must not starve its neighbors).
+/// Run one backup pass: dump the due tenant databases (each under its own
+/// per-account advisory lock), plus the control plane when `include_control`
+/// is set, and record one `backup_runs` row. Never fails as a whole —
+/// per-target failures land in [`BackupSummary::errors`] and on the tenant's
+/// row, and the rest of the fleet proceeds (a broken tenant must not starve
+/// its neighbors).
+///
+/// "Due" is [`BackupConfig::cadence`]: `Some(c)` dumps only tenants whose
+/// last successful backup is older than `now - c` (or absent — new signups
+/// are due immediately), which makes the pass idempotent-cheap and safe to
+/// tick every few minutes; `None` dumps every active tenant (`run-now`). A
+/// tick with nothing due and no control dump requested returns a quiet
+/// summary without writing a ledger row.
 ///
 /// Cross-pod safe by the reaper's mechanism: a tenant contended by another
 /// pod's pass is skipped (observable, never waited on), and the control dump
@@ -490,6 +526,7 @@ pub async fn run_backup_pass(
     store: &Arc<dyn BackupStore>,
     config: &BackupConfig,
     now: DateTime<Utc>,
+    include_control: bool,
 ) -> BackupSummary {
     let mut summary = BackupSummary::default();
 
@@ -498,6 +535,31 @@ pub async fn run_backup_pass(
     if let Err(e) = finalize_abandoned_backup_runs(control, DEFAULT_BACKUP_RUN_ABANDON_AFTER).await
     {
         tracing::warn!(error = %e, "backup pass: finalizing abandoned runs failed");
+    }
+
+    // Targets first, so a quiet due-driven tick (nothing due, control fresh)
+    // costs one SELECT and leaves no ledger row — the serve loop ticks far
+    // more often than the cadence, and 90+ empty ledger rows a day would
+    // bury the real runs.
+    let targets = match config.cadence {
+        Some(cadence) => {
+            let due_before = now
+                - chrono::Duration::from_std(cadence)
+                    .unwrap_or_else(|_| chrono::Duration::days(1));
+            list_due_tenant_databases(control, due_before).await
+        }
+        None => list_active_tenant_databases(control).await,
+    };
+    let targets = match targets {
+        Ok(targets) => targets,
+        Err(e) => {
+            tracing::error!(error = %e, "backup pass: listing tenants failed; aborting pass");
+            summary.errors.push(format!("listing tenants: {e}"));
+            return summary;
+        }
+    };
+    if targets.is_empty() && !include_control {
+        return summary;
     }
 
     let run_id = match start_backup_run(control, "nightly").await {
@@ -517,18 +579,6 @@ pub async fn run_backup_pass(
         Err(e) => {
             tracing::error!(error = %e, "backup pass: cluster URL unusable; aborting pass");
             summary.errors.push(format!("cluster connection: {e}"));
-            if let Some(run_id) = &run_id {
-                let _ = finish_backup_run(control, run_id, 0, 0, 0).await;
-            }
-            return summary;
-        }
-    };
-
-    let targets = match list_active_tenant_databases(control).await {
-        Ok(targets) => targets,
-        Err(e) => {
-            tracing::error!(error = %e, "backup pass: listing tenants failed; aborting pass");
-            summary.errors.push(format!("listing tenants: {e}"));
             if let Some(run_id) = &run_id {
                 let _ = finish_backup_run(control, run_id, 0, 0, 0).await;
             }
@@ -582,13 +632,17 @@ pub async fn run_backup_pass(
         }
     }
 
-    // Control-plane dump (plan: "plus the control plane"). One per pass, no
-    // lock — the key is per-day and the dump is idempotent.
-    match back_up_control_plane(control, &conn, store, now, config.backup_timeout).await {
-        Ok(()) => summary.control_backed_up = true,
-        Err(e) => {
-            tracing::error!(error = %e, "backup pass: control-plane dump failed");
-            summary.errors.push(format!("control plane: {e}"));
+    // Control-plane dump (plan: "plus the control plane"). No lock — the key
+    // is per-day and the dump is idempotent. `include_control` is the serve
+    // loop's once-per-day gate (and `run-now`'s always), so frequent
+    // due-driven ticks don't re-dump it 90 times a day.
+    if include_control {
+        match back_up_control_plane(control, &conn, store, now, config.backup_timeout).await {
+            Ok(()) => summary.control_backed_up = true,
+            Err(e) => {
+                tracing::error!(error = %e, "backup pass: control-plane dump failed");
+                summary.errors.push(format!("control plane: {e}"));
+            }
         }
     }
 
