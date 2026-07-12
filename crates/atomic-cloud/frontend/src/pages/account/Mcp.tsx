@@ -18,7 +18,7 @@ export function Mcp() {
       <header>
         <p className="text-xs font-medium uppercase tracking-wide text-text-muted">MCP</p>
         <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-          Connect your <span className="italic">tools.</span>
+          Connect your tools.
         </h1>
         <p className="mt-2 text-text-secondary">
           Atomic speaks the Model Context Protocol, so AI clients like Claude can

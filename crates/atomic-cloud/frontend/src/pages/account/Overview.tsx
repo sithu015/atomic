@@ -31,7 +31,7 @@ export function Overview() {
       <header>
         <p className="text-xs font-medium uppercase tracking-wide text-text-muted">Overview</p>
         <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-          Your <span className="italic">workspace.</span>
+          Your workspace.
         </h1>
         <p className="mt-2 text-text-secondary">
           {subdomain} · {email}

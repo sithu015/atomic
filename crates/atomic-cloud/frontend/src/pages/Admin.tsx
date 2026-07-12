@@ -63,7 +63,7 @@ export function Admin() {
         <header className="mb-8">
           <p className="text-xs font-medium uppercase tracking-wide text-text-muted">Operator</p>
           <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-            Accounts<span className="italic">.</span>
+            Accounts.
           </h1>
         </header>
 

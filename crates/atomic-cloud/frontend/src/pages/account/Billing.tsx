@@ -71,7 +71,7 @@ export function Billing() {
       <header>
         <p className="text-xs font-medium uppercase tracking-wide text-text-muted">Billing</p>
         <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-          Plan &amp; <span className="italic">billing.</span>
+          Plan &amp; billing.
         </h1>
         <p className="mt-2 text-text-secondary">
           Manage your subscription and payment method. Payments are handled

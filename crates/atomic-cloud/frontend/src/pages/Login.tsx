@@ -95,11 +95,7 @@ export function Login() {
     <PublicLayout>
       <AuthLayout
         eyebrow="Sign in"
-        title={
-          <>
-            Welcome <span className="italic">back.</span>
-          </>
-        }
+        title="Welcome back."
         subtitle="Enter your email and we'll send you a link to sign in — no password needed."
         footer={
           <>

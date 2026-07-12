@@ -46,7 +46,7 @@ export function Danger() {
       <header>
         <p className="text-xs font-medium uppercase tracking-wide text-text-muted">Account</p>
         <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-          Account <span className="italic">settings.</span>
+          Account settings.
         </h1>
         <p className="mt-2 text-text-secondary">
           {subdomain} · {overview.email}

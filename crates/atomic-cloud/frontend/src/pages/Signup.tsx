@@ -152,11 +152,7 @@ export function Signup() {
     <PublicLayout>
       <AuthLayout
         eyebrow="Create your workspace"
-        title={
-          <>
-            Start your <span className="italic">Atomic</span> graph.
-          </>
-        }
+        title="Start your Atomic graph."
         subtitle="Pick a subdomain and we'll email you a link to finish — no password to remember."
         footer={
           <>

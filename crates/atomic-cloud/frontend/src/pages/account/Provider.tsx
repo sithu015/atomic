@@ -51,7 +51,7 @@ export function Provider() {
       <header>
         <p className="text-xs font-medium uppercase tracking-wide text-text-muted">AI provider</p>
         <h1 className="mt-1 font-display text-3xl tracking-tight md:text-4xl">
-          Power your <span className="italic">AI.</span>
+          Power your AI.
         </h1>
         <p className="mt-2 text-text-secondary">
           Atomic uses an AI provider for embeddings, tag extraction, wiki

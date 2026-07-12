@@ -12,7 +12,7 @@ export function NotFound() {
             404
           </p>
           <h1 className="font-display text-4xl md:text-5xl tracking-tight mb-4">
-            This page <span className="italic">drifted off.</span>
+            This page drifted off.
           </h1>
           <p className="text-text-secondary leading-relaxed mb-8">
             The link you followed doesn't lead anywhere here.

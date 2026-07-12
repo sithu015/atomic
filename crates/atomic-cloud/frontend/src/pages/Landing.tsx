@@ -38,8 +38,7 @@ export function Landing() {
               Atomic Cloud
             </p>
             <h1 className="font-display text-5xl md:text-6xl lg:text-7xl leading-[1.05] tracking-tight text-balance mb-6">
-              Your knowledge graph,{' '}
-              <span className="italic">hosted and run for you.</span>
+              Your knowledge graph, hosted and run for you.
             </h1>
             <p className="text-lg md:text-xl text-text-secondary leading-relaxed max-w-2xl mx-auto mb-10">
               The same AI-native Atomic — semantic search, wiki synthesis, and
