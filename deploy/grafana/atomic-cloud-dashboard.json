@@ -361,7 +361,7 @@
       },
       "targets": [
         {
-          "expr": "100 * node_filesystem_avail_bytes{mountpoint=~\"/host/root/mnt.*|/\"} / node_filesystem_size_bytes{mountpoint=~\"/host/root/mnt.*|/\"}",
+          "expr": "100 * node_filesystem_avail_bytes{fstype=\"ext4\"} / node_filesystem_size_bytes{fstype=\"ext4\"}",
           "refId": "A",
           "legendFormat": "{{mountpoint}}"
         }
