@@ -1259,6 +1259,21 @@ enum AccountAction {
         /// to the automated writers.
         #[arg(long, default_value_t = true)]
         pin: bool,
+
+        /// Resize the account's managed-key allowance to the new plan as
+        /// part of the override, exactly as the admin portal does — requires
+        /// the provisioning environment, so run inside the serve container.
+        /// Without it the resize is a logged no-op (the pre-existing CLI
+        /// behavior) and reconciles on the next serve-driven transition.
+        #[arg(long)]
+        managed: bool,
+
+        #[command(flatten)]
+        provisioning: ProvisioningArgs,
+
+        /// See `serve --master-key-env`. Only read with --managed.
+        #[arg(long, default_value = atomic_cloud::MASTER_KEY_ENV)]
+        master_key_env: String,
     },
 }
 
@@ -1759,19 +1774,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 subdomain,
                 plan,
                 pin,
+                managed,
+                provisioning,
+                master_key_env,
             } => {
                 let account_id = control
                     .account_id_by_subdomain(&subdomain)
                     .await?
                     .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
                 // Managed keys are disabled on CLI hosts (no provisioning
-                // key), so the allowance resize inside set_plan_override is
-                // a logged no-op here; it reconciles on the next transition
-                // a serve pod drives, or immediately when run through the
-                // admin portal instead.
+                // key) unless --managed opts in from inside the serve
+                // container; without it the allowance resize inside
+                // set_plan_override is a logged no-op that reconciles on
+                // the next serve-driven transition (or immediately via the
+                // admin portal).
+                let managed_keys = if managed {
+                    let vault: Arc<dyn KeyVault> =
+                        Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+                    provisioning.into_managed_keys(vault)?
+                } else {
+                    ManagedKeys::Disabled
+                };
                 atomic_cloud::admin::set_plan_override(
                     &control,
-                    &ManagedKeys::Disabled,
+                    &managed_keys,
                     "cli",
                     &account_id,
                     &plan,
