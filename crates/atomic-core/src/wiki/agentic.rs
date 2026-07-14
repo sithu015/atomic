@@ -339,7 +339,12 @@ async fn run_research(
     max_source_tokens: usize,
 ) -> Result<(), String> {
     let tools = research_tools();
-    let llm_config = LlmConfig::new(model);
+    // Explicit output budget (see providers::structured::DEFAULT_MAX_OUTPUT_TOKENS
+    // for why it must never be left unset on long-output calls).
+    let llm_config = LlmConfig::new(model).with_params(
+        crate::providers::types::GenerationParams::new()
+            .with_max_tokens(crate::providers::structured::DEFAULT_MAX_OUTPUT_TOKENS),
+    );
     let provider = get_llm_provider(provider_config).map_err(|e| e.to_string())?;
 
     for iteration in 0..MAX_RESEARCH_ITERATIONS {

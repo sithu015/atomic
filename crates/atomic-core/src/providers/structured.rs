@@ -45,6 +45,16 @@ use std::sync::Arc;
 
 // ==================== Public API ====================
 
+/// Default output-token budget for LLM calls that lack an explicit one.
+/// Never leave `max_tokens` unset on a call whose output can be long:
+/// OpenAI-family models treat "absent" as "model maximum", but Anthropic's
+/// API *requires* the field, so routers fill in a small default — which
+/// truncated a claude-authored report digest mid-sentence (2026-07-14).
+/// 8k tokens is roomy for the longest wiki article or digest while still
+/// bounding a runaway generation; short-output callers (tagging,
+/// extraction) are simply nowhere near it.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
+
 /// A single structured-output LLM call. Construct with [`StructuredCall::new`],
 /// optionally adjust via the `with_*` methods, then pass to [`call_structured`].
 pub struct StructuredCall<'a, T> {
@@ -83,7 +93,9 @@ impl<'a, T> StructuredCall<'a, T> {
             messages,
             schema_name,
             schema,
-            params: GenerationParams::new().with_temperature(0.3),
+            params: GenerationParams::new()
+                .with_temperature(0.3)
+                .with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS),
             max_retries: 2,
             strict: true,
             _marker: PhantomData,

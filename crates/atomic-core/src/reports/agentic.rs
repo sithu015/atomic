@@ -539,7 +539,12 @@ async fn run_research(
     max_iters: usize,
 ) -> Result<(), AtomicCoreError> {
     let tools = report_tools();
-    let llm_config = LlmConfig::new(model);
+    // Explicit output budget (see providers::structured::DEFAULT_MAX_OUTPUT_TOKENS
+    // for why it must never be left unset on long-output calls).
+    let llm_config = LlmConfig::new(model).with_params(
+        crate::providers::types::GenerationParams::new()
+            .with_max_tokens(crate::providers::structured::DEFAULT_MAX_OUTPUT_TOKENS),
+    );
     let provider = get_llm_provider(provider_config)
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
