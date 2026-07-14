@@ -141,14 +141,37 @@ permanently on the fast-path poll — harmless-ish, but hints should mean
 
 ### Provisioning the demo account
 
-`demo` is in the reserved-subdomains blocklist (correctly, for signup).
-Operator path: a small CLI subcommand (`atomic-cloud account provision
---subdomain demo --email <op> --allow-reserved`) that runs the normal
-provisioning routine with the blocklist check bypassed behind the
-explicit flag. Then set the account's plan to Pro (comped: no Stripe
-subscription; billing_state stays `active`) and its managed-key limit to
-the demo cap. Both are one-time operator actions; document them in the
-runbook section of this file when built.
+`demo` is in the reserved-subdomains blocklist (correctly, for signup);
+the operator path bypasses it explicitly. **Runbook (executed 2026-07-13,
+account `640ec443…`, tenant `acct_mqhmiq6kubb5ne7wvnkoqm6yye`):**
+
+```bash
+# 1. Local deploy/.env (rsynced by deploy.sh): ATOMIC_CLOUD_DEMO_SUBDOMAIN=demo
+bash deploy/scripts/deploy.sh root@<droplet>
+
+# 2. Inside the pod container (it holds the provisioning + master keys):
+docker exec atomic-cloud-atomic-cloud-1 atomic-cloud account create \
+  --email <operator-email> --subdomain demo --allow-reserved --managed
+# prints the owner token ONCE — used for seeding, then revoke it
+# (`token revoke`); mint fresh ones via `token create --subdomain demo`.
+
+# 3. Comped pro, sweep-proof (plan_pinned), key allowance resized in-band:
+docker exec atomic-cloud-atomic-cloud-1 atomic-cloud account set-plan \
+  --subdomain demo --plan pro --managed
+
+# 4. Tenant config via the owner token on the demo host:
+#    POST /api/tags/configure-autotag-targets
+#      {"keep_defaults":["Topics","People","Organizations","Events"],"add_custom":[]}
+#    PUT  /api/settings/onboarding_completed {"value":"true"}
+
+# 5. Seed the corpus (idempotent, skip_if_source_exists on the arXiv abs
+#    URL, paced under the 60/min atom_creates window): 100 landmark papers,
+#    metadata fetched live from the arXiv API — never from model memory.
+```
+
+The account is a normal pro tenant in every other respect: managed key
+with the plan's monthly credit cap (the spend backstop), due-driven
+backups, fleet migrations, metrics.
 
 ### Frontend demo mode
 
