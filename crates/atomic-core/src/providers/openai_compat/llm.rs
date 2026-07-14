@@ -330,6 +330,7 @@ async fn complete_internal(
     Ok(CompletionResponse {
         content,
         tool_calls,
+        finish_reason: choice.finish_reason.clone(),
     })
 }
 
@@ -524,5 +525,6 @@ pub async fn complete_streaming_with_tools(
     Ok(CompletionResponse {
         content,
         tool_calls,
+        finish_reason,
     })
 }

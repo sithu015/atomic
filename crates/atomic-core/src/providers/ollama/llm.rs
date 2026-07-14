@@ -242,6 +242,7 @@ pub async fn complete(
     Ok(CompletionResponse {
         content: chat_response.message.content,
         tool_calls,
+        finish_reason: None,
     })
 }
 
@@ -320,6 +321,7 @@ pub async fn complete_with_tools(
     Ok(CompletionResponse {
         content: chat_response.message.content,
         tool_calls,
+        finish_reason: None,
     })
 }
 
@@ -455,5 +457,6 @@ pub async fn complete_streaming_with_tools(
         } else {
             Some(tool_calls)
         },
+        finish_reason: None,
     })
 }

@@ -388,6 +388,7 @@ async fn complete_internal(
         .map(|tcs| tcs.iter().map(convert_tool_call).collect());
 
     Ok(CompletionResponse {
+        finish_reason: choice.finish_reason.clone(),
         content: choice.message.content.unwrap_or_default(),
         tool_calls,
     })
@@ -602,5 +603,6 @@ async fn complete_streaming_internal(
     Ok(CompletionResponse {
         content,
         tool_calls,
+        finish_reason,
     })
 }

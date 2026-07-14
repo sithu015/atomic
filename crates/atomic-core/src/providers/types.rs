@@ -243,6 +243,12 @@ impl GenerationParams {
 pub struct CompletionResponse {
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// The provider's finish reason, normalized to the OpenAI vocabulary
+    /// (`stop`, `length`, `tool_calls`, …) when available. `length` means
+    /// the content is truncated BY CONSTRUCTION — consumers that parse the
+    /// content (structured outputs) must treat it as a failed generation,
+    /// never as material to salvage. `None` when the provider didn't say.
+    pub finish_reason: Option<String>,
 }
 
 /// Streaming delta from LLM

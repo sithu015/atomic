@@ -257,6 +257,28 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
 
         match provider.complete(messages, &primary_config).await {
             Ok(response) => {
+                // A `length` stop means the content is truncated BY
+                // CONSTRUCTION — parsing it is how a mid-sentence digest
+                // ends up in the database looking like a success (the
+                // model may still close the JSON envelope around the cut
+                // string). Treat as transient and retry: another attempt
+                // (often another upstream) usually completes.
+                if response.finish_reason.as_deref() == Some("length") {
+                    last_parse_err = format!(
+                        "generation hit the output-token limit (finish_reason=length, \
+                         {} chars in)",
+                        response.content.len()
+                    );
+                    tracing::warn!(
+                        schema_name,
+                        content_chars = response.content.len(),
+                        "[structured] Truncated generation (finish_reason=length); retrying"
+                    );
+                    if attempt < max_retries {
+                        continue;
+                    }
+                    return Err(StructuredCallError::Other(last_parse_err));
+                }
                 if response.content.is_empty() {
                     return Err(StructuredCallError::Other(
                         "LLM returned empty content".to_string(),
@@ -451,13 +473,25 @@ pub fn parse_tolerant<T: DeserializeOwned>(content: &str) -> Result<T, serde_jso
     let stripped = strip_code_fences(content);
     if stripped != content {
         if let Ok(v) = serde_json::from_str::<T>(&stripped) {
+            tracing::warn!(
+                content_chars = content.len(),
+                "[structured] Parse needed code-fence stripping — the provider \
+                 didn't honor response_format cleanly"
+            );
             return Ok(v);
         }
     }
 
     // Attempt 3: find the outermost JSON object substring.
     let located = locate_json_object(&stripped);
-    serde_json::from_str::<T>(&located)
+    let v = serde_json::from_str::<T>(&located)?;
+    tracing::warn!(
+        content_chars = content.len(),
+        located_chars = located.len(),
+        "[structured] Parse needed JSON-object extraction — the provider \
+         wrapped the object in extra text"
+    );
+    Ok(v)
 }
 
 fn strip_code_fences(content: &str) -> String {
@@ -619,6 +653,7 @@ mod tests {
                 Some(MockResponse::Ok(content)) => Ok(CompletionResponse {
                     content,
                     tool_calls: None,
+                    finish_reason: Some("stop".to_string()),
                 }),
                 Some(MockResponse::Err(e)) => Err(e),
                 None => Err(ProviderError::Configuration(
