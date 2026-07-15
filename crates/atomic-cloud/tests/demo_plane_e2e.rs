@@ -259,6 +259,28 @@ async fn demo_whitelist_serves_reads_and_refuses_everything_else() {
             .expect("atom id")
             .to_string();
 
+        // 0 — the edge-cache contract: a visitor's 200 GET carries the
+        // shared-cache header, the owner's identical GET never does, and a
+        // visitor denial (non-200) never does. This is what lets the CDN
+        // fronting the demo host absorb spikes without ever holding an
+        // owner-only or personalized byte.
+        let res = h.anon(Method::GET, "/api/atoms").await;
+        assert_eq!(
+            res.headers().get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("public, s-maxage=60"),
+            "visitor 200 GET must be shared-cacheable"
+        );
+        let res = h.owner(Method::GET, "/api/atoms", None).await;
+        assert!(
+            res.headers().get("cache-control").is_none(),
+            "owner responses must never be shared-cacheable"
+        );
+        let res = h.anon(Method::POST, "/api/atoms").await;
+        assert!(
+            res.headers().get("cache-control").is_none(),
+            "denials must never be shared-cacheable"
+        );
+
         // 1 — the whitelisted read surface answers anonymously.
         for path in [
             "/api/atoms",

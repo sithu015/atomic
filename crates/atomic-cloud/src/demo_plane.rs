@@ -240,6 +240,46 @@ impl DemoPlane {
     }
 }
 
+/// The `Cache-Control` stamped on cacheable demo responses. `s-maxage`
+/// only: shared caches (the CDN fronting the demo host) may hold a copy
+/// for a minute; browsers get no directive and keep revalidating. One
+/// minute is invisible against the corpus's change rate (a weekly digest,
+/// occasional seeding) while collapsing a traffic spike to one origin hit
+/// per path per minute.
+const DEMO_CACHE_CONTROL: &str = "public, s-maxage=60";
+
+/// Response middleware: mark shared-cacheable exactly the responses a
+/// shared cache may correctly hold — status-200 GET/HEAD served to a
+/// [`CredentialSource::DemoVisitor`] principal. That surface is
+/// visitor-identical BY CONSTRUCTION (the whitelist admits no
+/// personalized read), which is also why the cache deliberately does NOT
+/// vary on `Cookie`: a logged-in-elsewhere browser sends the base-domain
+/// session cookie, is served as a visitor, and receives the same bytes.
+/// Owner/token responses never carry the header (the CDN's
+/// bypass-on-Authorization rule is belt-and-braces on top), denials are
+/// non-200 and skipped, and deployments with no demo subdomain have no
+/// DemoVisitor principals — the middleware is inert everywhere else.
+pub async fn demo_cache_headers(
+    req: ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
+) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error>
+{
+    let cacheable_method =
+        *req.method() == Method::GET || *req.method() == Method::HEAD;
+    let is_visitor = req
+        .extensions()
+        .get::<ResolvedTenant>()
+        .is_some_and(|t| t.principal.source == CredentialSource::DemoVisitor);
+    let mut res = next.call(req).await?;
+    if cacheable_method && is_visitor && res.status() == actix_web::http::StatusCode::OK {
+        res.headers_mut().insert(
+            actix_web::http::header::CACHE_CONTROL,
+            actix_web::http::header::HeaderValue::from_static(DEMO_CACHE_CONTROL),
+        );
+    }
+    Ok(res)
+}
+
 /// The path served by [`demo_config`]; whitelisted so the probe works
 /// anonymously on the demo host.
 const DEMO_CONFIG_PATH: &str = "/api/demo-config";
@@ -283,6 +323,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, auth: CloudAuth) {
         web::resource(DEMO_CONFIG_PATH)
             .app_data(web::Data::new(DemoConfigSignup(signup_url)))
             .route(web::get().to(demo_config))
+            .wrap(actix_web::middleware::from_fn(demo_cache_headers))
             .wrap(actix_web::middleware::from_fn(cloud_plane_guard))
             .wrap(auth),
     );

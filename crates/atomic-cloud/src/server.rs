@@ -596,6 +596,11 @@ pub fn configure_cloud_app(
                 .wrap(from_fn(quota_guard))
                 .wrap(from_fn(billing_write_guard))
                 .wrap(from_fn(data_plane_rate_limit_guard))
+                // Response-phase only: stamps Cache-Control on demo-visitor
+                // 200 GETs so the CDN fronting the demo host can absorb
+                // spikes (docs/plans/demo-instance.md). Inert for every
+                // other principal and every other deployment.
+                .wrap(from_fn(crate::demo_plane::demo_cache_headers))
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth)
         });
