@@ -604,57 +604,67 @@ Rules:
 
 // ==================== Shared LLM Infrastructure ====================
 
-#[derive(Deserialize)]
 pub(crate) struct WikiGenerationResult {
     pub article_content: String,
     #[allow(dead_code)]
     pub citations_used: Vec<i32>,
 }
 
-/// JSON schema for wiki full-article generation. Extracted as a function so
-/// it's callable from the lint regression tests.
-pub(crate) fn wiki_generation_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "article_content": {
-                "type": "string",
-                "description": "The full wiki article in markdown format with [N] citations"
-            },
-            "citations_used": {
-                "type": "array",
-                "items": { "type": "integer" },
-                "description": "List of citation numbers actually used in the article"
-            }
-        },
-        "required": ["article_content", "citations_used"],
-        "additionalProperties": false
-    })
-}
-
-/// Call LLM provider for wiki generation (full-article rewrite schema).
-/// Thin wrapper over [`call_llm_for_wiki_typed`].
+/// Call LLM provider for full-article wiki generation.
+///
+/// Uses the long-form markdown contract (`call_long_form_markdown`), not a
+/// JSON envelope: articles are the longest outputs in the app, and both
+/// JSON transports corrupted long-form output in the 2026-07 truncation
+/// incidents (wire `response_format` → router-side salvage stored cut
+/// content as valid JSON; prompt-only JSON → raw newlines/unescaped quotes
+/// in the giant string failed the parse). The trailer line doubles as a
+/// structural completeness check.
 pub(crate) async fn call_llm_for_wiki(
     provider_config: &ProviderConfig,
     system_prompt: &str,
     user_content: &str,
     model: &str,
 ) -> Result<WikiGenerationResult, String> {
-    call_llm_for_wiki_typed::<WikiGenerationResult>(
-        provider_config,
-        system_prompt,
-        user_content,
+    tracing::info!(
         model,
-        "wiki_generation_result",
-        wiki_generation_schema(),
+        input_chars = user_content.len(),
+        "[wiki] Starting long-form article generation"
+    );
+    let messages = vec![Message::system(system_prompt), Message::user(user_content)];
+
+    let started = std::time::Instant::now();
+    match crate::providers::structured::call_long_form_markdown(
+        provider_config,
+        model,
+        &messages,
+        "wiki_article",
     )
     .await
+    {
+        Ok(out) => {
+            tracing::info!(
+                elapsed_secs = format_args!("{:.1}", started.elapsed().as_secs_f64()),
+                "[wiki] Article generation complete"
+            );
+            Ok(WikiGenerationResult {
+                article_content: out.content,
+                citations_used: out.citations_used,
+            })
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "[wiki] Article generation failed");
+            Err(e.to_compact_string())
+        }
+    }
 }
 
-/// Generic LLM call for wiki operations. Thin wrapper over the shared
-/// [`call_structured`] helper that adds wiki-specific tracing context so
-/// the logs still say `[wiki]` for anyone watching them. The retry / parse
-/// / prompt-based-fallback loop lives in the shared helper now.
+/// Generic structured LLM call for wiki operations (section ops). Thin
+/// wrapper over the shared [`call_structured`] helper that adds
+/// wiki-specific tracing context so the logs still say `[wiki]` for anyone
+/// watching them. Section ops keep the wire-level schema: the op array
+/// genuinely benefits from constrained decoding, and full articles — the
+/// output size where the JSON transports failed — go through
+/// [`call_llm_for_wiki`]'s long-form path instead.
 pub(crate) async fn call_llm_for_wiki_typed<T: DeserializeOwned>(
     provider_config: &ProviderConfig,
     system_prompt: &str,
@@ -672,13 +682,7 @@ pub(crate) async fn call_llm_for_wiki_typed<T: DeserializeOwned>(
 
     let messages = vec![Message::system(system_prompt), Message::user(user_content)];
 
-    // prompt_only: wiki articles and section rewrites are the longest
-    // outputs in the app — the shape OpenRouter's structured-output layer
-    // silently corrupted on reports (stream tail lost, JSON repaired around
-    // the cut; see StructuredCall::prompt_only). Schema-in-prompt makes a
-    // lost tail an unparseable response — a loud retry, not a stored stub.
-    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema)
-        .with_prompt_only(true);
+    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema);
 
     let started = std::time::Instant::now();
     match call_structured::<T>(call).await {
@@ -1724,12 +1728,6 @@ mod tests {
     // silent cross-provider divergence (wiki has been bitten by this before —
     // see the long comment on `section_ops_schema`). The linter lives in
     // `providers::structured::lint_schema`.
-
-    #[test]
-    fn lint_wiki_generation_schema() {
-        lint_schema(&wiki_generation_schema())
-            .expect("wiki_generation_schema must be portable across providers");
-    }
 
     #[test]
     fn lint_wiki_section_ops_schema() {

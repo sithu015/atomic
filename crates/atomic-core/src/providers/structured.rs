@@ -81,22 +81,6 @@ pub struct StructuredCall<'a, T> {
     /// OpenRouter or non-OpenAI backends). The linter rules + prompt-based
     /// fallback still cover correctness when strict is off.
     pub strict: bool,
-    /// When true, the schema travels ONLY in an appended prompt message —
-    /// no wire-level `response_format` at all. Default: `false`.
-    ///
-    /// This exists for long-form outputs routed through an aggregator.
-    /// OpenRouter's structured-output layer reassembles the upstream
-    /// stream and, when it loses part of it, *repairs* the broken JSON
-    /// into a valid envelope around the cut content (observed on kenny's
-    /// Daily Briefing, gen-1784452040: Bedrock generated 1,404 native
-    /// tokens and finished `end_turn`; 429 tokens were delivered as clean
-    /// JSON with `finish_reason: stop`). No stop-reason gate can see that.
-    /// Without `response_format` there is no router-side salvage layer: a
-    /// dropped tail arrives as unparseable JSON, the parse fails loudly,
-    /// and the retry/fallback machinery regenerates. Corruption becomes
-    /// detection. Short-output callers should stay on wire schemas — the
-    /// loss window is negligible and constrained decoding earns its keep.
-    pub prompt_only: bool,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -121,7 +105,6 @@ impl<'a, T> StructuredCall<'a, T> {
                 .with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS),
             max_retries: 2,
             strict: true,
-            prompt_only: false,
             _marker: PhantomData,
         }
     }
@@ -149,13 +132,6 @@ impl<'a, T> StructuredCall<'a, T> {
     /// parse failures then fall through to the prompt-based fallback path.
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
-        self
-    }
-
-    /// Convey the schema only via the prompt, never via `response_format`.
-    /// See the field docs for when (and why) to use this.
-    pub fn with_prompt_only(mut self, prompt_only: bool) -> Self {
-        self.prompt_only = prompt_only;
         self
     }
 }
@@ -277,40 +253,22 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         params,
         max_retries,
         strict,
-        prompt_only,
         ..
     } = call;
 
     let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
 
-    // Primary attempt: wire-level structured output by default (strict
-    // unless the caller opted out); in prompt_only mode the schema is
-    // appended as an explicit instruction instead and the request goes out
-    // as a plain completion (see the `prompt_only` field docs for why).
-    let (primary_config, primary_messages) = if prompt_only {
-        let instruction = format!(
-            "Respond with ONLY a single JSON object matching this schema. No \
-             markdown, no prose, no code fences, no surrounding text.\n\nSchema:\n{}",
-            schema_str
-        );
-        let mut with_instruction = messages.to_vec();
-        with_instruction.push(Message::user(instruction));
-        (
-            LlmConfig::new(model.to_string()).with_params(params.clone()),
-            with_instruction,
-        )
-    } else {
-        let schema_wrapper = StructuredOutputSchema {
-            name: schema_name.to_string(),
-            schema: schema.clone(),
-            strict,
-        };
-        (
-            LlmConfig::new(model.to_string())
-                .with_params(params.clone().with_structured_output(schema_wrapper)),
-            messages.to_vec(),
-        )
+    // Primary attempt: with structured output enabled. Strict defaults to
+    // true but callers can opt out via `StructuredCall::with_strict(false)`
+    // for models that reject OpenAI strict mode.
+    let schema_wrapper = StructuredOutputSchema {
+        name: schema_name.to_string(),
+        schema: schema.clone(),
+        strict,
     };
+    let primary_config = LlmConfig::new(model.to_string())
+        .with_params(params.clone().with_structured_output(schema_wrapper));
+    let primary_messages = messages.to_vec();
 
     let mut last_preview = String::new();
     let mut last_parse_err = String::new();
@@ -479,6 +437,220 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
             })
         }
     }
+}
+
+// ==================== Long-form markdown calls ====================
+
+/// Result of a [`call_long_form_markdown`] call: the markdown body and the
+/// citation numbers the model reported in its trailer line.
+#[derive(Debug, PartialEq)]
+pub struct LongFormOutput {
+    pub content: String,
+    pub citations_used: Vec<i32>,
+}
+
+const LONG_FORM_TRAILER: &str = "CITATIONS_USED:";
+
+/// Long-form generation WITHOUT any JSON envelope: the model writes plain
+/// markdown and ends with a single `CITATIONS_USED: 1, 4, 7` trailer line.
+///
+/// This is the output contract for report bodies and wiki articles, born of
+/// two incidents in one week:
+///
+/// - Wire-level `response_format` put OpenRouter's structured-output layer
+///   in the path, and that layer silently repaired a partially-delivered
+///   generation into valid JSON around cut prose (gen-1784452040: upstream
+///   billed 1,404 native tokens and finished `end_turn`, 429 were delivered
+///   as clean JSON with `finish_reason: stop`). Undetectable client-side.
+/// - Prompt-only JSON removed that layer but reintroduced hand-escaping:
+///   models writing thousands of words inside one JSON string emit raw
+///   newlines and unescaped quotes (both observed on the very first two
+///   live runs), so the parse failed nearly every time.
+///
+/// Markdown-plus-trailer has neither failure class: there is nothing for a
+/// router to "repair", no escaping to get wrong, and the trailer is a
+/// structural completeness check — a generation that lost its tail is
+/// missing the trailer and fails loudly into the retry below, instead of
+/// being stored as a stub. Short structured calls (tagging, extraction,
+/// section ops) should keep [`call_structured`]: their outputs are small
+/// and genuinely benefit from constrained decoding.
+pub async fn call_long_form_markdown(
+    provider_config: &ProviderConfig,
+    model: &str,
+    messages: &[Message],
+    label: &'static str,
+) -> Result<LongFormOutput, StructuredCallError> {
+    let provider = get_llm_provider(provider_config)?;
+    call_long_form_markdown_with_provider(model, messages, label, provider).await
+}
+
+/// Test-facing variant of [`call_long_form_markdown`] with an injected
+/// provider, mirroring [`call_structured_with_provider`].
+pub async fn call_long_form_markdown_with_provider(
+    model: &str,
+    messages: &[Message],
+    label: &'static str,
+    provider: Arc<dyn LlmProvider>,
+) -> Result<LongFormOutput, StructuredCallError> {
+    let instruction = format!(
+        "Write your response as plain markdown prose — do NOT wrap it in JSON \
+         and do NOT wrap the whole response in a code fence. After the \
+         markdown, end with exactly one final line in this exact form:\n\
+         {LONG_FORM_TRAILER} 1, 4, 7\n\
+         listing the [N] citation numbers you actually referenced, or \
+         `{LONG_FORM_TRAILER} none` if you referenced none."
+    );
+    let mut call_messages = messages.to_vec();
+    call_messages.push(Message::user(instruction));
+
+    let params = GenerationParams::new()
+        .with_temperature(0.3)
+        .with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS);
+    let config = LlmConfig::new(model.to_string()).with_params(params);
+
+    let max_retries = 2usize;
+    let mut last_err = String::new();
+    let mut nudged = false;
+
+    // Retry loop: transient provider errors and early-ended generations
+    // retry with backoff; a parse failure (missing/malformed trailer) gets
+    // ONE corrective nudge appended, then errors out. Mirrors
+    // call_structured's shape without the JSON machinery.
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay = 1u64 << attempt;
+            tracing::warn!(
+                attempt,
+                max_retries,
+                delay_secs = delay,
+                last_error = %last_err,
+                label,
+                "[long-form] Retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+
+        let response = match provider.complete(&call_messages, &config).await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = e.to_string();
+                if e.is_retryable() && attempt < max_retries {
+                    continue;
+                }
+                return Err(StructuredCallError::Provider(e));
+            }
+        };
+
+        if let Some(reason) = early_end_reason(&response) {
+            last_err = format!(
+                "generation ended early (reason={reason}, {} chars in)",
+                response.content.len()
+            );
+            tracing::warn!(
+                label,
+                finish_reason = response.finish_reason.as_deref().unwrap_or("-"),
+                native_finish_reason = response.native_finish_reason.as_deref().unwrap_or("-"),
+                completion_tokens = response.completion_tokens,
+                upstream_provider = response.upstream_provider.as_deref().unwrap_or("-"),
+                generation_id = response.generation_id.as_deref().unwrap_or("-"),
+                content_chars = response.content.len(),
+                "[long-form] Incomplete generation; retrying"
+            );
+            if attempt < max_retries {
+                continue;
+            }
+            return Err(StructuredCallError::Other(last_err));
+        }
+
+        match parse_long_form(&response.content) {
+            Ok(out) => {
+                tracing::info!(
+                    label,
+                    finish_reason = response.finish_reason.as_deref().unwrap_or("-"),
+                    native_finish_reason =
+                        response.native_finish_reason.as_deref().unwrap_or("-"),
+                    completion_tokens = response.completion_tokens,
+                    upstream_provider = response.upstream_provider.as_deref().unwrap_or("-"),
+                    generation_id = response.generation_id.as_deref().unwrap_or("-"),
+                    content_chars = out.content.len(),
+                    "[long-form] Completed"
+                );
+                return Ok(out);
+            }
+            Err(parse_err) => {
+                last_err = parse_err.clone();
+                tracing::warn!(
+                    label,
+                    parse_error = %parse_err,
+                    preview = %preview_of(&response.content),
+                    generation_id = response.generation_id.as_deref().unwrap_or("-"),
+                    "[long-form] Trailer parse failed"
+                );
+                if nudged || attempt >= max_retries {
+                    return Err(StructuredCallError::Other(format!(
+                        "long-form parse failed: {parse_err}"
+                    )));
+                }
+                // One corrective nudge: restate the trailer contract. The
+                // most common causes (forgot the trailer, wrapped it in a
+                // fence, kept writing after it) are all instruction slips
+                // a second pass fixes.
+                nudged = true;
+                call_messages.push(Message::user(format!(
+                    "Your previous response could not be used: {parse_err}. \
+                     Write the complete response again as plain markdown, \
+                     ending with exactly one final `{LONG_FORM_TRAILER} …` \
+                     line and nothing after it."
+                )));
+            }
+        }
+    }
+
+    Err(StructuredCallError::Other(format!(
+        "long-form parse failed: {last_err}"
+    )))
+}
+
+/// Split a long-form response into markdown body + trailer citations.
+///
+/// Strict about the things that indicate an unusable response (no trailer,
+/// content after the trailer, empty body) and tolerant about the things
+/// models plausibly vary (whole-response code fences, `[1]`-style brackets
+/// or `none` in the citation list).
+fn parse_long_form(content: &str) -> Result<LongFormOutput, String> {
+    let text = strip_code_fences(content);
+    let idx = text
+        .rfind(LONG_FORM_TRAILER)
+        .ok_or_else(|| format!("missing {LONG_FORM_TRAILER} trailer line"))?;
+    let (body, trailer) = text.split_at(idx);
+    let trailer_line = trailer.lines().next().unwrap_or("");
+    let after = &trailer[trailer_line.len()..];
+    if !after.trim().is_empty() {
+        return Err(format!("content after the {LONG_FORM_TRAILER} trailer"));
+    }
+
+    let list = trailer_line[LONG_FORM_TRAILER.len()..].trim();
+    let citations_used = if list.is_empty() || list.eq_ignore_ascii_case("none") {
+        Vec::new()
+    } else {
+        list.split([',', ' '])
+            .map(|tok| tok.trim_matches(|c: char| !c.is_ascii_digit()))
+            .filter(|tok| !tok.is_empty())
+            .map(|tok| {
+                tok.parse::<i32>()
+                    .map_err(|e| format!("bad citation number '{tok}': {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let content = body.trim().to_string();
+    if content.is_empty() {
+        return Err("empty content before the trailer".to_string());
+    }
+    Ok(LongFormOutput {
+        content,
+        citations_used,
+    })
 }
 
 // ==================== Schema linting ====================
@@ -1056,68 +1228,127 @@ mod tests {
         }
     }
 
-    // ==================== prompt_only mode ====================
+    // ==================== Long-form markdown calls ====================
 
-    #[tokio::test]
-    async fn prompt_only_sends_no_wire_schema_and_appends_instruction() {
-        let provider = Arc::new(MockLlmProvider::new());
-        provider.queue_response(OK_JSON);
-
-        let config = test_provider_config();
-        let messages = vec![Message::system("s"), Message::user("u")];
-        let call = StructuredCall::<Sample>::new(
-            &config,
-            "test-model",
-            &messages,
-            "sample_result",
-            sample_schema(),
+    #[test]
+    fn long_form_parses_body_and_trailer() {
+        let out = parse_long_form(
+            "# Report\n\nProse with \"quotes\" and\nraw newlines. [1] [4]\n\nCITATIONS_USED: 1, 4",
         )
-        .with_prompt_only(true);
-        let result = call_structured_with_provider::<Sample>(call, provider.clone())
-            .await
-            .unwrap();
+        .unwrap();
+        assert!(out.content.starts_with("# Report"));
+        assert!(out.content.ends_with("[1] [4]"));
+        assert_eq!(out.citations_used, vec![1, 4]);
+    }
 
-        assert_eq!(result.count, 7);
-        // No response_format on the wire — the whole point: nothing for a
-        // router-side salvage layer to "repair".
-        let schemas = provider.captured_schemas();
-        assert_eq!(schemas.len(), 1);
-        assert!(schemas[0].is_none(), "prompt_only must not send a wire schema");
-        // The schema instruction rides as an appended user message instead.
-        let captured = provider.captured_messages();
-        let sent = &captured[0];
-        assert_eq!(sent.len(), 3, "original messages + schema instruction");
-        let instruction = sent.last().unwrap().content.as_deref().unwrap_or("");
-        assert!(
-            instruction.contains("ONLY a single JSON object") && instruction.contains("Schema:"),
-            "appended instruction should carry the schema"
+    #[test]
+    fn long_form_accepts_none_and_bracketed_lists() {
+        assert_eq!(
+            parse_long_form("Body.\n\nCITATIONS_USED: none")
+                .unwrap()
+                .citations_used,
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            parse_long_form("Body.\n\nCITATIONS_USED: [2], [7]")
+                .unwrap()
+                .citations_used,
+            vec![2, 7]
         );
     }
 
-    #[tokio::test]
-    async fn prompt_only_broken_json_still_reaches_fallback() {
-        // The failure mode this mode converts corruption into: a lost tail
-        // arrives as unparseable JSON and the fallback regenerates.
-        let provider = Arc::new(MockLlmProvider::new());
-        provider.queue_response(r#"{"value":"cut mid-sen"#); // unterminated
-        provider.queue_response(OK_JSON);
+    #[test]
+    fn long_form_strips_whole_response_fence() {
+        let out = parse_long_form("```markdown\nBody text.\n\nCITATIONS_USED: 3\n```").unwrap();
+        assert_eq!(out.content, "Body text.");
+        assert_eq!(out.citations_used, vec![3]);
+    }
 
-        let config = test_provider_config();
-        let messages = vec![Message::user("u")];
-        let call = StructuredCall::<Sample>::new(
-            &config,
+    #[test]
+    fn long_form_rejects_missing_trailer_and_trailing_content() {
+        // Missing trailer is the truncation sentinel — a generation that
+        // lost its tail must fail, never be stored.
+        assert!(parse_long_form("A body that just stops mid-sen").is_err());
+        assert!(parse_long_form("Body\nCITATIONS_USED: 1\nMore prose after").is_err());
+        assert!(parse_long_form("CITATIONS_USED: 1").is_err());
+    }
+
+    #[tokio::test]
+    async fn long_form_pipeline_happy_path_appends_contract() {
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response("The article. [1]\n\nCITATIONS_USED: 1");
+
+        let messages = vec![Message::system("s"), Message::user("u")];
+        let out = call_long_form_markdown_with_provider(
             "test-model",
             &messages,
-            "sample_result",
-            sample_schema(),
+            "test_article",
+            provider.clone(),
         )
-        .with_prompt_only(true);
-        let result = call_structured_with_provider::<Sample>(call, provider.clone())
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
-        assert_eq!(result.count, 7);
-        assert_eq!(provider.call_count(), 2, "fallback should have fired");
+        assert_eq!(out.content, "The article. [1]");
+        assert_eq!(out.citations_used, vec![1]);
+        assert_eq!(provider.call_count(), 1);
+        // No wire schema, and the trailer contract rides as a user message.
+        let schemas = provider.captured_schemas();
+        assert!(schemas[0].is_none(), "long-form must not send response_format");
+        let sent = &provider.captured_messages()[0];
+        assert_eq!(sent.len(), 3);
+        let instruction = sent.last().unwrap().content.as_deref().unwrap_or("");
+        assert!(instruction.contains("CITATIONS_USED"));
+    }
+
+    #[tokio::test]
+    async fn long_form_missing_trailer_gets_one_nudge() {
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response("A body that just stops mid-sen");
+        provider.queue_response("Complete body. [2]\n\nCITATIONS_USED: 2");
+
+        let messages = vec![Message::user("u")];
+        let out = call_long_form_markdown_with_provider(
+            "test-model",
+            &messages,
+            "test_article",
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.citations_used, vec![2]);
+        assert_eq!(provider.call_count(), 2);
+        let second = &provider.captured_messages()[1];
+        let nudge = second.last().unwrap().content.as_deref().unwrap_or("");
+        assert!(
+            nudge.contains("could not be used"),
+            "nudge should explain the retry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_form_early_end_retries_then_errors() {
+        let provider = Arc::new(MockLlmProvider::new());
+        for _ in 0..3 {
+            provider.queue_response_with_finish(
+                "Cut body\n\nCITATIONS_USED: 1",
+                Some("stop"),
+                Some("max_tokens"),
+            );
+        }
+
+        let messages = vec![Message::user("u")];
+        let err = call_long_form_markdown_with_provider(
+            "test-model",
+            &messages,
+            "test_article",
+            provider.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(provider.call_count(), 3);
+        assert!(matches!(err, StructuredCallError::Other(_)));
     }
 
     // ==================== Early-end gates ====================
@@ -1335,15 +1566,10 @@ mod tests {
 
     fn collect_live_schemas() -> std::collections::BTreeMap<&'static str, Value> {
         let mut out = std::collections::BTreeMap::new();
-        out.insert(
-            "wiki_generation_result",
-            crate::wiki::wiki_generation_schema(),
-        );
+        // Wiki full articles and report findings are NOT here: they moved
+        // to the long-form markdown contract (call_long_form_markdown) and
+        // no longer send a wire schema at all.
         out.insert("wiki_update_section_ops", crate::wiki::section_ops_schema());
-        out.insert(
-            "report_finding_result",
-            crate::reports::agentic::report_schema_for_snapshot(),
-        );
         out.insert("extraction_result", crate::extraction::extraction_schema());
         out.insert(
             "consolidation_result",

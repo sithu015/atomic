@@ -105,48 +105,6 @@
     ],
     "type": "object"
   },
-  "report_finding_result": {
-    "additionalProperties": false,
-    "properties": {
-      "citations_used": {
-        "description": "List of citation numbers actually used.",
-        "items": {
-          "type": "integer"
-        },
-        "type": "array"
-      },
-      "finding_content": {
-        "description": "The finding in markdown, with [N] citation markers.",
-        "type": "string"
-      }
-    },
-    "required": [
-      "finding_content",
-      "citations_used"
-    ],
-    "type": "object"
-  },
-  "wiki_generation_result": {
-    "additionalProperties": false,
-    "properties": {
-      "article_content": {
-        "description": "The full wiki article in markdown format with [N] citations",
-        "type": "string"
-      },
-      "citations_used": {
-        "description": "List of citation numbers actually used in the article",
-        "items": {
-          "type": "integer"
-        },
-        "type": "array"
-      }
-    },
-    "required": [
-      "article_content",
-      "citations_used"
-    ],
-    "type": "object"
-  },
   "wiki_update_section_ops": {
     "additionalProperties": false,
     "properties": {

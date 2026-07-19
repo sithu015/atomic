@@ -506,27 +506,74 @@ impl Respond for ChatResponder {
         // Inspect the requested schema name so this responder can serve
         // more than just tag extraction as the test matrix grows.
         //
-        // prompt_only callers (wiki generation/updates, the report final
-        // pass) send no `response_format` — the schema rides in an appended
-        // instruction message instead — so when the pointer comes up empty,
-        // identify the call by property names that appear in exactly one
-        // schema.
+        // Long-form callers (wiki full articles, the report final pass)
+        // send no `response_format` at all — they use the markdown +
+        // `CITATIONS_USED:` trailer contract, whose instruction line is
+        // detectable in the request text. `call_structured`'s prompt-based
+        // fallback also arrives schema-less; its nudge embeds the schema
+        // JSON, so property-name sniffing routes it to the right arm.
         let request_text = body.to_string().to_lowercase();
-        let schema_name = body
+        let wire_schema = body
             .pointer("/response_format/json_schema/name")
             .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if request_text.contains("after_heading") {
-                    "wiki_update_section_ops".to_string()
-                } else if request_text.contains("article_content") {
-                    "wiki_generation_result".to_string()
-                } else if request_text.contains("finding_content") {
-                    "report_generation_result".to_string()
+            .map(str::to_string);
+
+        if wire_schema.is_none() && request_text.contains("citations_used:") {
+            if request_text.contains("wikifail") {
+                return with_delay(ResponseTemplate::new(400).set_body_json(json!({
+                    "error": { "message": "mock wiki generation failure" }
+                })));
+            }
+            let content = if request_text.contains("wiki article") {
+                if let Some(new_index) = first_new_source_index(&body) {
+                    format!(
+                        "# Mock Wiki\n\nUpdated article body integrating new source. [1] [{new_index}]\n\nCITATIONS_USED: 1, {new_index}"
+                    )
                 } else {
-                    String::new()
+                    let n = count_numbered_sources(&body);
+                    let cited: Vec<i32> = (1..=n.min(2).max(1)).collect();
+                    let markers = cited
+                        .iter()
+                        .map(|i| format!("[{i}]"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let list = cited
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "# Mock Wiki\n\nThis is a deterministic mock article body. {markers}\n\nCITATIONS_USED: {list}"
+                    )
                 }
-            });
+            } else {
+                "# Mock Finding\n\nA deterministic mock finding body. [1]\n\nCITATIONS_USED: 1"
+                    .to_string()
+            };
+            let mut response = ResponseTemplate::new(200).set_body_json(json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": { "role": "assistant", "content": content },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }));
+            if request_text.contains("wikislow") {
+                response = response.set_delay(std::time::Duration::from_millis(1500));
+            }
+            return with_delay(response);
+        }
+
+        let schema_name = wire_schema.unwrap_or_else(|| {
+            if request_text.contains("after_heading") {
+                "wiki_update_section_ops".to_string()
+            } else {
+                String::new()
+            }
+        });
 
         let content = match schema_name.as_str() {
             "extraction_result" => {
@@ -543,62 +590,6 @@ impl Respond for ChatResponder {
                     ]
                 })
                 .to_string()
-            }
-            // Wiki full-article generation. The wiki prompt embeds source
-            // chunks as `[1] excerpt...\n[2] excerpt...\n` etc.; the
-            // citation extractor parses `\[(\d+)\]` against that source
-            // list.
-            //
-            // Two marker-driven modes for the ledger e2e tests, keyed on
-            // the tag name (which lands in the prompt as `Write a wiki
-            // article about "{tag_name}"`):
-            //
-            // - `WikiFail...` → 400. Non-retryable at the provider layer
-            //   (`is_retryable` excludes 400), so the failure surfaces
-            //   immediately and the `task_runs` retry/backoff machinery —
-            //   not the provider's internal retry — owns recovery.
-            // - `WikiSlow...` → normal article after a delay, long enough
-            //   that a concurrent regeneration request deterministically
-            //   observes the first one's live lease.
-            //
-            // The legacy `update_wiki` path reuses this schema for a full
-            // rewrite. Detect the update prompt shape ("NEW SOURCES TO
-            // INCORPORATE") and emit a *different* body that pins the new
-            // source index — otherwise the update returns content
-            // byte-identical to the original generation and tests can't
-            // distinguish the two.
-            "wiki_generation_result" => {
-                if request_text.contains("wikifail") {
-                    return with_delay(ResponseTemplate::new(400).set_body_json(json!({
-                        "error": { "message": "mock wiki generation failure" }
-                    })));
-                }
-                let n = count_numbered_sources(&body);
-                if let Some(new_index) = first_new_source_index(&body) {
-                    // Update path: cite the new source so the test can
-                    // verify the freshly added atom is integrated.
-                    json!({
-                        "article_content": format!(
-                            "# Mock Wiki\n\nUpdated article body integrating new source. [1] [{new_index}]"
-                        ),
-                        "citations_used": [1, new_index],
-                    })
-                    .to_string()
-                } else {
-                    let cited: Vec<i32> = (1..=n.min(2).max(1)).collect();
-                    let markers = cited
-                        .iter()
-                        .map(|i| format!("[{i}]"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    json!({
-                        "article_content": format!(
-                            "# Mock Wiki\n\nThis is a deterministic mock article body. {markers}"
-                        ),
-                        "citations_used": cited,
-                    })
-                    .to_string()
-                }
             }
             // Tag compaction. The route hands the LLM a flat list of
             // tag rows (`tag_id | name | parent_name | atom_count`). We
@@ -620,15 +611,6 @@ impl Respond for ChatResponder {
                     json!({ "merges": [] }).to_string()
                 }
             }
-            // Report final pass. The agent embeds source atoms as
-            // `Source [N]: ...` blocks; cite the first one and
-            // `extract_citations` resolves the marker against the citables
-            // table so the finding atom gets a non-empty citation row.
-            "report_generation_result" => json!({
-                "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
-                "citations_used": [1],
-            })
-            .to_string(),
             // Wiki incremental update: emit a single AppendToSection op
             // pinned to the heading the existing article uses, referencing
             // the first new-source index. Tests assert that the update
@@ -656,7 +638,7 @@ impl Respond for ChatResponder {
             _ => "{}".to_string(),
         };
 
-        let mut response = ResponseTemplate::new(200).set_body_json(json!({
+        let response = ResponseTemplate::new(200).set_body_json(json!({
             "id": "mock-cmpl",
             "object": "chat.completion",
             "choices": [
@@ -670,11 +652,6 @@ impl Respond for ChatResponder {
                 }
             ],
         }));
-        // Slow-wiki mode: hold the response long enough that overlapping
-        // regeneration requests genuinely race the in-flight one's lease.
-        if schema_name == "wiki_generation_result" && request_text.contains("wikislow") {
-            response = response.set_delay(std::time::Duration::from_millis(1500));
-        }
         with_delay(response)
     }
 }

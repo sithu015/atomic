@@ -17,13 +17,13 @@
 //!   context scope (tag subtree, time window, kinds, self-exclusion).
 //!   The agent never sees atoms outside scope.
 //!
-//! The structured-output JSON shape mirrors the briefing's
-//! `BriefingGenerationResult` so the existing tolerant-parsing helper
-//! (`call_structured`) does the heavy lifting.
+//! The final pass uses the long-form markdown contract
+//! (`call_long_form_markdown`): the report body is plain markdown with a
+//! `CITATIONS_USED:` trailer, never JSON — see that helper's docs for the
+//! two truncation incidents that ruled JSON envelopes out.
 
 use crate::error::AtomicCoreError;
 use crate::models::{AtomWithTags, CitationPolicy, Report};
-use crate::providers::structured::{call_structured, StructuredCall};
 use crate::providers::types::{CompletionResponse, Message, MessageRole, ToolDefinition};
 use crate::providers::{get_llm_provider, LlmConfig, ProviderConfig, ProviderType};
 use crate::reports::scope::{ContextFilter, TimeWindow};
@@ -31,7 +31,7 @@ use crate::search::{SearchMode, SearchOptions};
 use crate::AtomicCore;
 
 use regex::Regex;
-use serde::Deserialize;
+
 use std::collections::{HashMap, HashSet};
 
 /// Default cap on tool-calling iterations. Reports can override via the
@@ -81,40 +81,6 @@ pub struct ResolvedCitation {
     pub position: i32,
     pub cited_atom_id: String,
     pub excerpt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReportGenerationResult {
-    finding_content: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    citations_used: Vec<i32>,
-}
-
-/// Public re-export of the report output schema for the structured-output
-/// snapshot test. Kept module-public so phase-3 wiring can reach it
-/// without exposing the agent loop internals.
-pub fn report_schema_for_snapshot() -> serde_json::Value {
-    report_schema()
-}
-
-fn report_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "finding_content": {
-                "type": "string",
-                "description": "The finding in markdown, with [N] citation markers."
-            },
-            "citations_used": {
-                "type": "array",
-                "items": { "type": "integer" },
-                "description": "List of citation numbers actually used."
-            }
-        },
-        "required": ["finding_content", "citations_used"],
-        "additionalProperties": false
-    })
 }
 
 const SYSTEM_PROMPT_SCAFFOLD: &str = "You are running a scheduled research report over a personal knowledge base.
@@ -616,22 +582,22 @@ async fn final_pass(
     model: &str,
     messages: &[Message],
 ) -> Result<String, AtomicCoreError> {
-    // prompt_only: report bodies are long-form prose, the exact shape
-    // OpenRouter's structured-output layer silently corrupted (three Daily
-    // Briefings stored cut mid-sentence, 2026-07-15/18/19 — the router lost
-    // part of the upstream stream and repaired the JSON around the cut).
-    // With the schema in the prompt instead, a lost tail fails the parse
-    // loudly and the retry/fallback regenerates.
-    let call = StructuredCall::<ReportGenerationResult>::new(
+    // Markdown + trailer, not JSON: report bodies are long-form prose, the
+    // exact shape both JSON transports corrupted in the 2026-07 truncation
+    // incidents (wire response_format → router-side salvage stored cut
+    // briefings as valid JSON; prompt-only JSON → raw newlines/unescaped
+    // quotes in the giant string failed nearly every parse). The trailer
+    // doubles as a structural completeness check. See
+    // providers::structured::call_long_form_markdown.
+    match crate::providers::structured::call_long_form_markdown(
         provider_config,
         model,
         messages,
-        "report_generation_result",
-        report_schema(),
+        "report_finding",
     )
-    .with_prompt_only(true);
-    match call_structured::<ReportGenerationResult>(call).await {
-        Ok(result) => Ok(result.finding_content),
+    .await
+    {
+        Ok(out) => Ok(out.content),
         Err(e) => Err(AtomicCoreError::DatabaseOperation(format!(
             "final report pass failed: {}",
             e.to_compact_string()
@@ -728,10 +694,8 @@ pub async fn run(
     .await?;
 
     state.messages.push(Message::user(
-        "Now write the final report. Respond with a JSON object matching the \
-         report_generation_result schema: set `finding_content` to markdown \
-         prose with [N] citation markers, and `citations_used` to the list of \
-         numbers you referenced. Do not call tools."
+        "Now write the final report as markdown prose with [N] citation \
+         markers. Do not call tools."
             .to_string(),
     ));
 
