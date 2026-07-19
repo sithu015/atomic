@@ -48,15 +48,26 @@ export function BriefingContent({ content, citations, onCitationClick }: Briefin
     return children;
   };
 
+  // Agent-authored markdown is body content, not page structure: whatever
+  // heading level the model chose, it renders as a modest section header
+  // and can never compete with the app's own chrome. h1–h3 demote to a
+  // semantic <h3> (one <h1> per page, and it isn't the model's), h4+ to
+  // <h4>; the container's prose-headings utilities cap the visual scale.
   const components = {
     p: ({ children }: { children?: ReactNode }) => <p>{processChildren(children)}</p>,
     li: ({ children }: { children?: ReactNode }) => <li>{processChildren(children)}</li>,
     strong: ({ children }: { children?: ReactNode }) => <strong>{processChildren(children)}</strong>,
     em: ({ children }: { children?: ReactNode }) => <em>{processChildren(children)}</em>,
+    h1: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
+    h2: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
+    h3: ({ children }: { children?: ReactNode }) => <h3>{processChildren(children)}</h3>,
+    h4: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
+    h5: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
+    h6: ({ children }: { children?: ReactNode }) => <h4>{processChildren(children)}</h4>,
   };
 
   return (
-    <div className="prose prose-invert prose-sm md:prose-base max-w-none text-[var(--color-text-secondary)] [&_p]:leading-relaxed [&_p]:my-3 first:[&_p]:mt-0 last:[&_p]:mb-0">
+    <div className="prose prose-invert prose-sm md:prose-base max-w-none text-[var(--color-text-secondary)] [&_p]:leading-relaxed [&_p]:my-3 first:[&_p]:mt-0 last:[&_p]:mb-0 prose-headings:text-lg prose-headings:font-semibold prose-headings:tracking-normal prose-headings:mt-5 prose-headings:mb-2 prose-h4:text-base prose-headings:first:mt-0">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {content}
       </ReactMarkdown>

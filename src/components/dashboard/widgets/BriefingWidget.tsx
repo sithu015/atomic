@@ -17,6 +17,9 @@ import { FeaturedDropdown } from '../../reports/FeaturedDropdown';
 import { getTransport } from '../../../lib/transport';
 import { formatRelativeDate } from '../../../lib/date';
 
+/// Empty-state only: when a finding exists, the page's H1 is the report's
+/// name (informative, stable, user-named). The greeting fills the void
+/// before any briefing exists — it should never compete with real content.
 function greeting(date: Date): string {
   const h = date.getHours();
   if (h < 5) return 'Working late';
@@ -213,7 +216,7 @@ export function BriefingWidget() {
       )}
 
       <h1 className="text-3xl md:text-4xl font-semibold text-[var(--color-text-primary)] tracking-tight mb-4">
-        {hello}.
+        {hasFinding ? active!.finding.report_name_snapshot : `${hello}.`}
       </h1>
 
       {isMobile && hasFinding && (
