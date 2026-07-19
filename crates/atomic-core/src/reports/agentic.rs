@@ -591,6 +591,7 @@ async fn final_pass(
         model,
         messages,
         "report_finding",
+        None,
     )
     .await
     {

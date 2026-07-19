@@ -337,7 +337,14 @@ async fn update_wiki_content(
     );
 
     // Call LLM API
-    let result = call_llm_for_wiki(provider_config, system_prompt, &user_content, model).await?;
+    let result = call_llm_for_wiki(
+        provider_config,
+        system_prompt,
+        &user_content,
+        model,
+        Some(crate::wiki::WIKI_UPDATE_RESPONSE_CONTRACT),
+    )
+    .await?;
 
     // Create updated article
     let now = Utc::now().to_rfc3339();

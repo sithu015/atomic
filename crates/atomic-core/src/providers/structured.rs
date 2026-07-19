@@ -477,23 +477,37 @@ pub async fn call_long_form_markdown(
     model: &str,
     messages: &[Message],
     label: &'static str,
+    response_contract: Option<&str>,
 ) -> Result<LongFormOutput, StructuredCallError> {
     let provider = get_llm_provider(provider_config)?;
-    call_long_form_markdown_with_provider(model, messages, label, provider).await
+    call_long_form_markdown_with_provider(model, messages, label, response_contract, provider)
+        .await
 }
 
 /// Test-facing variant of [`call_long_form_markdown`] with an injected
 /// provider, mirroring [`call_structured_with_provider`].
+///
+/// `response_contract` is an optional caller-supplied sentence describing
+/// what the response must consist of (e.g. "the complete updated article,
+/// never only the changed sections"). It rides inside the final format
+/// instruction rather than the caller's own prompt because the last user
+/// message dominates the model's framing of what "your response" means —
+/// a completeness requirement stated earlier tends to lose to it.
 pub async fn call_long_form_markdown_with_provider(
     model: &str,
     messages: &[Message],
     label: &'static str,
+    response_contract: Option<&str>,
     provider: Arc<dyn LlmProvider>,
 ) -> Result<LongFormOutput, StructuredCallError> {
+    let contract_clause = response_contract
+        .map(|c| format!(" {c}"))
+        .unwrap_or_default();
     let instruction = format!(
         "Write your response as plain markdown prose — do NOT wrap it in JSON \
-         and do NOT wrap the whole response in a code fence. After the \
-         markdown, end with exactly one final line in this exact form:\n\
+         and do NOT wrap the whole response in a code fence.{contract_clause} \
+         After the markdown, end with exactly one final line in this exact \
+         form:\n\
          {LONG_FORM_TRAILER} 1, 4, 7\n\
          listing the [N] citation numbers you actually referenced, or \
          `{LONG_FORM_TRAILER} none` if you referenced none."
@@ -1281,6 +1295,7 @@ mod tests {
             "test-model",
             &messages,
             "test_article",
+            None,
             provider.clone(),
         )
         .await
@@ -1309,6 +1324,7 @@ mod tests {
             "test-model",
             &messages,
             "test_article",
+            None,
             provider.clone(),
         )
         .await
@@ -1340,6 +1356,7 @@ mod tests {
             "test-model",
             &messages,
             "test_article",
+            None,
             provider.clone(),
         )
         .await

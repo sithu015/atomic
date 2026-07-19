@@ -568,6 +568,18 @@ Guidelines:
 - Only use [[wiki links]] for topics listed in the EXISTING WIKI ARTICLES section provided
 - Do not force wiki links where they don't fit naturally"#;
 
+/// Rides in the long-form call's final format instruction (see
+/// `call_long_form_markdown`'s `response_contract`) so it can't be
+/// out-framed by earlier messages: an update prompt whose completeness
+/// requirement sits above the source materials gets answered with only
+/// the new section, written as if appended to the article.
+pub(crate) const WIKI_UPDATE_RESPONSE_CONTRACT: &str =
+    "Your response must be the COMPLETE updated article: begin with the \
+     current article's opening heading and reproduce every existing section \
+     — revised where the new sources require — through the end, with the \
+     new material integrated where it belongs. Never respond with only the \
+     new or changed sections.";
+
 pub(crate) const WIKI_UPDATE_SYSTEM_PROMPT: &str = r#"You are updating an existing wiki article with new information from additional sources. Integrate the new information naturally into the existing article.
 
 Guidelines:
@@ -623,6 +635,7 @@ pub(crate) async fn call_llm_for_wiki(
     system_prompt: &str,
     user_content: &str,
     model: &str,
+    response_contract: Option<&str>,
 ) -> Result<WikiGenerationResult, String> {
     tracing::info!(
         model,
@@ -637,6 +650,7 @@ pub(crate) async fn call_llm_for_wiki(
         model,
         &messages,
         "wiki_article",
+        response_contract,
     )
     .await
     {
@@ -906,11 +920,8 @@ pub(crate) async fn synthesize_article(
         Some(existing) => format!(
             "CURRENT ARTICLE:\n{}\n\n{}\
              SOURCE MATERIALS:\n{}\
-             Write the complete updated article about \"{}\" now, integrating \
-             the source materials into the current article. Return the ENTIRE \
-             article from its first heading to its end — keep all existing \
-             content that isn't contradicted, never a summary of changes or \
-             only the new sections. Cite sources with [N] notation.{}",
+             Integrate the source materials into the current article about \
+             \"{}\", citing sources with [N] notation.{}",
             existing, articles_section, source_materials, tag_name, link_hint
         ),
         None => format!(
@@ -921,7 +932,9 @@ pub(crate) async fn synthesize_article(
         ),
     };
 
-    let result = call_llm_for_wiki(provider_config, system_prompt, &user_content, model).await?;
+    let contract = existing_content.map(|_| WIKI_UPDATE_RESPONSE_CONTRACT);
+    let result =
+        call_llm_for_wiki(provider_config, system_prompt, &user_content, model, contract).await?;
 
     let article_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
