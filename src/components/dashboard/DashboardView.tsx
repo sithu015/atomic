@@ -3,6 +3,7 @@ import { dashboardWidgets } from './registry';
 import { useWikiStore } from '../../stores/wiki';
 import { useAtomsStore } from '../../stores/atoms';
 import { WelcomeView } from './WelcomeView';
+import { DemoIntroCard } from './DemoIntroCard';
 
 export function DashboardView() {
   const fetchAllArticles = useWikiStore(s => s.fetchAllArticles);
@@ -26,6 +27,7 @@ export function DashboardView() {
   return (
     <div className="h-full overflow-y-auto scrollbar-auto-hide">
       <div className="mx-auto max-w-4xl px-6 pt-10 pb-16 md:px-10 md:pt-14 md:pb-20">
+        <DemoIntroCard />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-10 md:gap-y-12">
           {dashboardWidgets.map(({ id, span, Component }) => (
             <div key={id} className={span === 'full' ? 'md:col-span-2' : ''}>
